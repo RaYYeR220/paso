@@ -81,6 +81,27 @@ describe.skipIf(!live || !ownerKey)("POST /api/relay, for an account that exists
     expect(body.detail).toMatch(/BadSignature \(account error #2\)/);
     expect(body.diagnostic).toContain("failed account authentication");
     expect(body.diagnostic).toContain("__check_auth");
+    // Decided before anything was sent, and checked against the chain: the call has not run.
+    expect(body.sent as unknown).toBe(false);
+  });
+
+  it("answers a repeat of a relayed call with its transaction, on record or found on chain", async () => {
+    const once = relayRequest(await signedApprove(owner, 11));
+    const before = await xlmBalance(relayer.address);
+
+    const first = await relay(once);
+    expect(first.status).toBe(200);
+    const paid = before - (await xlmBalance(relayer.address));
+    expect(paid > BigInt(0)).toBe(true);
+
+    // The same bytes again: the same answer, and nothing more is paid for.
+    const again = await relay(once);
+    expect(again).toEqual(first);
+
+    // A server that has never seen the call finds the transaction that carried it, instead of calling it refused.
+    const stranger = new Relayer(loadConfig());
+    expect(await stranger.relay(once)).toEqual({ hash: first.body.hash });
+    expect(before - (await xlmBalance(relayer.address))).toBe(paid);
   });
 
   it("answers bad_signature when the call differs from the entry that was signed", async () => {
@@ -198,6 +219,22 @@ describe.skipIf(!live)("POST /api/relay, for an account that does not exist yet"
     expect(body.deployHash).toMatch(/^[0-9a-f]{64}$/);
     expect(body.deployHash).not.toBe(body.hash);
     expect(await isDeployed(owner.address, "testnet")).toBe(true);
+  });
+
+  it("deploys nothing for a first call the owner did not sign, and pays nothing", async () => {
+    const owner = privateKeyToAccount(generatePrivateKey());
+    const relayerAddress = getRelayer().address;
+    const before = await xlmBalance(relayerAddress);
+    const tampered = withArgument(await signedApprove(owner, 1), 2, i128(1_000_000));
+
+    const { status, body } = await relay(relayRequest(tampered));
+
+    expect(status).toBe(422);
+    expect(body.error).toBe("bad_signature");
+    expect(body.sent as unknown).toBe(false);
+    expect(body.detail).toMatch(/not the owner's signature/);
+    expect(await isDeployed(owner.address, "testnet")).toBe(false);
+    expect(await xlmBalance(relayerAddress)).toBe(before);
   });
 
   it("handles two first calls at once with a single deployment", async () => {

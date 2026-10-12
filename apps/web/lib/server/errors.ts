@@ -20,8 +20,16 @@ export class ApiError extends Error {
   constructor(
     readonly code: ApiErrorCode,
     readonly detail: string,
-    /** Extra fields for the response body: a transaction hash, the network's own diagnostics, a retry delay. */
-    readonly extra: { hash?: string; diagnostic?: string; retryAfterSeconds?: number } = {},
+    /**
+     * Extra fields for the response body: a transaction hash, the network's
+     * own diagnostics, a retry delay, and `sent`.
+     *
+     * `sent: false` is a statement about a relayed call: the server decided
+     * this before handing anything to the network, and has checked that the
+     * call has not run. `sent: true` says a transaction did go out. When the
+     * field is absent the server makes no claim either way.
+     */
+    readonly extra: { hash?: string; diagnostic?: string; retryAfterSeconds?: number; sent?: boolean } = {},
   ) {
     super(detail);
     this.name = "ApiError";

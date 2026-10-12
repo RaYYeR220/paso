@@ -16,6 +16,7 @@ import {
   isExpired,
   readContract,
   receiveMessageOnEvm,
+  recoverEntrySigner,
   signedFromRelayRequest,
   simulateSigned,
   SimulationError,
@@ -39,6 +40,7 @@ import {
   hexToBytes,
   http,
   isAddress,
+  isAddressEqual,
   pad,
   size,
   toHex,
@@ -91,7 +93,7 @@ const MAX_ATTESTATION_BYTES = 2_048;
 const MAX_DIAGNOSTIC_CHARS = 4_000;
 const REMEMBERED_DELIVERIES = 1_000;
 /** Changes whenever the shape of `RelayerState` does, so that state left by older code is never mistaken for this. */
-export const STATE_VERSION = 1;
+export const STATE_VERSION = 2;
 
 /**
  * Bounds on a mint the server pays for on Base. It is sent only after the
@@ -110,7 +112,16 @@ const EXIT_CHECKS_PER_CALLER_PER_HOUR = 30;
  * table is full of entries that still stand, new work is declined instead.
  */
 const MAX_EXITS = 5_000;
+const MAX_RELAYS = 5_000;
 const MAX_PENDING_SENDS = 256;
+/** How long the answer to a relayed call is kept, so that the same call asked again gets the same answer. */
+const RELAYED_MEMORY_MS = 24 * 60 * 60 * 1000;
+const REFUSED_MEMORY_MS = 15 * 60 * 1000;
+/** How many pages of one ledger's transactions are read when looking for the one that carried a signed call. */
+const LOOKUP_PAGES = 5;
+const LOOKUP_PAGE_SIZE = 200;
+/** What a caller is told to wait before asking again about a transaction that is on its way. */
+const ON_ITS_WAY_RETRY_SECONDS = 3;
 /** How long an answer that may yet change is remembered: a re-attested exit, a reverting simulation. */
 const SHORT_MEMORY_MS = 5 * 60 * 1000;
 /** How often an exit the server refused is looked up on Base again, in case someone else minted it since. */
@@ -286,6 +297,10 @@ export interface RelayerState {
   readonly delivered: Map<string, { until: number; result: DeliverResult }>;
   readonly exits: Map<string, Exit>;
   readonly sends: Map<string, PendingSend>;
+  /** Relayed calls being worked on, by what they are: the same call arriving again shares the work and its answer. */
+  readonly relaying: Map<string, Promise<RelayResult>>;
+  /** What became of a relayed call: the transaction that carried it, or the refusal it got before anything was sent. */
+  readonly relays: Map<string, { until: number; result?: RelayResult; refusal?: ApiError }>;
   /** Transactions on Base that were started and have neither succeeded nor failed yet. */
   unsettled: number;
   /**
@@ -316,6 +331,8 @@ export function createRelayerState(config: ServerConfig): RelayerState {
     delivered: new Map(),
     exits: new Map(),
     sends: new Map(),
+    relaying: new Map(),
+    relays: new Map(),
     unsettled: 0,
     inFlight() {
       const now = Date.now();
@@ -347,6 +364,8 @@ export class Relayer {
   private readonly completions: RelayerState["completions"];
   private readonly exits: RelayerState["exits"];
   private readonly sends: RelayerState["sends"];
+  private readonly relaying: RelayerState["relaying"];
+  private readonly relays: RelayerState["relays"];
   private readonly exitChecksPerCaller: Limiter;
   private readonly mintsPerCaller: Limiter;
   private readonly mintsOverall: Limiter;
@@ -375,6 +394,8 @@ export class Relayer {
     this.completions = state.completions;
     this.exits = state.exits;
     this.sends = state.sends;
+    this.relaying = state.relaying;
+    this.relays = state.relays;
     this.fees = state.fees;
     this.fundsPerCaller = state.fundsPerCaller;
     this.fundsPerOwner = state.fundsPerOwner;
@@ -391,36 +412,224 @@ export class Relayer {
    * authorisation entry, for the account derived from `owner`, that the
    * account contract accepts for exactly this call. The owner's account is
    * deployed first when it does not exist yet.
+   *
+   * Relaying is idempotent. A signed call can run once, and a request for it
+   * can arrive many times: a retry after a lost answer, a second tab, a
+   * client that gave up waiting. Every request for the same call, known by
+   * the hash of its signed entry and its function, gets the answer the first
+   * one got. While its transaction is on its way they are told so; after it
+   * was applied they get its hash; after a refusal that was decided before
+   * anything was sent they get that refusal. Nothing is simulated again for
+   * a call that is on its way or has run, because a call that has run always
+   * simulates as refused: its nonce is spent.
    */
   async relay(body: unknown): Promise<RelayResult> {
-    const { signed, func, entry } = this.readRelayRequest(body);
+    let request: ReturnType<Relayer["readRelayRequest"]>;
+    try {
+      request = this.readRelayRequest(body);
+    } catch (error) {
+      // Not a call that could be relayed at all, so not one that ever was.
+      throw error instanceof ApiError ? new ApiError(error.code, error.detail, { ...error.extra, sent: false }) : error;
+    }
+    const { signed, func, entry } = request;
+    const key = relayKey(func, entry);
 
-    // The same signed call, sent before with an outcome that was never learned: that is settled first, not sent again.
-    const key = `relay:${createHash("sha256").update(signed.entries[0] ?? "").digest("hex")}`;
-    const earlier = await this.settleSend(key);
-    if (earlier) return { hash: earlier };
-
-    const { sequence } = await this.server.getLatestLedger();
-    if (isExpired(signed, sequence)) {
-      throw new ApiError(
-        "expired",
-        `The signature was valid up to ledger ${signed.validUntilLedger} and the network is at ${sequence}; prepare and sign again`,
-      );
+    const known = this.relays.get(key);
+    if (known && known.until > Date.now()) {
+      if (known.result) return known.result;
+      if (known.refusal) throw known.refusal;
+    }
+    const running = this.relaying.get(key);
+    if (running) return running;
+    if (this.relaying.size >= MAX_IN_FLIGHT) {
+      throw new ApiError("unavailable", "The relayer is busy; try again in a moment");
     }
 
-    const deployHash = await this.ensureDeployed(signed.owner);
-    await this.assertAccepted(signed, func, entry);
+    const attempt = this.relayOnce(key, signed, func, entry).finally(() => this.relaying.delete(key));
+    this.relaying.set(key, attempt);
+    return attempt;
+  }
+
+  private async relayOnce(
+    key: string,
+    signed: Signed,
+    func: xdr.HostFunction,
+    entry: xdr.SorobanAuthorizationEntry,
+  ): Promise<RelayResult> {
+    // The same call, handed to the network before with an outcome that was never learned: that is settled first.
+    const earlier = await this.settleSend(key);
+    if (earlier) return this.rememberRelayed(key, { hash: earlier });
+
+    let deployHash: string | undefined;
+    try {
+      const { sequence } = await this.server.getLatestLedger();
+      if (isExpired(signed, sequence)) {
+        throw new ApiError(
+          "expired",
+          `The signature was valid up to ledger ${signed.validUntilLedger} and the network is at ${sequence}; prepare and sign again`,
+        );
+      }
+      // An account that exists judges the signature itself, in the simulation below, at no cost. One that does
+      // not exist cannot, and creating it costs the relayer a transaction: nothing is spent on that until the
+      // signature has been checked here to be the owner's, the way the account will check it.
+      if (!(await isDeployed(signed.owner, this.config.network, this.server))) {
+        await this.assertSignedByOwner(signed, entry);
+        deployHash = await this.ensureDeployed(signed.owner);
+      }
+      await this.assertAccepted(signed, func, entry);
+    } catch (error) {
+      return this.answerBeforeSending(key, func, entry, error);
+    }
 
     const operation = Operation.invokeHostFunction({ func, auth: [entry] });
+    let hash: string;
     try {
-      const hash = await this.send(key, operation, (simulation) => assertNothingElseAuthorised(simulation, entry));
-      return deployHash ? { hash, deployHash } : { hash };
+      hash = await this.send(key, operation, (simulation) => assertNothingElseAuthorised(simulation, entry));
     } catch (error) {
       if (error instanceof SimulationFailure) {
-        throw refusal(error.diagnostic, isExpired(signed, error.latestLedger));
+        return this.answerBeforeSending(key, func, entry, refusal(error.diagnostic, isExpired(signed, error.latestLedger)));
+      }
+      // The price check and the last look at the simulation both come before anything is signed.
+      if (error instanceof ApiError && error.code === "simulation_failed") {
+        return this.answerBeforeSending(key, func, entry, error);
+      }
+      if (error instanceof ApiError && error.code === "transaction_failed") {
+        throw new ApiError(error.code, error.detail, { ...error.extra, sent: true });
       }
       throw error;
     }
+    return this.rememberRelayed(key, deployHash ? { hash, deployHash } : { hash });
+  }
+
+  /**
+   * The account contract's own check, made here: the typed data is rebuilt
+   * from the entry, the signer recovered from its 65 bytes, and that signer
+   * has to be the owner. An entry that fails it would be refused by the
+   * account as `BadSignature`, so nothing is deployed or sent for it.
+   */
+  private async assertSignedByOwner(signed: Signed, entry: xdr.SorobanAuthorizationEntry): Promise<void> {
+    const signer = await recoverEntrySigner(entry, this.config.network).catch(() => null);
+    if (signer === null || !isAddressEqual(signer, signed.owner)) {
+      throw new ApiError(
+        "bad_signature",
+        "The signature is not the owner's signature over this call (BadSignature): the account was not deployed and nothing was sent",
+      );
+    }
+  }
+
+  /** Keeps the transaction of a relayed call while there is room. Without the record the chain is asked instead. */
+  private rememberRelayed(key: string, result: RelayResult): RelayResult {
+    if (this.relayRoom(key)) this.relays.set(key, { until: Date.now() + RELAYED_MEMORY_MS, result });
+    return result;
+  }
+
+  /** Whether the table of answers can take one more. Entries whose time is up are cleared first; none that stands is dropped. */
+  private relayRoom(key: string): boolean {
+    if (this.relays.has(key) || this.relays.size < MAX_RELAYS) return true;
+    const now = Date.now();
+    for (const [other, record] of this.relays) if (record.until <= now) this.relays.delete(other);
+    return this.relays.size < MAX_RELAYS;
+  }
+
+  /**
+   * The answer to a call that was turned down before this request sent
+   * anything. Usually that is the refusal. But a call that has already run,
+   * relayed by an earlier request whose answer was lost or by another server
+   * instance, is turned down in just the same way, because its nonce is
+   * spent. So the chain is asked first, and a call that did run is answered
+   * with its transaction.
+   *
+   * Only when the chain says the call has not run does the refusal say
+   * `sent: false`. When the chain cannot be asked, or the signature has
+   * expired and its nonce may be gone with it, the refusal makes no claim.
+   */
+  private async answerBeforeSending(
+    key: string,
+    func: xdr.HostFunction,
+    entry: xdr.SorobanAuthorizationEntry,
+    error: unknown,
+  ): Promise<RelayResult> {
+    const refusals: readonly string[] = ["bad_signature", "simulation_failed", "bad_request", "expired"];
+    if (!(error instanceof ApiError) || !refusals.includes(error.code)) throw error;
+
+    let earlier: Awaited<ReturnType<Relayer["executedBefore"]>>;
+    try {
+      earlier = await this.executedBefore(func, entry);
+    } catch {
+      throw error;
+    }
+    if (earlier.state === "executed") return this.rememberRelayed(key, { hash: earlier.hash });
+    if (earlier.state === "spent") {
+      throw new ApiError("unavailable", "This call has run on Stellar and its transaction has not been found yet; ask again in a moment", {
+        sent: true,
+        retryAfterSeconds: ON_ITS_WAY_RETRY_SECONDS,
+      });
+    }
+
+    const answer = error.code === "expired" ? error : new ApiError(error.code, error.detail, { ...error.extra, sent: false });
+    if (this.relayRoom(key)) this.relays.set(key, { until: Date.now() + REFUSED_MEMORY_MS, refusal: answer });
+    throw answer;
+  }
+
+  /**
+   * Whether this signed call has already run, read off the chain. A signed
+   * entry can be used once: using it writes its nonce under the account, in
+   * the ledger of the transaction that did. So a nonce on the ledger means
+   * the call ran, and the ledger it was written in holds the transaction.
+   *
+   * `unused`: the call has not run. `executed`: it ran, in this transaction.
+   * `spent`: it ran, and the transaction could not be picked out.
+   */
+  private async executedBefore(
+    func: xdr.HostFunction,
+    entry: xdr.SorobanAuthorizationEntry,
+  ): Promise<{ state: "unused" } | { state: "spent" } | { state: "executed"; hash: string }> {
+    const { credentials } = entry;
+    const authorised = entry.rootInvocation.function;
+    const address =
+      credentials.type === "sorobanCredentialsAddress"
+        ? credentials.address
+        : credentials.type === "sorobanCredentialsAddressV2"
+          ? credentials.addressV2
+          : undefined;
+    // An entry can only have carried the call it authorises at its root. For any other call it is as good as unused.
+    const isThisCall =
+      func.type === "hostFunctionTypeInvokeContract" &&
+      authorised.type === "sorobanAuthorizedFunctionTypeContractFn" &&
+      authorised.contractFn.toXdr("base64") === func.invokeContract.toXdr("base64");
+    if (!address || !isThisCall) return { state: "unused" };
+
+    const nonce = xdr.LedgerKey.contractData(
+      new xdr.LedgerKeyContractData({
+        contract: address.address,
+        key: xdr.ScVal.scvLedgerKeyNonce(new xdr.ScNonceKey({ nonce: address.nonce })),
+        durability: xdr.ContractDataDurability.temporary,
+      }),
+    );
+    const { entries } = await this.server.getLedgerEntries(nonce);
+    const [spent] = entries;
+    if (!spent) return { state: "unused" };
+    const ledger = spent.lastModifiedLedgerSeq;
+    if (ledger === undefined) return { state: "spent" };
+
+    const wanted = entry.toXdr("base64");
+    let cursor: string | undefined;
+    for (let page = 0; page < LOOKUP_PAGES; page += 1) {
+      const answer = await this.server.getTransactions(
+        cursor === undefined
+          ? { startLedger: ledger, pagination: { limit: LOOKUP_PAGE_SIZE } }
+          : { pagination: { cursor, limit: LOOKUP_PAGE_SIZE } },
+      );
+      for (const transaction of answer.transactions) {
+        if (transaction.ledger > ledger) return { state: "spent" };
+        if (transaction.status === rpc.Api.GetTransactionStatus.SUCCESS && carries(transaction.envelopeXdr, wanted)) {
+          return { state: "executed", hash: transaction.txHash };
+        }
+      }
+      if (answer.transactions.length < LOOKUP_PAGE_SIZE) break;
+      cursor = answer.cursor;
+    }
+    return { state: "spent" };
   }
 
   /** Deploys the account of an Ethereum address. Doing it twice changes nothing. */
@@ -1402,7 +1611,7 @@ export class Relayer {
       throw new ApiError(
         "unavailable",
         `Transaction ${pending.hash} is on its way and the network cannot be asked about it; try again in a moment`,
-        { hash: pending.hash },
+        { hash: pending.hash, sent: true, retryAfterSeconds: ON_ITS_WAY_RETRY_SECONDS },
       );
     }
     if (status === rpc.Api.GetTransactionStatus.SUCCESS) {
@@ -1418,7 +1627,11 @@ export class Relayer {
       this.sends.delete(key);
       return undefined;
     }
-    throw new ApiError("unavailable", `Transaction ${pending.hash} is on its way; ask again in a moment`, { hash: pending.hash });
+    throw new ApiError("unavailable", `Transaction ${pending.hash} is on its way; ask again in a moment`, {
+      hash: pending.hash,
+      sent: true,
+      retryAfterSeconds: ON_ITS_WAY_RETRY_SECONDS,
+    });
   }
 
   /** Refuses new sends while the table of transactions on their way is full of ones that may still land. */
@@ -1497,7 +1710,7 @@ export class Relayer {
           throw new ApiError(
             "unavailable",
             `Transaction ${hash} was sent and the network did not say whether it took it; ask again in a moment`,
-            { hash },
+            { hash, sent: true, retryAfterSeconds: ON_ITS_WAY_RETRY_SECONDS },
           );
         }
 
@@ -1539,6 +1752,8 @@ export class Relayer {
         }
         throw new ApiError("unavailable", `Transaction ${hash} was sent and has not been confirmed yet; ask again in a moment`, {
           hash,
+          sent: true,
+          retryAfterSeconds: ON_ITS_WAY_RETRY_SECONDS,
         });
       }
     });
@@ -1559,6 +1774,32 @@ function revertReason(error: unknown): string | null | undefined {
     return reason || null;
   }
   return /execution reverted/i.test(error.shortMessage) ? null : undefined;
+}
+
+/**
+ * What a relayed call is known by: the hash of its signed authorisation
+ * entry, byte for byte, together with the function it is submitted with. Two
+ * requests share a key exactly when they ask for the same thing.
+ */
+function relayKey(func: xdr.HostFunction, entry: xdr.SorobanAuthorizationEntry): string {
+  const hash = createHash("sha256");
+  hash.update(entry.toXdr());
+  hash.update(func.toXdr());
+  return `relay:${hash.digest("hex")}`;
+}
+
+/** Whether a transaction carries exactly this authorisation entry. */
+function carries(envelope: xdr.TransactionEnvelope, entry: string): boolean {
+  const operations =
+    envelope.type === "envelopeTypeTx"
+      ? envelope.v1.tx.operations
+      : envelope.type === "envelopeTypeTxFeeBump"
+        ? envelope.feeBump.tx.innerTx.v1.tx.operations
+        : [];
+  return operations.some(
+    ({ body }) =>
+      body.type === "invokeHostFunction" && body.invokeHostFunctionOp.auth.some((carried) => carried.toXdr("base64") === entry),
+  );
 }
 
 /** Stops a queued task the queue has stopped waiting for, before it starts anything new. */
