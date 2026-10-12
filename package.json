@@ -11,6 +11,16 @@
     "test:contracts": "stellar contract build && cargo test",
     "build:sdk": "pnpm --filter @paso/sdk build",
     "test:sdk": "pnpm --filter @paso/sdk test",
-    "test": "pnpm test:contracts && pnpm test:sdk"
+    "test": "pnpm test:contracts && pnpm test:sdk",
+    "test:web": "pnpm --filter @paso/web test",
+    "e2e": "tsx scripts/e2e.ts",
+    "verify": "tsx scripts/verify.ts"
+  },
+  "devDependencies": {
+    "@stellar/stellar-sdk": "17.2.1",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "~5.9.3",
+    "viem": "^2.57.4"
   }
 }
