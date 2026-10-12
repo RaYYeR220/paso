@@ -1,6 +1,7 @@
 import { hash, StrKey } from "@stellar/stellar-sdk";
 import { toHex, type Address, type Chain, type Hex } from "viem";
 import { base, baseSepolia } from "viem/chains";
+import mainnetDeployment from "../../../deployments/mainnet.json";
 import testnetDeployment from "../../../deployments/testnet.json";
 
 export type NetworkName = "testnet" | "mainnet";
@@ -41,7 +42,10 @@ export interface NetworkConfig {
 /** Every function that needs a network takes its name or a full config. */
 export type Network = NetworkName | NetworkConfig;
 
-/** What `deployments/<network>.json` holds. */
+/**
+ * What `deployments/<network>.json` holds. `hub` and `accountWasmHash` are
+ * empty until Paso is deployed on the network; `scripts/deploy.sh` fills them.
+ */
 interface Deployment {
   rpcUrl: string;
   networkPassphrase: string;
@@ -55,17 +59,6 @@ interface Deployment {
 
 export const STELLAR_CCTP_DOMAIN = 27;
 export const BASE_CCTP_DOMAIN = 6;
-
-const mainnetDeployment: Deployment = {
-  rpcUrl: "https://mainnet.sorobanrpc.com",
-  networkPassphrase: "Public Global Stellar Network ; September 2015",
-  hub: "",
-  accountWasmHash: "",
-  usdc: "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75",
-  tokenMessenger: "CAE2G5Z77UP7GYPYGFOWFGW7C7J6I4YP2AFGSADRKQY62SYUFLPNFTXL",
-  messageTransmitter: "CACMENFFJPJMSDAJQLX4R7K3SFZIW2LJSE3R2UMLGSWHFHS353FVXAZV",
-  forwarder: "CBZL2IH7F6BIDAA3WBNXYKIXSATJGMSW7K5P5MJ6STX5RXN47TZJDF5T",
-};
 
 function stellarConfig(deployment: Deployment, explorerUrl: string): StellarConfig {
   return {

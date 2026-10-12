@@ -6,10 +6,14 @@ import {
   evmTxUrl,
   NETWORKS,
   networkId,
+  requireHub,
   resolveNetwork,
   stellarAddressUrl,
   stellarTxUrl,
 } from "../src/networks";
+import { twinAddress } from "../src/twin";
+import mainnetDeployment from "../../../deployments/mainnet.json";
+import testnetDeployment from "../../../deployments/testnet.json";
 
 describe.each(Object.values(NETWORKS))("$name", (network) => {
   it("lists valid Stellar contract ids", () => {
@@ -51,6 +55,57 @@ describe("networks", () => {
     expect(evm.chain.id).toBe(8453);
     expect(evm.usdc).toBe("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
     expect(irisUrl).toBe("https://iris-api.circle.com");
+  });
+
+  it("keeps both deployment files in one shape", () => {
+    expect(Object.keys(mainnetDeployment)).toEqual(Object.keys(testnetDeployment));
+    expect(mainnetDeployment.network).toBe("mainnet");
+    expect(testnetDeployment.network).toBe("testnet");
+  });
+
+  it("reads Stellar mainnet from its deployment file", () => {
+    const { stellar } = NETWORKS.mainnet;
+    expect(stellar.rpcUrl).toBe(mainnetDeployment.rpcUrl);
+    expect(stellar.hub).toBe(mainnetDeployment.hub);
+    expect(stellar.accountWasmHash).toBe(mainnetDeployment.accountWasmHash);
+    expect(stellar.explorerUrl).toBe("https://stellar.expert/explorer/public");
+    expect(stellar.usdc).toBe("CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75");
+    expect(stellar.tokenMessenger).toBe("CAE2G5Z77UP7GYPYGFOWFGW7C7J6I4YP2AFGSADRKQY62SYUFLPNFTXL");
+    expect(stellar.messageTransmitter).toBe("CACMENFFJPJMSDAJQLX4R7K3SFZIW2LJSE3R2UMLGSWHFHS353FVXAZV");
+    expect(stellar.forwarder).toBe("CBZL2IH7F6BIDAA3WBNXYKIXSATJGMSW7K5P5MJ6STX5RXN47TZJDF5T");
+  });
+
+  it("pairs mainnet with Circle's contracts on Base", () => {
+    const { evm } = NETWORKS.mainnet;
+    expect(evm.tokenMessenger).toBe("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
+    expect(evm.messageTransmitter).toBe("0x81D40F21F12A8F0E3252Bccb954D722d4c464B64");
+  });
+
+  it.each(Object.values(NETWORKS))("records the hub and the account code of $name together", ({ stellar }) => {
+    const { hub, accountWasmHash } = stellar;
+    if (hub === "") {
+      expect(accountWasmHash).toBe("");
+    } else {
+      expect(StrKey.isValidContract(hub)).toBe(true);
+      expect(accountWasmHash).toMatch(/^[0-9a-f]{64}$/);
+    }
+  });
+
+  it("derives mainnet accounts once a hub is recorded, and says so until then", () => {
+    const owner = "0x000000000000000000000000000000000000dEaD";
+    if (NETWORKS.mainnet.stellar.hub === "") {
+      expect(() => requireHub("mainnet")).toThrow("Paso has no hub on mainnet yet");
+      expect(() => twinAddress(owner, "mainnet")).toThrow("Paso has no hub on mainnet yet");
+    } else {
+      expect(StrKey.isValidContract(twinAddress(owner, "mainnet"))).toBe(true);
+    }
+
+    // The same hub on another network is another account: the network id is part of the address.
+    const hub = NETWORKS.testnet.stellar.hub;
+    const deployed = { ...NETWORKS.mainnet, stellar: { ...NETWORKS.mainnet.stellar, hub } };
+    expect(requireHub(deployed)).toBe(hub);
+    expect(StrKey.isValidContract(twinAddress(owner, deployed))).toBe(true);
+    expect(twinAddress(owner, deployed)).not.toBe(twinAddress(owner, "testnet"));
   });
 
   it("resolves a name or passes a config through", () => {

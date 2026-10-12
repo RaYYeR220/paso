@@ -2,7 +2,11 @@
  * Checks, from public chain data alone, that a Stellar transaction was
  * authorised by an Ethereum key.
  *
- *   pnpm verify <stellar transaction hash> [--network testnet]
+ *   pnpm verify <stellar transaction hash> [--network testnet|mainnet]
+ *
+ * The network decides which RPC endpoint is asked, which passphrase the
+ * signature is checked against and where the explorer links point. It
+ * defaults to testnet.
  *
  * It fetches the transaction, takes the authorisation entry of the Paso
  * account in it, rebuilds the EIP-712 message a wallet displays for that
@@ -24,6 +28,7 @@ import {
   entryTypedData,
   ownerOf,
   renderCalls,
+  requireHub,
   resolveNetwork,
   stellarAddressUrl,
   stellarTxUrl,
@@ -79,6 +84,8 @@ async function accountCodeHash(server: rpc.Server, account: string): Promise<str
 async function main(): Promise<number> {
   const { hash, network } = parseArgs(process.argv.slice(2));
   const config = resolveNetwork(network);
+  // Without a hub there are no Paso accounts on the network, so nothing to check a transaction against.
+  requireHub(config);
   const server = new rpc.Server(config.stellar.rpcUrl);
 
   const tx = await server.getTransaction(hash);
