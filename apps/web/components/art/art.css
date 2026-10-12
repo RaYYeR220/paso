@@ -1,0 +1,39 @@
+.art-pass {
+  position: relative;
+  overflow: hidden;
+}
+
+.art-pass-layer {
+  position: absolute;
+  bottom: 0;
+  left: var(--pass-at, 50%);
+  display: block;
+  height: 100.4%;
+  min-width: 135%;
+  max-width: none;
+  aspect-ratio: 2260 / 600;
+  transform: translateX(-55.044%);
+  translate: calc(var(--drift, 0) * var(--depth, 0) * 3.2vw) 0;
+}
+
+.art-numeral {
+  font-family: var(--font-besley), "Besley", Georgia, serif;
+}
+
+.art-boom {
+  transform-box: fill-box;
+  transform-origin: 20.717% 50%;
+  transform: rotate(-70deg);
+  transition: transform 0.55s cubic-bezier(0.3, 1.35, 0.5, 1);
+}
+
+.art-boom[data-lowered="true"],
+[data-boom="down"] .art-boom:not([data-lowered="false"]) {
+  transform: rotate(0deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .art-boom {
+    transition: none;
+  }
+}

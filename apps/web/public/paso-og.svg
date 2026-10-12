@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <rect width="1200" height="630" fill="#F3E1B6"/>
+  <circle cx="820" cy="250" r="330" fill="#F1D8A1"/>
+  <circle cx="820" cy="250" r="250" fill="#EECA80"/>
+  <circle cx="820" cy="250" r="176" fill="#EBBB5E"/>
+  <circle cx="820" cy="250" r="110" fill="#E6AC3C"/>
+  <circle cx="820" cy="250" r="62" fill="#FCF3DA"/>
+  <path d="M0 330Q120 250 240 300T480 280T720 310T960 270T1200 300L1200 630L0 630Z" fill="#A9CFC0"/>
+  <path d="M-80 420L90 190L250 420Z" fill="#D5693A"/>
+  <path d="M120 420L330 150L520 420Z" fill="#C8552D"/>
+  <path d="M400 420L680 90L812 330L900 420Z" fill="#D5693A"/>
+  <path d="M740 420L828 330L960 120L1180 420Z" fill="#C8552D"/>
+  <path d="M1040 420L1170 220L1300 420Z" fill="#BF4C29"/>
+  <path d="M680 90L628 151L662 138L690 166L722 140Z" fill="#F8EDD2"/>
+  <path d="M960 120L921 182L950 168L978 192L1004 166Z" fill="#F8EDD2"/>
+  <path d="M330 150L296 194L324 184L346 204L362 190Z" fill="#F8EDD2"/>
+  <path d="M0 400Q200 360 420 392T820 372T1200 396L1200 630L0 630Z" fill="#17605F"/>
+  <path d="M0 440Q260 404 520 430T1200 420L1200 630L0 630Z" fill="#0B3436"/>
+  <path d="M560 630Q700 520 760 470T818 372L824 372Q840 430 800 478T720 630Z" fill="#F8EDD2"/>
+  <path d="M0 470Q300 440 600 462T1200 452L1200 630L0 630Z" fill="#E0A227"/>
+  <text x="56" y="92" font-family="Besley, Georgia, 'Times New Roman', serif" font-style="italic" font-weight="900" font-size="54" fill="#0B3436">Paso</text>
+  <text x="56" y="548" font-family="Besley, Georgia, 'Times New Roman', serif" font-weight="900" font-size="50" fill="#0B3436">Your Ethereum wallet is</text>
+  <text x="56" y="602" font-family="Besley, Georgia, 'Times New Roman', serif" font-weight="900" font-size="50" fill="#0B3436">already a Stellar account.</text>
+</svg>
