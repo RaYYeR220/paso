@@ -251,6 +251,7 @@ export function Workspace({ signer, owner, prefillTo }: WorkspaceProps) {
               elapsed={relayed}
               tamper={action.tamper}
               declined={state.phase === "review" && state.notice === "rejected"}
+              retrying={action.retrying}
               exampleHref={REFUSAL_ON_CHAIN}
               onSign={() => void action.sign()}
               onBack={action.back}

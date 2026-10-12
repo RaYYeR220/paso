@@ -320,12 +320,43 @@
     letter-spacing: 0.025em;
     font-variant-numeric: tabular-nums lining-nums;
   }
-  .field input::placeholder {
+  .field textarea {
+    flex: 1;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    outline: 0;
+    resize: none;
+    field-sizing: content;
+    background: none;
+    color: var(--ink);
+    font: 500 17px/1.25 var(--text);
+    letter-spacing: 0.025em;
+    font-variant-numeric: tabular-nums lining-nums;
+    overflow-wrap: anywhere;
+    overflow: hidden;
+  }
+  .field[data-lines="2"],
+  .field[data-lines="3"] {
+    height: auto;
+    min-height: 44px;
+    padding-block: 7px 8px;
+    border-radius: 22px;
+  }
+  .field[data-lines="2"] textarea,
+  .field[data-lines="3"] textarea {
+    font-size: 14.5px;
+    line-height: 1.3;
+    letter-spacing: 0.01em;
+  }
+  .field input::placeholder,
+  .field textarea::placeholder {
     color: var(--ink-soft);
     opacity: 1;
     letter-spacing: 0.01em;
   }
-  .field input:disabled {
+  .field input:disabled,
+  .field textarea:disabled {
     opacity: 0.72;
   }
   .field em {
@@ -1281,6 +1312,15 @@
     height: 12px;
     border-radius: 50%;
     background: var(--teal);
+  }
+  .stations + .claims {
+    margin: 2px 0 14px;
+  }
+  .stations + .claims li[data-mark] {
+    padding-left: 58px;
+  }
+  .stations + .claims li[data-mark]::before {
+    left: 8px;
   }
   .claims li[data-mark="refused"]::before {
     top: 15px;

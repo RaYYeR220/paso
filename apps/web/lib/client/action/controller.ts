@@ -61,6 +61,8 @@ export interface ActionDeps {
    * wallet for one that cannot be used any more wastes a prompt.
    */
   staleAfterMs?: number;
+  /** How long to wait before the one second attempt at a relayer that was unavailable. */
+  retryDelayMs?: number;
 }
 
 export interface ActionController {
@@ -78,6 +80,7 @@ export interface ActionController {
 }
 
 const DEFAULT_STALE_AFTER_MS = 9 * 60_000;
+const DEFAULT_RETRY_DELAY_MS = 1_500;
 const REFUSALS: readonly string[] = ["bad_signature", "simulation_failed", "bad_request"];
 
 /** The message the account contract rebuilds from an authorisation entry: its account, its calls, its payload. */
@@ -125,6 +128,7 @@ export function createActionController(owner: Address, deps: ActionDeps): Action
   const relayCall = deps.relay ?? relay;
   const alter = deps.withArgument ?? withArgument;
   const staleAfterMs = deps.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
+  const retryDelayMs = deps.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
 
   const store = createStore<ActionState>(IDLE_ACTION);
   /** Set from the first synchronous line of an operation to its last: two clicks cannot both get in. */
@@ -216,8 +220,24 @@ export function createActionController(owner: Address, deps: ActionDeps): Action
       at: now(),
     });
 
+    /**
+     * Hands the signed call to the relayer. A relayer that could not reach
+     * Stellar has judged nothing, so the same call is offered once more; a
+     * refusal is an answer and is never asked about twice.
+     */
+    const relayPatiently = async () => {
+      try {
+        return await relayCall(submitted, relayUrl);
+      } catch (error) {
+        if (describeFailure(error).code !== "unavailable" || !current()) throw error;
+        dispatch({ type: "RELAY_RETRY" });
+        await new Promise<void>((resolve) => setTimeout(resolve, retryDelayMs));
+        return relayCall(submitted, relayUrl);
+      }
+    };
+
     try {
-      const { hash, deployHash } = await relayCall(submitted, relayUrl);
+      const { hash, deployHash } = await relayPatiently();
       // On record even when the screen has moved on: the call did happen.
       record(review, {
         kind: review.request.kind === "transfer" ? "send" : review.request.kind === "exit" ? "exit" : "call",

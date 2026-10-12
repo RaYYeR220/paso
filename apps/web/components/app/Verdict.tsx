@@ -32,6 +32,8 @@ export interface VerdictProps {
   tamper?: boolean;
   /** True when the owner just said no in the wallet: the review is still open. */
   declined?: boolean;
+  /** True while a relayer that was unavailable is being asked a second time. */
+  retrying?: boolean;
   /**
    * A refusal recorded on chain, to look at. A relayer turns a mismatched
    * call down before sending anything, so a refusal here has no transaction
@@ -91,6 +93,7 @@ export function Verdict({
   elapsed,
   tamper = false,
   declined = false,
+  retrying = false,
   exampleHref,
   onSign,
   onBack,
@@ -123,7 +126,12 @@ export function Verdict({
       text = "Waiting for your signature. Compare what the wallet displays with the sheet on the left.";
       break;
     case "relaying":
-      text = (
+      text = retrying ? (
+        <>
+          Still sending: the relayer could not reach Stellar and is being asked once more
+          {elapsed ? <span className="elapsed">, {elapsed}</span> : null}. Nothing has been judged yet.
+        </>
+      ) : (
         <>
           Submitted. The account contract is rebuilding the message from the call it received
           {elapsed ? <span className="elapsed">, {elapsed}</span> : null}.

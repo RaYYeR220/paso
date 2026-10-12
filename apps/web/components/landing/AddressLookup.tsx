@@ -51,7 +51,7 @@ export function AddressLookup({ children }: { children: ReactNode }) {
         <span className="label">For example, {shorten(DEMO_ADDRESS)} is</span>
         <Account value={DEMO_ACCOUNT} />
         <span className="note">
-          <Link className="link" href={`/lookup/${DEMO_ADDRESS}`}>
+          <Link prefetch={false} className="link" href={`/lookup/${DEMO_ADDRESS}`}>
             Open this account
           </Link>
         </span>
@@ -62,7 +62,7 @@ export function AddressLookup({ children }: { children: ReactNode }) {
       <>
         <span className="label">Names are resolved on the lookup page.</span>
         <span className="note">
-          <Link className="link" href={`/lookup/${encodeURIComponent(query)}`}>
+          <Link prefetch={false} className="link" href={`/lookup/${encodeURIComponent(query)}`}>
             Look up {query}
           </Link>
         </span>
@@ -76,7 +76,7 @@ export function AddressLookup({ children }: { children: ReactNode }) {
           <Account value={found.account} />
           <span className="note">
             It can receive USDC now.{" "}
-            <Link className="link" href={`/lookup/${query}`}>
+            <Link prefetch={false} className="link" href={`/lookup/${query}`}>
               Open this account
             </Link>
           </span>

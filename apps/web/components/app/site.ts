@@ -10,6 +10,6 @@ export const SITE_LINKS = [
   { href: "/proof", label: "Proof" },
 ] as const;
 
-/** A refusal recorded on Stellar testnet: signed for one amount, submitted with another. */
+/** A refusal recorded on Stellar mainnet: signed for one amount, submitted with another. */
 export const REFUSAL_ON_CHAIN =
-  "https://stellar.expert/explorer/testnet/tx/ded23530dfc8d114a1350522e45b257170ed775738b0e85887f0e6667d52b181";
+  "https://stellar.expert/explorer/public/tx/eb94539839cba10012c01cea9453410d740d89194c2e99c4b33958aec144b6a3";

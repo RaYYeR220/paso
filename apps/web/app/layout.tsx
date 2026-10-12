@@ -25,7 +25,7 @@ export const metadata: Metadata = {
   metadataBase: siteUrl(),
   title: { default: "Paso", template: "%s · Paso" },
   description: "Your Ethereum wallet is already a Stellar account.",
-  icons: { icon: "/paso-mark.svg" },
+  robots: { index: true, follow: true },
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

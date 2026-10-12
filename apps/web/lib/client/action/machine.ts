@@ -72,6 +72,8 @@ export type ActionState =
       phase: "relaying";
       /** When the signed call was sent to the relayer, in milliseconds. */
       since: number;
+      /** True once the relayer could not reach Stellar and the same signed call is being offered a second time. */
+      retrying?: true;
     } & Review &
       Submission)
   | ({ phase: "done"; hash: string; deployHash?: string; finishedAt: number } & Review & Submission)
@@ -105,6 +107,8 @@ export type ActionEvent =
   | { type: "REFUSED"; code: RefusalCode; detail: string; reason: string; txHash: string | null }
   | { type: "EXPIRED"; detail: string }
   | { type: "RELAY_FAILED"; error: ProblemError }
+  /** The relayer was unavailable: the same signed call goes out once more. */
+  | { type: "RELAY_RETRY" }
   /** Back from the review to the form. */
   | { type: "BACK" }
   | { type: "RESET" };
@@ -206,6 +210,9 @@ export function actionReducer(state: ActionState, event: ActionEvent): ActionSta
     case "EXPIRED":
       if (state.phase !== "review" && state.phase !== "signing" && state.phase !== "relaying") return state;
       return { phase: "expired", detail: event.detail, ...reviewOf(state)! };
+
+    case "RELAY_RETRY":
+      return state.phase === "relaying" ? { ...state, retrying: true } : state;
 
     case "RELAY_FAILED": {
       if (state.phase !== "relaying") return state;

@@ -419,10 +419,55 @@ describe("failures", () => {
     });
   });
 
-  it("keeps the request when the relayer is down, so it can be tried again", async () => {
-    const { controller } = harness({ relay: [new RelayError("unavailable", 503, "The relayer is busy; try again in a moment"), { hash: STELLAR_HASH }] });
+  const down = () => new RelayError("unavailable", 503, "The relayer is busy; try again in a moment");
+
+  it("offers the same signed call once more when the relayer is unavailable", async () => {
+    const { controller, relay } = harness({ relay: [down(), { hash: STELLAR_HASH }] }, { retryDelayMs: 0 });
+    const retrying: (boolean | undefined)[] = [];
+    controller.subscribe(() => {
+      const state = controller.getState();
+      if (state.phase === "relaying") retrying.push(state.retrying);
+    });
     await controller.prepare(transferRequest);
     await controller.sign(owner);
+
+    expect(controller.getState()).toMatchObject({ phase: "done", hash: STELLAR_HASH });
+    expect(retrying).toEqual([undefined, true]);
+    expect(relay.calls).toHaveLength(2);
+    expect(submittedTo(relay, 1)).toBe(submittedTo(relay, 0));
+  });
+
+  it("never asks twice about a refusal, an expiry or an answer it cannot read", async () => {
+    for (const answer of [
+      new RelayError("bad_signature", 422, "Error(Contract, #2)"),
+      new RelayError("simulation_failed", 422, "HostError: Error(Contract, #10)"),
+      new RelayError("expired", 409, "prepare and sign again"),
+      new RelayError("relay_failed", 500, "<html>"),
+      new RelayError("rate_limited", 429, "slow down"),
+    ]) {
+      const { controller, relay } = harness({ relay: [answer, { hash: STELLAR_HASH }] }, { retryDelayMs: 0 });
+      await controller.prepare(transferRequest);
+      await controller.sign(owner);
+      expect(relay.calls).toHaveLength(1);
+      expect(controller.getState().phase).not.toBe("done");
+    }
+  });
+
+  it("gives the screen back when a reset comes during the second attempt", async () => {
+    const { controller, relay } = harness({ relay: [down()] }, { retryDelayMs: 0 });
+    await controller.prepare(transferRequest);
+    const signing = controller.sign(owner);
+    await until(() => relay.calls.length === 2, "the second attempt");
+    controller.reset();
+    expect(controller.getState()).toBe(IDLE_ACTION);
+    void signing;
+  });
+
+  it("keeps the request when the relayer stays down, so it can be tried again", async () => {
+    const { controller, relay } = harness({ relay: [down(), down(), { hash: STELLAR_HASH }] }, { retryDelayMs: 0 });
+    await controller.prepare(transferRequest);
+    await controller.sign(owner);
+    expect(relay.calls).toHaveLength(2);
     const failed = controller.getState();
     expect(failed).toMatchObject({ phase: "failed", stage: "relay", request: transferRequest, error: { code: "unavailable", retryable: true } });
     expect(failed.phase === "failed" && failed.review?.calls).toHaveLength(1);

@@ -42,6 +42,8 @@ export interface ActionFlow {
    * (`unsigned`, `checking`, `match`, `refused`).
    */
   panels: Panels;
+  /** True while a relayer that was unavailable is being asked a second time. Still sending: nothing has been judged. */
+  retrying: boolean;
   /** The demo control "Change the amount after signing". */
   tamper: boolean;
   setTamper(on: boolean): void;
@@ -107,6 +109,7 @@ export function useAction(): ActionFlow {
       calls: "calls" in state ? state.calls : (state.phase === "failed" ? (state.review?.calls ?? null) : null),
       attemptedCalls: submitted ? state.attemptedCalls : null,
       panels: panelsOf(state, contractName),
+      retrying: state.phase === "relaying" && state.retrying === true,
       tamper,
       setTamper: tamperChoice.set,
       link: state.phase === "done" ? stellarTx(state.hash) : null,

@@ -1,6 +1,6 @@
 "use client";
 
-import { useId, type FormEvent, type ReactNode } from "react";
+import { useId, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 
 export type SendDestination = "stellar" | "base";
 
@@ -29,6 +29,9 @@ export interface SendFormProps {
   children?: ReactNode;
 }
 
+/** Roughly what one line of the recipient field holds: past it, the field grows instead of hiding the end of an address. */
+const RECIPIENT_LINE = 26;
+
 const DESTINATIONS: readonly { value: SendDestination; label: string }[] = [
   { value: "stellar", label: "another Stellar account" },
   { value: "base", label: "back to Base" },
@@ -54,9 +57,18 @@ export function SendForm({
   const locked = preparing || disabled;
   const problem = toError ?? amountError ?? callProblem;
 
+  const recipientLines = Math.min(3, Math.max(1, Math.ceil(to.length / RECIPIENT_LINE)));
+
   const submit = (event: FormEvent) => {
     event.preventDefault();
     if (!locked) onSubmit();
+  };
+
+  /** An address is one line of text however many it takes on screen: Enter sends the form. */
+  const submitOnEnter = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    event.currentTarget.form?.requestSubmit();
   };
 
   return (
@@ -83,10 +95,10 @@ export function SendForm({
         {children}
         <label className="field-row" htmlFor={`${id}-to`}>
           <span>To</span>
-          <span className="field" data-invalid={toError ? true : undefined}>
-            <input
+          <span className="field" data-invalid={toError ? true : undefined} data-lines={recipientLines}>
+            <textarea
               id={`${id}-to`}
-              type="text"
+              rows={recipientLines}
               value={to}
               spellCheck={false}
               autoComplete="off"
@@ -96,7 +108,8 @@ export function SendForm({
               placeholder={destination === "base" ? "0x… or ENS name" : "G…, C…, 0x… or ENS name"}
               aria-invalid={toError ? true : undefined}
               aria-describedby={`${id}-status`}
-              onChange={(event) => onToChange(event.target.value)}
+              onKeyDown={submitOnEnter}
+              onChange={(event) => onToChange(event.target.value.replace(/\s+/g, ""))}
             />
           </span>
         </label>

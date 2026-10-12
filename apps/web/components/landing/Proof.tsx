@@ -8,9 +8,12 @@ import { REPO_URL, VERIFY_URL } from "./demo";
 const FACTS = [
   { name: "Account contract", detail: "7.8 KB, 29 tests" },
   { name: "Hub", detail: "4.2 KB, 15 tests" },
-  { name: "SDK", detail: "189 tests, sharing 11 signing vectors with the contracts" },
-  { name: "Base Sepolia → Stellar", detail: "in 7 seconds, and back in 9" },
+  { name: "SDK", detail: "200 tests, sharing 11 signing vectors with the contracts" },
+  { name: "Base → Stellar", detail: "attested in 2 seconds on mainnet" },
 ] as const;
+
+const MAINNET_HUB_URL =
+  "https://stellar.expert/explorer/public/contract/CDZCHMNSAAIST5K2DNP4DP6H3DE4UJISUOMDFQTKD7IK6CD477AB7LJK";
 
 export function Proof() {
   return (
@@ -28,7 +31,7 @@ export function Proof() {
             <a className="link" href={VERIFY_URL}>
               Verify a transaction yourself
             </a>
-            <Link className="link" href="/proof">
+            <Link className="link" href="/proof" prefetch={false}>
               See every claim
             </Link>
           </p>
@@ -43,7 +46,9 @@ export function Proof() {
             </li>
           ))}
           <li className="board live">
-            <b>Live on Stellar testnet</b>
+            <b>
+              <a href={MAINNET_HUB_URL}>Live on Stellar mainnet</a>
+            </b>
           </li>
         </ul>
       </div>

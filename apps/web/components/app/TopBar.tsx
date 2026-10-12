@@ -16,7 +16,7 @@ export interface TopBarProps {
 export function TopBar({ network, signer, signerKind = "wallet", leaveLabel = "Disconnect", onLeave, links = [] }: TopBarProps) {
   return (
     <header className="bar">
-      <Link className="wordmark" href="/" aria-label="Paso, home">
+      <Link className="wordmark" href="/" prefetch={false} aria-label="Paso, home">
         Paso
       </Link>
       <span className="net">{network}</span>

@@ -22,10 +22,10 @@ export function Hero() {
             Same key. No new wallet, no seed phrase, no XLM. Bring USDC from Base in about 20 seconds, and sign exactly what you see.
           </p>
           <div className="cta">
-            <Link className="btn" href="/app">
+            <Link prefetch={false} className="btn" href="/app">
               Connect wallet
             </Link>
-            <Link className="link" href="/app?demo=1">
+            <Link prefetch={false} className="link" href="/app?demo=1">
               Try it without a wallet
             </Link>
           </div>
