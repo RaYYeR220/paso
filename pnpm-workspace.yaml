@@ -4,6 +4,9 @@ packages:
   - "fixtures/gen"
 
 allowBuilds:
+  bufferutil: false
   esbuild: true
+  keccak: false
   sharp: false
   unrs-resolver: false
+  utf-8-validate: false
