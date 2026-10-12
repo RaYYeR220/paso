@@ -1,0 +1,11 @@
+{
+  "network": "testnet",
+  "rpcUrl": "https://soroban-testnet.stellar.org",
+  "networkPassphrase": "Test SDF Network ; September 2015",
+  "hub": "",
+  "accountWasmHash": "",
+  "usdc": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+  "tokenMessenger": "CDNG7HXAPBWICI2E3AUBP3YZWZELJLYSB6F5CC7WLDTLTHVM74SLRTHP",
+  "messageTransmitter": "CBJ6MTCKKZG73PMDZCJMSFRD7DQEMI4FKDH7CGDSV4W6FHCRBCQAVVJY",
+  "forwarder": "CA66Q2WFBND6V4UEB7RD4SAXSVIWMD6RA4X3U32ELVFGXV5PJK4T4VSZ"
+}

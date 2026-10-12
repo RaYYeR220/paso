@@ -1,0 +1,12 @@
+{
+  "name": "paso",
+  "private": true,
+  "license": "MIT",
+  "packageManager": "pnpm@12.11.2",
+  "engines": { "node": ">=22.12" },
+  "scripts": {
+    "build:contracts": "stellar contract build",
+    "test:contracts": "cargo test",
+    "test": "pnpm -r test"
+  }
+}
