@@ -7,6 +7,7 @@ import {
   assertOnlyAccountEntries,
   attachSignature,
   AuthorizationEntriesError,
+  recoverEntrySigner,
   authPayload,
   entryTypedData,
   setExpiration,
@@ -255,5 +256,71 @@ describe("assertOnlyAccountEntries", () => {
     expect(() => assertOnlyAccountEntries([], ACCOUNT)).toThrow(/does not need.*authoris/i);
     const twice = [unsignedEntry("sorobanCredentialsAddress"), unsignedEntry("sorobanCredentialsAddressV2")];
     expect(() => assertOnlyAccountEntries(twice, ACCOUNT)).toThrow(/2 separate authorisations/);
+  });
+});
+
+describe("recoverEntrySigner", () => {
+  const account = privateKeyToAccount(OWNER_KEY);
+
+  it.each(["sorobanCredentialsAddress", "sorobanCredentialsAddressV2"] as const)(
+    "recovers the wallet that signed an entry with %s",
+    async (kind) => {
+      const signed = await signEntry(account, unsignedEntry(kind), VALID_UNTIL, testNetwork);
+      expect(await recoverEntrySigner(signed, testNetwork)).toBe(OWNER);
+    },
+  );
+
+  it("recovers someone else when the expiration ledger is not the one that was signed", async () => {
+    const signed = await signEntry(account, unsignedEntry("sorobanCredentialsAddressV2"), VALID_UNTIL, testNetwork);
+    const later = setExpiration(signed, VALID_UNTIL + 1);
+
+    expect(await recoverEntrySigner(later, testNetwork)).not.toBe(OWNER);
+  });
+
+  it("accepts the recovery byte as 0 or 1 as well as 27 or 28, like the account", async () => {
+    const signed = await signEntry(account, unsignedEntry("sorobanCredentialsAddress"), VALID_UNTIL, testNetwork);
+    const credentials = credentialsOf(signed);
+    if (credentials.signature.type !== "scvBytes") throw new Error("signature is not bytes");
+    const bytes = credentials.signature.bytes.toBytes().slice();
+    bytes[64] = bytes[64]! - 27;
+    const raw = new xdr.SorobanAuthorizationEntry({
+      credentials: xdr.SorobanCredentials.sorobanCredentialsAddress(
+        new xdr.SorobanAddressCredentials({
+          address: credentials.address,
+          nonce: credentials.nonce,
+          signatureExpirationLedger: credentials.signatureExpirationLedger,
+          signature: xdr.ScVal.scvBytes(bytes),
+        }),
+      ),
+      rootInvocation: signed.rootInvocation,
+    });
+
+    expect(await recoverEntrySigner(raw, testNetwork)).toBe(OWNER);
+  });
+
+  it("refuses an entry with no signature, or one the account would not look at", async () => {
+    const unsigned = setExpiration(unsignedEntry("sorobanCredentialsAddressV2"), VALID_UNTIL);
+    await expect(recoverEntrySigner(unsigned, testNetwork)).rejects.toThrow(/not signed/);
+
+    const withBytes = (bytes: Uint8Array) =>
+      new xdr.SorobanAuthorizationEntry({
+        credentials: xdr.SorobanCredentials.sorobanCredentialsAddressV2(
+          new xdr.SorobanAddressCredentials({
+            address: new Address(ACCOUNT).toScAddress(),
+            nonce: NONCE,
+            signatureExpirationLedger: VALID_UNTIL,
+            signature: xdr.ScVal.scvBytes(bytes),
+          }),
+        ),
+        rootInvocation: transferInvocation(),
+      });
+    await expect(recoverEntrySigner(withBytes(new Uint8Array(64).fill(1)), testNetwork)).rejects.toThrow(/65 bytes/);
+    const highS = new Uint8Array(65).fill(0xff);
+    highS[64] = 27;
+    await expect(recoverEntrySigner(withBytes(highS), testNetwork)).rejects.toThrow(/low-s/);
+    const badRecovery = new Uint8Array(65).fill(1);
+    badRecovery[64] = 5;
+    await expect(recoverEntrySigner(withBytes(badRecovery), testNetwork)).rejects.toThrow(/recovery byte/);
+    await expect(recoverEntrySigner(sourceAccountEntry(), testNetwork)).rejects.toThrow(/address credentials/);
   });
 });

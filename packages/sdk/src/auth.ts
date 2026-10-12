@@ -1,5 +1,5 @@
 import { Address, buildAuthorizationEntryPreimage, hash, xdr } from "@stellar/stellar-sdk";
-import { hexToBytes, size, toHex, type Hex } from "viem";
+import { hexToBytes, recoverTypedDataAddress, size, toHex, type Address as EvmAddress, type Hex } from "viem";
 import { resolveNetwork, type Network } from "./networks";
 import { renderCalls } from "./render";
 import { typedData, type AuthorizationTypedData } from "./typedData";
@@ -217,6 +217,30 @@ export function attachSignature(entry: xdr.SorobanAuthorizationEntry, signature:
   }
   assertUsableSignature(signature);
   return withAddressCredentials(entry, { signature: xdr.ScVal.scvBytes(hexToBytes(signature)) });
+}
+
+/**
+ * The Ethereum address whose key signed an authorisation entry.
+ *
+ * The typed data is rebuilt from the entry itself, under its own credential
+ * type and expiration ledger, exactly as the wallet was shown it and as the
+ * account contract rebuilds it, and the signer is recovered from the 65 bytes
+ * the entry carries. This is the account contract's check, made off chain:
+ * the entry authorises its calls on chain only if the address returned here
+ * is the owner the account was created for.
+ *
+ * It is what a fee payer asks before it spends anything on a request, and
+ * what tells a signature apart from 65 arbitrary bytes while the account does
+ * not exist yet. Throws when the entry is not signed, or carries a signature
+ * the account would not even look at.
+ */
+export async function recoverEntrySigner(entry: xdr.SorobanAuthorizationEntry, network: Network): Promise<EvmAddress> {
+  const signature = entrySignature(entry);
+  if (signature === null) {
+    throw new Error("The authorisation entry is not signed");
+  }
+  assertUsableSignature(signature);
+  return recoverTypedDataAddress({ ...entryTypedData(entry, network), signature });
 }
 
 /** Sets the expiration, asks the wallet to sign the typed data and attaches the signature. */
