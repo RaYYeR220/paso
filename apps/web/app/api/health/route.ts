@@ -1,5 +1,5 @@
 import { connection } from "next/server";
-import { respond } from "@/lib/server/http";
+import { limit, respond } from "@/lib/server/http";
 import { getRelayer } from "@/lib/server/relayer";
 
 /**
@@ -7,7 +7,10 @@ import { getRelayer } from "@/lib/server/relayer";
  * the relayer's address and XLM, the demo payer's address and its balances
  * on Base. Addresses and balances only.
  */
-export async function GET(): Promise<Response> {
+export async function GET(request: Request): Promise<Response> {
   await connection();
-  return respond(() => getRelayer().health());
+  return respond(async () => {
+    limit("health", request);
+    return getRelayer().health();
+  });
 }

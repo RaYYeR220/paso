@@ -175,6 +175,8 @@ describe.skipIf(!live || !ownerKey)("POST /api/relay, for an account that exists
 
   it("refuses a request for another network, a missing signature and anything that is not JSON", async () => {
     expect((await relay({ ...request, network: "mainnet" })).body.error).toBe("bad_request");
+    expect((await relay({ ...request, network: undefined })).body.error).toBe("bad_request");
+    expect((await relay({ ...request, auth: [...request.auth, ...request.auth, ...request.auth] })).status).toBe(400);
     expect((await relay({ ...request, auth: [] })).body.detail).toMatch(/does not need/);
     expect((await relay({ ...request, func: "AAAA" })).body.error).toBe("bad_request");
 

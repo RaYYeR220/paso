@@ -166,6 +166,48 @@ describe("POST /api/cctp/deliver, once the burn is attested", () => {
     });
   });
 
+  it("refuses a message too large to be a USDC transfer, without decoding it", async () => {
+    const relayer = offlineRelayer();
+    const chain = stubChain(relayer, { nonceUsed: [], send: async () => "ab".repeat(32) });
+    stubIris(() => complete(`${MESSAGE}${"00".repeat(8_192)}`));
+
+    await expect(relayer.deliver({ network: "testnet", sourceDomain: 1, txHash: freshTxHash() })).rejects.toMatchObject({
+      code: "bad_request",
+      detail: expect.stringContaining("too large"),
+    });
+    expect(chain.isNonceUsed).not.toHaveBeenCalled();
+    expect(chain.send).not.toHaveBeenCalled();
+  });
+
+  it("stops waiting for Iris and answers pending when it hangs", async () => {
+    vi.useFakeTimers();
+    const relayer = offlineRelayer();
+    vi.stubGlobal("fetch", (_input: RequestInfo | URL, init?: RequestInit) =>
+      new Promise<Response>((_, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal?.reason))),
+    );
+
+    const answer = relayer.deliver({ network: "testnet", sourceDomain: 6, txHash: freshTxHash() });
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(await answer).toEqual({ status: "pending", attestation: "unreachable" });
+    vi.useRealTimers();
+  });
+
+  it("declines new burns while too many lookups are under way, and takes them again afterwards", async () => {
+    const relayer = offlineRelayer();
+    const answers: Array<(response: Response) => void> = [];
+    vi.stubGlobal("fetch", () => new Promise<Response>((resolve) => answers.push(resolve)));
+    const ask = () => relayer.deliver({ network: "testnet", sourceDomain: 6, txHash: freshTxHash() });
+
+    const under = Array.from({ length: 64 }, ask);
+    await expect(ask()).rejects.toMatchObject({ code: "unavailable", detail: expect.stringContaining("busy") });
+
+    for (const answer of answers) answer(Response.json({ error: "Message not found" }, { status: 404 }));
+    expect(new Set((await Promise.all(under)).map((result) => result.status))).toEqual(new Set(["pending"]));
+    stubIris(() => Response.json({ error: "Message not found" }, { status: 404 }));
+    await expect(ask()).resolves.toEqual({ status: "pending", attestation: "not_found" });
+  });
+
   it("refuses requests that do not name a burn", async () => {
     const relayer = offlineRelayer();
     const good = { network: "testnet", sourceDomain: 6, txHash: freshTxHash() };
@@ -173,6 +215,12 @@ describe("POST /api/cctp/deliver, once the burn is attested", () => {
     await expect(relayer.deliver({ ...good, txHash: "0x1234" })).rejects.toMatchObject({ code: "bad_request" });
     await expect(relayer.deliver({ ...good, sourceDomain: 27 })).rejects.toMatchObject({ code: "bad_request" });
     await expect(relayer.deliver({ ...good, sourceDomain: "6" })).rejects.toMatchObject({ code: "bad_request" });
+    await expect(relayer.deliver({ ...good, sourceDomain: -1 })).rejects.toMatchObject({ code: "bad_request" });
+    await expect(relayer.deliver({ ...good, sourceDomain: 6.5 })).rejects.toMatchObject({ code: "bad_request" });
+    await expect(relayer.deliver({ ...good, sourceDomain: 2 ** 32 })).rejects.toMatchObject({ code: "bad_request" });
+    await expect(relayer.deliver({ ...good, txHash: `0x${"a".repeat(65)}` })).rejects.toMatchObject({ code: "bad_request" });
+    await expect(relayer.deliver({ ...good, txHash: `0x${"g".repeat(64)}` })).rejects.toMatchObject({ code: "bad_request" });
+    await expect(relayer.deliver({ ...good, txHash: ["0x"] })).rejects.toMatchObject({ code: "bad_request" });
     await expect(relayer.deliver({ ...good, network: "mainnet" })).rejects.toMatchObject({ code: "bad_request" });
     await expect(relayer.deliver("0xabc")).rejects.toMatchObject({ code: "bad_request" });
   });

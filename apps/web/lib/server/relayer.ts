@@ -29,20 +29,37 @@ import {
   hexToBytes,
   http,
   isAddress,
+  size,
   type Address,
   type Hex,
 } from "viem";
 import { loadConfig, type ServerConfig } from "./config";
 import { ApiError } from "./errors";
-import { createQueue } from "./queue";
-import { createLimiter, type Limiter } from "./ratelimit";
+import { createQueue, QueueFullError, QueueTimeoutError, type Queue } from "./queue";
+import { createBudget, createLimiter, type Budget, type Limiter } from "./ratelimit";
 
 /** What the network offers above the resource fee to be included in a ledger, in stroops. */
 const INCLUSION_FEE = "1000";
 const TRANSACTION_TIMEOUT_SECONDS = 60;
-const CONFIRMATION_ATTEMPTS = 45;
+const CONFIRMATION_ATTEMPTS = 30;
 const BUSY_RETRIES = 3;
 const BUSY_WAIT_MS = 2000;
+
+/**
+ * Bounds on waiting. No call to the network is waited for indefinitely, and
+ * no transaction holds the queue of the relayer account for longer than
+ * `SEND_TIMEOUT_MS`: one slow or hanging request cannot stall the others.
+ */
+const RPC_TIMEOUT_MS = 15_000;
+const EVM_TIMEOUT_MS = 8_000;
+const IRIS_TIMEOUT_MS = 10_000;
+const SEND_TIMEOUT_MS = 50_000;
+const BURN_TIMEOUT_MS = 55_000;
+
+/** Bounds on work in progress. Past them a request is declined at once instead of piling up. */
+const MAX_QUEUED_TRANSACTIONS = 8;
+const MAX_QUEUED_BURNS = 4;
+const MAX_IN_FLIGHT = 64;
 
 /** One test USDC, in Base's 6-decimal units: what the demo faucet sends per request. */
 export const DEMO_FUND_AMOUNT = BigInt(1_000_000);
@@ -50,9 +67,20 @@ export const DEMO_FUND_AMOUNT = BigInt(1_000_000);
 const STANDING_ALLOWANCE = BigInt(1_000) * DEMO_FUND_AMOUNT;
 
 const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+const HEALTH_CACHE_MS = 5_000;
+
+/** Bounds on input: what a request, or an answer from another service, may ask the server to decode and keep. */
 const MAX_XDR_CHARS = 16_384;
+const MAX_AUTH_ENTRIES = 2;
+const MAX_DOMAIN = 0xffff_ffff;
+const MAX_MESSAGE_BYTES = 8_192;
+const MAX_ATTESTATION_BYTES = 2_048;
 const MAX_DIAGNOSTIC_CHARS = 4_000;
 const REMEMBERED_DELIVERIES = 1_000;
+
+/** The one key of a limit that applies to all callers together. */
+const EVERYONE = "everyone";
 
 /** Circle's MessageTransmitter: the message was delivered before. */
 const NONCE_ALREADY_USED = "Error(Contract, #6908)";
@@ -168,19 +196,25 @@ type Simulated = rpc.Api.SimulateTransactionSuccessResponse;
 export class Relayer {
   readonly address: string;
   private readonly server: rpc.Server;
-  private readonly queue = createQueue();
-  private readonly evmQueue = createQueue();
+  private readonly queue: Queue = createQueue({ maxPending: MAX_QUEUED_TRANSACTIONS, timeoutMs: SEND_TIMEOUT_MS });
+  private readonly evmQueue: Queue = createQueue({ maxPending: MAX_QUEUED_BURNS, timeoutMs: BURN_TIMEOUT_MS });
   private readonly deployments = new Map<string, Promise<string | undefined>>();
   private readonly deliveries = new Map<string, Promise<DeliverResult>>();
   private readonly delivered = new Map<string, DeliverResult>();
-  private readonly fundsPerIp: Limiter;
+  /** Fees of the relayer account over the last day, counted when a transaction is signed. */
+  private readonly fees: Budget;
+  private readonly fundsPerCaller: Limiter;
   private readonly fundsPerOwner: Limiter;
+  private readonly fundsOverall: Limiter;
+  private healthReport?: { until: number; report: ReturnType<Relayer["readHealth"]> };
 
   constructor(readonly config: ServerConfig) {
     this.address = config.relayer.publicKey();
-    this.server = new rpc.Server(config.network.stellar.rpcUrl);
-    this.fundsPerIp = createLimiter({ limit: config.demoFund.perIpPerHour, windowMs: HOUR_MS });
-    this.fundsPerOwner = createLimiter({ limit: config.demoFund.perOwnerPerDay, windowMs: 24 * HOUR_MS });
+    this.server = new rpc.Server(config.network.stellar.rpcUrl, { timeout: RPC_TIMEOUT_MS });
+    this.fees = createBudget({ limit: config.maxDailyFees, windowMs: DAY_MS });
+    this.fundsPerCaller = createLimiter({ limit: config.demoFund.perIpPerHour, windowMs: HOUR_MS });
+    this.fundsPerOwner = createLimiter({ limit: config.demoFund.perOwnerPerDay, windowMs: DAY_MS });
+    this.fundsOverall = createLimiter({ limit: config.demoFund.perDay, windowMs: DAY_MS, maxKeys: 1 });
   }
 
   /**
@@ -207,7 +241,7 @@ export class Relayer {
 
     const operation = Operation.invokeHostFunction({ func, auth: [entry] });
     try {
-      const hash = await this.send(operation, (simulation) => this.assertWorthRelaying(simulation, entry));
+      const hash = await this.send(operation, (simulation) => assertNothingElseAuthorised(simulation, entry));
       return deployHash ? { hash, deployHash } : { hash };
     } catch (error) {
       if (error instanceof SimulationFailure) {
@@ -242,6 +276,9 @@ export class Relayer {
     if (known) return known;
     const running = this.deliveries.get(key);
     if (running) return running;
+    if (this.deliveries.size >= MAX_IN_FLIGHT) {
+      throw new ApiError("unavailable", "The relayer is busy; try again in a moment");
+    }
 
     const delivery = this.deliverOnce(sourceDomain, txHash).finally(() => this.deliveries.delete(key));
     this.deliveries.set(key, delivery);
@@ -258,10 +295,16 @@ export class Relayer {
 
   /**
    * Testnet only: the demo payer burns one test USDC on Base for the account
-   * of `owner`. Limited per caller address and per owner; the counts are kept
+   * of `owner`.
+   *
+   * Three limits apply: per caller, per owner, and per day for everyone
+   * together. All three are looked at before any is counted; once counted,
+   * an attempt stays counted whatever becomes of it, because a burn that
+   * fails half way may already have cost the payer gas, and a caller must
+   * not be able to earn retries by making attempts fail. The counts are kept
    * in memory and start over when the server restarts or is redeployed.
    */
-  async demoFund(body: unknown, ip: string): Promise<DemoFundResult> {
+  async demoFund(body: unknown, caller: string): Promise<DemoFundResult> {
     const { network, payer } = this.config;
     if (network.name !== "testnet") {
       throw new ApiError("not_found", "The demo faucet exists on testnet only");
@@ -272,33 +315,61 @@ export class Relayer {
     const owner = this.readOwner(body);
     const ownerKey = owner.toLowerCase();
 
-    const perIp = this.fundsPerIp.take(ip);
-    if (!perIp.ok) {
+    // Asked before anything is counted: an empty faucet costs nobody an attempt.
+    await this.assertFaucetFunded(payer.address);
+
+    const perCaller = this.fundsPerCaller.check(caller);
+    if (!perCaller.ok) {
       throw new ApiError("rate_limited", "This address has used the demo faucet too often; try again later", {
-        retryAfterSeconds: perIp.retryAfterSeconds,
+        retryAfterSeconds: perCaller.retryAfterSeconds,
       });
     }
-    const perOwner = this.fundsPerOwner.take(ownerKey);
+    const perOwner = this.fundsPerOwner.check(ownerKey);
     if (!perOwner.ok) {
-      this.fundsPerIp.refund(ip);
       throw new ApiError("rate_limited", "This account has already been funded by the demo faucet; try again later", {
         retryAfterSeconds: perOwner.retryAfterSeconds,
       });
     }
+    const overall = this.fundsOverall.check(EVERYONE);
+    if (!overall.ok) {
+      throw new ApiError("unavailable", "The demo faucet has given out all it gives in a day; try again later", {
+        retryAfterSeconds: overall.retryAfterSeconds,
+      });
+    }
+    const counted = [
+      this.fundsPerCaller.take(caller),
+      this.fundsPerOwner.take(ownerKey),
+      this.fundsOverall.take(EVERYONE),
+    ];
+    if (!counted.every((allowance) => allowance.ok)) {
+      throw new ApiError("unavailable", "The demo faucet is not available right now; try again later");
+    }
 
     try {
-      return await this.evmQueue(() => this.burnForDemo(owner, payer.address));
+      return await this.queued(this.evmQueue, (signal) => this.burnForDemo(owner, payer.address, signal));
     } catch (error) {
-      this.fundsPerIp.refund(ip);
-      this.fundsPerOwner.refund(ownerKey);
       if (error instanceof ApiError) throw error;
-      const reason = isRecord(error) && typeof error.shortMessage === "string" ? error.shortMessage : "the burn failed";
-      throw new ApiError("unavailable", `The demo faucet could not send USDC on Base: ${reason}`);
+      // The cause stays in the log: a transport error can quote the endpoint it failed to reach.
+      console.error("Faucet burn failed:", error instanceof Error ? error.name : "unknown error");
+      throw new ApiError("unavailable", `The demo faucet could not send USDC on ${network.evm.chain.name}; try again later`);
     }
   }
 
-  /** What the server runs on and what its accounts hold. Addresses and balances only. */
-  async health() {
+  /**
+   * What the server runs on and what its accounts hold. Addresses and
+   * balances only, all of them public on their chains. The answer is kept
+   * for a few seconds, so asking often does not turn into as many requests
+   * to the networks.
+   */
+  health(): ReturnType<Relayer["readHealth"]> {
+    const now = Date.now();
+    if (!this.healthReport || this.healthReport.until <= now) {
+      this.healthReport = { until: now + HEALTH_CACHE_MS, report: this.readHealth() };
+    }
+    return this.healthReport.report;
+  }
+
+  private async readHealth() {
     const { network, payer, maxResourceFee } = this.config;
     const { usdc } = network.evm;
     const evm = this.evmClients();
@@ -371,16 +442,17 @@ export class Relayer {
     const { network, owner, func, auth } = body;
     this.assertNetwork(network, true);
     const text = (value: unknown): value is string => typeof value === "string" && value.length <= MAX_XDR_CHARS;
-    if (typeof owner !== "string" || !text(func) || !Array.isArray(auth) || !auth.every(text)) {
+    const entries = Array.isArray(auth) && auth.length <= MAX_AUTH_ENTRIES && auth.every(text);
+    if (typeof owner !== "string" || owner.length > 42 || !text(func) || !entries) {
       throw new ApiError(
         "bad_request",
-        "owner must be an Ethereum address, func a base64 host function and auth a list of base64 authorisation entries",
+        "owner must be an Ethereum address, func a base64 host function and auth a list with the account's base64 authorisation entry",
       );
     }
 
     try {
       const signed = signedFromRelayRequest(
-        { network: this.config.network.name, owner: owner as Address, func, auth },
+        { network: this.config.network.name, owner: owner as Address, func, auth: auth as string[] },
         this.config.network,
       );
       // Decoded again from the validated request: the call, and the one entry
@@ -402,13 +474,14 @@ export class Relayer {
     this.assertNetwork(body.network, true);
     const { sourceDomain, txHash } = body;
     const { cctpDomain } = this.config.network.stellar;
-    if (!Number.isInteger(sourceDomain) || (sourceDomain as number) < 0 || sourceDomain === cctpDomain) {
+    const domain = Number.isInteger(sourceDomain) ? (sourceDomain as number) : -1;
+    if (domain < 0 || domain > MAX_DOMAIN || domain === cctpDomain) {
       throw new ApiError("bad_request", "sourceDomain must be the CCTP domain of the chain the USDC was burned on");
     }
     if (typeof txHash !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
       throw new ApiError("bad_request", "txHash must be the hash of the burn transaction (0x and 64 hex digits)");
     }
-    return { sourceDomain: sourceDomain as number, txHash: txHash as Hex };
+    return { sourceDomain: domain, txHash: txHash as Hex };
   }
 
   /**
@@ -448,28 +521,14 @@ export class Relayer {
     }
   }
 
-  /** Last look at the simulation the transaction is built from: its cost, and that it needs nothing beyond the entry. */
-  private assertWorthRelaying(simulation: Simulated, entry: xdr.SorobanAuthorizationEntry): void {
-    const { maxResourceFee } = this.config;
-    const fee = BigInt(simulation.minResourceFee);
-    if (fee > maxResourceFee) {
-      throw new ApiError(
-        "simulation_failed",
-        `This call would cost ${fee} stroops in resource fees; the relayer pays for calls up to ` +
-          `${maxResourceFee} stroops (${formatAmount(maxResourceFee, 7)} XLM)`,
-      );
-    }
-    const supplied = entry.toXdr("base64");
-    if ((simulation.result?.auth ?? []).some((reported) => reported.toXdr("base64") !== supplied)) {
-      throw new ApiError("simulation_failed", "The call needs an authorisation the request does not carry");
-    }
-  }
-
   /** Deploys the owner's account unless it exists. Requests for the same owner share one deployment. */
   private ensureDeployed(owner: Address): Promise<string | undefined> {
     const key = owner.toLowerCase();
     const running = this.deployments.get(key);
     if (running) return running;
+    if (this.deployments.size >= MAX_IN_FLIGHT) {
+      return Promise.reject(new ApiError("unavailable", "The relayer is busy; try again in a moment"));
+    }
 
     const { network } = this.config;
     const deployment = (async () => {
@@ -489,7 +548,12 @@ export class Relayer {
 
   private async deliverOnce(sourceDomain: number, txHash: Hex): Promise<DeliverResult> {
     const { network } = this.config;
-    const { status, attestation } = await fetchAttestation(sourceDomain, txHash, network);
+    // Circle's service gets a bounded time to answer; no answer in time is "ask again", like any other outage.
+    const patience = new AbortController();
+    const timer = setTimeout(() => patience.abort(), IRIS_TIMEOUT_MS);
+    const { status, attestation } = await fetchAttestation(sourceDomain, txHash, network, { signal: patience.signal })
+      .catch(() => ({ status: { state: "unreachable" as const }, attestation: undefined }))
+      .finally(() => clearTimeout(timer));
     if (!attestation) {
       if (status.state === "pending" && status.delayReason) {
         return { status: "pending", attestation: "pending", delayReason: status.delayReason };
@@ -498,6 +562,9 @@ export class Relayer {
     }
 
     const { message, nonce } = attestation;
+    if (size(message) > MAX_MESSAGE_BYTES || size(attestation.attestation) > MAX_ATTESTATION_BYTES) {
+      throw new ApiError("bad_request", "That transaction carries a message too large to be a USDC transfer");
+    }
     let burn: ReturnType<typeof decodeBurnMessage>;
     try {
       burn = decodeBurnMessage(message);
@@ -545,30 +612,49 @@ export class Relayer {
   private evmClients() {
     const { network, payer, evmRpcUrl } = this.config;
     const { chain } = network.evm;
-    const transport = http(evmRpcUrl);
+    const transport = http(evmRpcUrl, { timeout: EVM_TIMEOUT_MS, retryCount: 1 });
     return {
       publicClient: createPublicClient({ chain, transport }),
       walletClient: payer ? createWalletClient({ account: payer, chain, transport }) : null,
     };
   }
 
-  private async burnForDemo(owner: Address, payer: Address): Promise<DemoFundResult> {
+  /**
+   * Refuses while the payer could not make a payout: it must hold the amount
+   * on top of the reserve it keeps, and gas to send it. Reads only.
+   */
+  private async assertFaucetFunded(payer: Address): Promise<void> {
+    const { network, demoFund } = this.config;
+    const { chain, usdc } = network.evm;
+    const { publicClient } = this.evmClients();
+
+    let held: bigint;
+    let gas: bigint;
+    try {
+      [held, gas] = await Promise.all([
+        publicClient.readContract({ address: usdc, abi: erc20Abi, functionName: "balanceOf", args: [payer] }),
+        publicClient.getBalance({ address: payer }),
+      ]);
+    } catch {
+      throw new ApiError("unavailable", `The demo faucet could not reach ${chain.name}; try again later`);
+    }
+    if (held < DEMO_FUND_AMOUNT + demoFund.payerFloor) {
+      throw new ApiError("unavailable", `The demo faucet is out of test USDC on ${chain.name}`);
+    }
+    if (gas === BigInt(0)) {
+      throw new ApiError("unavailable", `The demo faucet is out of gas on ${chain.name}`);
+    }
+  }
+
+  private async burnForDemo(owner: Address, payer: Address, signal: AbortSignal): Promise<DemoFundResult> {
     const { network } = this.config;
     const { chain, usdc, tokenMessenger, cctpDomain } = network.evm;
     const { publicClient, walletClient } = this.evmClients();
     if (!walletClient) {
       throw new ApiError("unavailable", "The demo faucet has no payer configured");
     }
-
-    const balance = await publicClient.readContract({
-      address: usdc,
-      abi: erc20Abi,
-      functionName: "balanceOf",
-      args: [payer],
-    });
-    if (balance < DEMO_FUND_AMOUNT) {
-      throw new ApiError("unavailable", `The demo faucet is out of test USDC on ${chain.name}`);
-    }
+    // Asked again now that it is this request's turn: earlier payouts may have used what was there.
+    await this.assertFaucetFunded(payer);
 
     const allowance = await publicClient.readContract({
       address: usdc,
@@ -577,18 +663,20 @@ export class Relayer {
       args: [payer, tokenMessenger],
     });
     if (allowance < DEMO_FUND_AMOUNT) {
+      assertStillWanted(signal);
       const approval = await walletClient.writeContract({
         address: usdc,
         abi: erc20Abi,
         functionName: "approve",
         args: [tokenMessenger, STANDING_ALLOWANCE],
       });
-      const receipt = await publicClient.waitForTransactionReceipt({ hash: approval });
+      const receipt = await publicClient.waitForTransactionReceipt({ hash: approval, timeout: BURN_TIMEOUT_MS });
       if (receipt.status !== "success") {
         throw new ApiError("unavailable", `The demo faucet could not approve USDC on ${chain.name}`);
       }
     }
 
+    assertStillWanted(signal);
     const { burnTxHash, twin } = await fundFromEvm({
       walletClient,
       publicClient,
@@ -609,22 +697,73 @@ export class Relayer {
       .build();
   }
 
+  /** Runs a task in a queue, turning a full queue or an abandoned task into a refusal the caller can act on. */
+  private async queued<T>(queue: Queue, task: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    try {
+      return await queue(task);
+    } catch (error) {
+      if (error instanceof QueueFullError) {
+        throw new ApiError("unavailable", "The relayer is busy; try again in a moment");
+      }
+      if (error instanceof QueueTimeoutError) {
+        throw new ApiError("unavailable", "The network took too long to answer; try again in a moment");
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * The one place a transaction of the relayer account is priced, whatever
+   * it is for: a relayed call, a deployment, a delivery.
+   *
+   * Its resource fee must fit the cap per transaction, and its whole fee
+   * must fit what is left of the day's budget, where it is set aside before
+   * the transaction is signed. Both are read off the transaction about to be
+   * signed, which is what the network will charge against, as well as off
+   * the simulation. Nothing is given back when a transaction fails or is not
+   * taken: the budget may overstate what was spent, never understate it.
+   * Returns what this transaction has set aside so far, so a rebuilt
+   * transaction only adds the difference.
+   */
+  private setAsideFee(simulation: Simulated, fee: string, setAside: bigint): bigint {
+    const { maxResourceFee } = this.config;
+    const total = BigInt(fee);
+    const simulated = BigInt(simulation.minResourceFee);
+    const carried = total - BigInt(INCLUSION_FEE);
+    const resourceFee = carried > simulated ? carried : simulated;
+    if (resourceFee > maxResourceFee) {
+      throw new ApiError(
+        "simulation_failed",
+        `This transaction would cost ${resourceFee} stroops in resource fees; the relayer pays for transactions up to ` +
+          `${maxResourceFee} stroops (${formatAmount(maxResourceFee, 7)} XLM)`,
+      );
+    }
+    if (total <= setAside) return setAside;
+    if (!this.fees.spend(total - setAside)) {
+      throw new ApiError("unavailable", "The relayer has used up what it spends on fees in a day; try again later");
+    }
+    return total;
+  }
+
   /**
    * Sends one operation in a transaction of the relayer account and waits
    * for it to be applied.
    *
    * Everything from reading the sequence number to the confirmation happens
    * inside the queue, one transaction at a time. The operation is simulated
-   * there with the ledger as it is at that moment, and `inspect` gets the
-   * last word on that simulation before anything is signed. A transaction
-   * refused for a stale sequence number, which happens when another server
-   * instance used the account in between, is rebuilt and sent once more.
+   * there with the ledger as it is at that moment, `inspect` gets a say on
+   * that simulation, and the fee is checked against the cap and the day's
+   * budget before anything is signed. A transaction refused for a stale
+   * sequence number, which happens when another server instance used the
+   * account in between, is rebuilt and sent once more.
    */
   private send(operation: xdr.Operation, inspect: (simulation: Simulated) => void): Promise<string> {
-    return this.queue(async () => {
+    return this.queued(this.queue, async (signal) => {
       let staleSequences = 0;
       let busy = 0;
+      let setAside = BigInt(0);
       for (;;) {
+        assertStillWanted(signal);
         const account = await this.server.getAccount(this.address);
         const tx = this.transaction(account, operation);
 
@@ -641,6 +780,9 @@ export class Relayer {
         inspect(simulation);
 
         const ready = rpc.assembleTransaction(tx, simulation).build();
+        setAside = this.setAsideFee(simulation, ready.fee, setAside);
+        // The queue may have given up on this transaction while the network was answering.
+        assertStillWanted(signal);
         ready.sign(this.config.relayer);
         const sent = await this.server.sendTransaction(ready);
 
@@ -676,6 +818,19 @@ export class Relayer {
         });
       }
     });
+  }
+}
+
+/** Stops a queued task the queue has stopped waiting for, before it starts anything new. */
+function assertStillWanted(signal: AbortSignal): void {
+  if (signal.aborted) throw new QueueTimeoutError();
+}
+
+/** For a relayed call: the simulation must report no authorisation beyond the entry the owner signed. */
+function assertNothingElseAuthorised(simulation: Simulated, entry: xdr.SorobanAuthorizationEntry): void {
+  const supplied = entry.toXdr("base64");
+  if ((simulation.result?.auth ?? []).some((reported) => reported.toXdr("base64") !== supplied)) {
+    throw new ApiError("simulation_failed", "The call needs an authorisation the request does not carry");
   }
 }
 
