@@ -1,0 +1,21 @@
+[package]
+name = "paso-hub"
+description = "Deploys Paso accounts at addresses derived from Ethereum addresses and sends USDC back out over CCTP."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha2 = "0.10"
+sha3 = "0.10"
