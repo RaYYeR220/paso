@@ -21,8 +21,11 @@ export {
   type WalletSigner,
 } from "./signer";
 export { deriveTwin, useTwin, type Twin } from "./useTwin";
-export { useFunding, type Funding } from "./useFunding";
+export { useFunding, type Funding, type FundingLimits } from "./useFunding";
+export { burnAmountProblem, FAUCET_AMOUNT, WALLET_BURN_MIN, type BurnLimits } from "./funding/limits";
 export { useAction, type ActionFlow } from "./useAction";
+export { useExit, type Exit } from "./useExit";
+export type { ExitStage, ExitState, ExitTransfer } from "./exit";
 export { useActivity, type Activity } from "./useActivity";
 export { useLookup, type Lookup } from "./useLookup";
 export { useHealth, type Health } from "./useHealth";

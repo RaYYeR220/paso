@@ -46,6 +46,22 @@ function harness(script: { relay?: (RelayResult | Error)[] } = {}, overrides: Pa
 
 const submittedTo = (relay: ReturnType<typeof scripted<RelayResult>>, call = 0) => relay.calls[call]?.[0] as Signed;
 
+const fixtureMessage: SignedMessage = {
+  account: twin,
+  calls: [{ contract: USDC, fn: "transfer", args: [twin, RECIPIENT, "5"] }],
+  payload: "0x01",
+};
+const reviewFixture: Review = {
+  request: transferRequest,
+  owner: owner.address,
+  prepared: { calls: fixtureMessage.calls } as Review["prepared"],
+  calls: fixtureMessage.calls,
+  message: fixtureMessage,
+  recipient: null,
+  amount: 5n,
+  preparedAt: 1,
+};
+
 describe("the outbound flow", () => {
   it("prepares, shows exactly what the wallet will show, signs and relays", async () => {
     const { controller, relay, log, phases } = harness({ relay: [{ hash: STELLAR_HASH, deployHash: "aa".repeat(32) }] });
@@ -130,6 +146,7 @@ describe("tampering after the signature", () => {
     if (state.phase !== "refused") return;
 
     expect(state.code).toBe("bad_signature");
+    expect(state.txHash).toBeNull();
     expect(state.detail).toContain("BadSignature");
     expect(state.reason).toBe("BadSignature (#2): the transaction does not match what was signed. Nothing moved.");
     expect(state.tampered).toBe(true);
@@ -192,7 +209,7 @@ describe("refusals that are not about the signature", () => {
     await controller.prepare(transferRequest);
     await controller.sign(owner);
     const state = controller.getState();
-    expect(state).toMatchObject({ phase: "refused", code: "simulation_failed", tampered: false });
+    expect(state).toMatchObject({ phase: "refused", code: "simulation_failed", tampered: false, txHash: null });
     expect(state.phase === "refused" && state.reason).toBe("The call would fail, so it was not sent. The account does not hold enough USDC.");
     expect(state.phase === "refused" && panelsOf(state)).toMatchObject({ verdict: "refused", differingLines: [] });
   });
@@ -268,6 +285,56 @@ describe("the wallet says no", () => {
     await controller.sign(stranger);
     expect(controller.getState()).toMatchObject({ phase: "failed", stage: "sign", error: { code: "wrong_signer" } });
     expect(relay.calls).toHaveLength(0);
+  });
+});
+
+describe("how long it has been waiting", () => {
+  it("stamps the moment the wallet was asked and the moment the call was sent", async () => {
+    const seen: ActionState[] = [];
+    const { controller, clock } = harness();
+    controller.subscribe(() => seen.push(controller.getState()));
+    const slowSigner = {
+      signTypedData: async (typedData: Parameters<typeof owner.signTypedData>[0]) => {
+        clock.now += 4_000;
+        return owner.signTypedData(typedData);
+      },
+    };
+
+    await controller.prepare(transferRequest);
+    clock.now += 30_000;
+    const askedAt = clock.now;
+    await controller.sign(slowSigner as Parameters<typeof controller.sign>[0]);
+
+    const signing = seen.find((state) => state.phase === "signing");
+    const relaying = seen.find((state) => state.phase === "relaying");
+    expect(signing).toMatchObject({ phase: "signing", since: askedAt });
+    expect(relaying).toMatchObject({ phase: "relaying", since: askedAt + 4_000 });
+    expect(controller.getState()).toMatchObject({ phase: "done", finishedAt: askedAt + 4_000 });
+  });
+
+  it("starts the clock again when an expired request is signed again", async () => {
+    const seen: ActionState[] = [];
+    const { controller, clock } = harness({
+      relay: [new RelayError("expired", 409, "prepare and sign again"), { hash: STELLAR_HASH }],
+    });
+    controller.subscribe(() => seen.push(controller.getState()));
+    await controller.prepare(transferRequest);
+    await controller.sign(owner);
+    clock.now += 60_000;
+    await controller.signAgain(owner);
+    const sends = seen.filter((state) => state.phase === "relaying").map((state) => state.phase === "relaying" && state.since);
+    expect(sends).toEqual([1_000_000, 1_060_000]);
+  });
+
+  it("carries the stamps through the reducer and drops them at rest", () => {
+    const signing = actionReducer({ phase: "review", ...reviewFixture }, { type: "SIGN", tamper: true, at: 111 });
+    expect(signing).toMatchObject({ phase: "signing", tamper: true, since: 111 });
+    const relaying = actionReducer(signing, { type: "SIGNED", attempted: reviewFixture.message, tampered: true, at: 222 });
+    expect(relaying).toMatchObject({ phase: "relaying", since: 222, tampered: true });
+    const refused = actionReducer(relaying, { type: "REFUSED", code: "bad_signature", detail: "d", reason: "r", txHash: null });
+    expect(refused).toMatchObject({ phase: "refused", txHash: null });
+    expect("since" in refused).toBe(false);
+    expect("since" in actionReducer(relaying, { type: "RELAYED", hash: "h", at: 333 })).toBe(false);
   });
 });
 
@@ -398,20 +465,20 @@ describe("actionReducer", () => {
   const toRelaying: ActionEvent[] = [
     { type: "PREPARE", request: transferRequest },
     { type: "PREPARED", review },
-    { type: "SIGN", tamper: false },
-    { type: "SIGNED", attempted: message, tampered: false },
+    { type: "SIGN", tamper: false, at: 10 },
+    { type: "SIGNED", attempted: message, tampered: false, at: 20 },
   ];
 
   it("ignores every event that does not belong to the phase", () => {
     const stray: ActionEvent[] = [
       { type: "PREPARED", review },
       { type: "PREPARE_FAILED", error: problem },
-      { type: "SIGN", tamper: false },
+      { type: "SIGN", tamper: false, at: 10 },
       { type: "SIGN_REJECTED" },
       { type: "SIGN_FAILED", error: problem },
-      { type: "SIGNED", attempted: message, tampered: false },
+      { type: "SIGNED", attempted: message, tampered: false, at: 20 },
       { type: "RELAYED", hash: "h", at: 1 },
-      { type: "REFUSED", code: "bad_signature", detail: "d", reason: "r" },
+      { type: "REFUSED", code: "bad_signature", detail: "d", reason: "r", txHash: null },
       { type: "EXPIRED", detail: "d" },
       { type: "RELAY_FAILED", error: problem },
       { type: "BACK" },
@@ -430,9 +497,10 @@ describe("actionReducer", () => {
   it("reaches every end state from relaying", () => {
     const relaying = run(toRelaying);
     expect(run([{ type: "RELAYED", hash: "h", at: 9 }], relaying)).toMatchObject({ phase: "done", hash: "h", finishedAt: 9, calls: message.calls });
-    expect(run([{ type: "REFUSED", code: "bad_signature", detail: "d", reason: "r" }], relaying)).toMatchObject({
+    expect(run([{ type: "REFUSED", code: "bad_signature", detail: "d", reason: "r", txHash: null }], relaying)).toMatchObject({
       phase: "refused",
       code: "bad_signature",
+      txHash: null,
       detail: "d",
       shownCalls: message.calls,
       attemptedCalls: message.calls,
@@ -447,7 +515,7 @@ describe("actionReducer", () => {
       IDLE_ACTION,
       run(toRelaying.slice(0, 2)),
       run([{ type: "RELAYED", hash: "h", at: 9 }], relaying),
-      run([{ type: "REFUSED", code: "bad_request", detail: "d", reason: "r" }], relaying),
+      run([{ type: "REFUSED", code: "bad_request", detail: "d", reason: "r", txHash: null }], relaying),
       run([{ type: "EXPIRED", detail: "d" }], relaying),
       run([{ type: "RELAY_FAILED", error: problem }], relaying),
     ];

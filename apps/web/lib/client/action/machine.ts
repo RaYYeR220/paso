@@ -62,10 +62,32 @@ export type ActionState =
   | { phase: "idle"; notice?: "rejected" }
   | { phase: "preparing"; request: ActionRequest }
   | ({ phase: "review"; notice?: "rejected" } & Review)
-  | ({ phase: "signing"; tamper: boolean } & Review)
-  | ({ phase: "relaying" } & Review & Submission)
+  | ({
+      phase: "signing";
+      tamper: boolean;
+      /** When the wallet was asked, in milliseconds. */
+      since: number;
+    } & Review)
+  | ({
+      phase: "relaying";
+      /** When the signed call was sent to the relayer, in milliseconds. */
+      since: number;
+    } & Review &
+      Submission)
   | ({ phase: "done"; hash: string; deployHash?: string; finishedAt: number } & Review & Submission)
-  | ({ phase: "refused"; code: RefusalCode; detail: string; reason: string } & Review & Submission)
+  | ({
+      phase: "refused";
+      code: RefusalCode;
+      detail: string;
+      reason: string;
+      /**
+       * The transaction the refusal belongs to. A relayer checks a call
+       * before it sends anything, so a refusal comes with no transaction:
+       * this is `null`, and nothing was sent.
+       */
+      txHash: string | null;
+    } & Review &
+      Submission)
   /** The signature ran out before it was used. One click prepares the same call again. */
   | ({ phase: "expired"; detail: string } & Review)
   | { phase: "failed"; stage: "prepare" | "sign" | "relay"; request: ActionRequest; error: ProblemError; review?: Review };
@@ -74,13 +96,13 @@ export type ActionEvent =
   | { type: "PREPARE"; request: ActionRequest }
   | { type: "PREPARED"; review: Review }
   | { type: "PREPARE_FAILED"; error: ProblemError }
-  | { type: "SIGN"; tamper: boolean }
+  | { type: "SIGN"; tamper: boolean; at: number }
   /** The owner declined in the wallet: back to the review, nothing is wrong. */
   | { type: "SIGN_REJECTED" }
   | { type: "SIGN_FAILED"; error: ProblemError }
-  | { type: "SIGNED"; attempted: SignedMessage; tampered: boolean }
+  | { type: "SIGNED"; attempted: SignedMessage; tampered: boolean; at: number }
   | { type: "RELAYED"; hash: string; deployHash?: string; at: number }
-  | { type: "REFUSED"; code: RefusalCode; detail: string; reason: string }
+  | { type: "REFUSED"; code: RefusalCode; detail: string; reason: string; txHash: string | null }
   | { type: "EXPIRED"; detail: string }
   | { type: "RELAY_FAILED"; error: ProblemError }
   /** Back from the review to the form. */
@@ -131,7 +153,7 @@ export function actionReducer(state: ActionState, event: ActionEvent): ActionSta
 
     case "SIGN": {
       if (state.phase !== "review") return state;
-      return { phase: "signing", tamper: event.tamper, ...reviewOf(state)! };
+      return { phase: "signing", tamper: event.tamper, since: event.at, ...reviewOf(state)! };
     }
 
     case "SIGN_REJECTED":
@@ -149,6 +171,7 @@ export function actionReducer(state: ActionState, event: ActionEvent): ActionSta
       const review = reviewOf(state)!;
       return {
         phase: "relaying",
+        since: event.at,
         ...review,
         shownCalls: review.calls,
         attemptedCalls: event.attempted.calls,
@@ -177,6 +200,7 @@ export function actionReducer(state: ActionState, event: ActionEvent): ActionSta
         code: event.code,
         detail: event.detail,
         reason: event.reason,
+        txHash: event.txHash,
       };
 
     case "EXPIRED":

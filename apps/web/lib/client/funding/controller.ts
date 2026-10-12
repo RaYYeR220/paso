@@ -58,31 +58,49 @@ export interface FundingDeps {
    * a second while Circle is still waiting.
    */
   deliveringAfterMs?: number;
-  /** How many answers in a row may fail before tracking stops. The transfer can be picked up again. */
-  maxConsecutiveErrors?: number;
-  /** How long Circle may go on not knowing the burn before it is called lost. */
+  /** How long Circle may go on not knowing the burn before it is asked less often. */
   burnNotFoundAfterMs?: number;
+}
+
+/** The burn being followed, and whether a reload will still know about it. */
+export interface TrackedBurn {
+  transfer: Transfer;
+  /** False when the browser keeps no storage: the tracker lives in this tab only. The USDC is unaffected. */
+  saved: boolean;
 }
 
 export interface FundingController {
   getState(): FundingState;
   subscribe(listener: Listener): () => void;
-  /** Starts a transfer. Ignored while one is in flight, so a double click burns once. */
+  /**
+   * Starts a transfer. Ignored while one is in flight or on record, so a
+   * double click burns once and a burn already made is never written over.
+   */
   start(request: FundingRequest): Promise<void>;
-  /** Follows a burn that already happened. Returns false when the hash is not one, or a transfer is in flight. */
+  /**
+   * Follows a burn that already happened. Returns false when the hash is not
+   * one, a transfer is in flight, or another burn is on record.
+   */
   resume(burnTxHash: Hex): boolean;
-  /** Picks up the transfer that was in flight when the page was last open. */
+  /** Picks up the burn on record: the one in flight when the page was last open. */
   restore(): boolean;
-  /** After a failure that left the burn intact: follows it again. */
+  /** After a failure: follows the burn on record again. */
   retry(): boolean;
-  /** Back to idle. A transfer in flight is no longer followed here; the USDC still arrives. */
-  reset(): void;
+  /** Back to idle. Refused, with `false`, while a burn is on record: that takes `stopTracking`. */
+  reset(): boolean;
+  /**
+   * Forgets the burn on record and goes back to idle. The only way a burn
+   * leaves the record short of being delivered: the USDC is not affected,
+   * it is only no longer followed here.
+   */
+  stopTracking(): boolean;
+  /** The burn on record, if any. */
+  tracked(): TrackedBurn | null;
 }
 
 const DEFAULTS = {
   pollIntervalMs: 2_000,
   deliveringAfterMs: 3_000,
-  maxConsecutiveErrors: 15,
   burnNotFoundAfterMs: 10 * 60_000,
 };
 
@@ -178,15 +196,13 @@ function deliveryFailure(error: unknown): { permanent: boolean; reason: FundingF
   }
   return {
     permanent: false,
-    reason: failure(
-      "unavailable",
-      "The delivery service is not answering. The burn is safe on Base: pick the transfer up again in a moment.",
-      true,
-      problem,
-    ),
+    reason: failure("unavailable", "The delivery service is not answering. The burn is safe on Base.", true, problem),
     ...(problem.retryAfterSeconds ? { retryAfterMs: problem.retryAfterSeconds * 1000 } : {}),
   };
 }
+
+/** Errors that say nothing about whether a transaction left the wallet. */
+const INCONCLUSIVE_CODES: readonly string[] = ["unknown", "network"];
 
 /** The wallet client with its contract writes reported: which prompt is open, and the hash once it is sent. */
 function observeWrites(walletClient: WalletClient, report: (step: RequestStep, hash?: Hex) => void): WalletClient {
@@ -204,8 +220,9 @@ function observeWrites(walletClient: WalletClient, report: (step: RequestStep, h
  * The inbound flow of one owner: burn on Base (the wallet's, or the
  * faucet's), then follow the burn until the USDC is minted on Stellar.
  *
- * The transfer in flight is written to storage as soon as its burn is known,
- * so a reload carries on from there.
+ * A burn is money in transit, so it goes on record the moment its hash is
+ * known and stays there until the USDC is delivered or the owner says to stop
+ * tracking it. No outage, reload, second click or reset takes it off.
  */
 export function createFundingController(owner: Address, deps: FundingDeps): FundingController {
   const { network, api, storage } = deps;
@@ -215,17 +232,19 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
   const fund = deps.fund ?? fundFromEvm;
   const pollIntervalMs = deps.pollIntervalMs ?? DEFAULTS.pollIntervalMs;
   const deliveringAfterMs = deps.deliveringAfterMs ?? DEFAULTS.deliveringAfterMs;
-  const maxConsecutiveErrors = deps.maxConsecutiveErrors ?? DEFAULTS.maxConsecutiveErrors;
   const burnNotFoundAfterMs = deps.burnNotFoundAfterMs ?? DEFAULTS.burnNotFoundAfterMs;
 
   const key = fundingStorageKey(network.name, owner);
   const store = createStore<FundingState>(IDLE_FUNDING);
   let tracking: AbortController | null = null;
   let starting = false;
+  /** The burn on record, kept here as well as in storage: storage may be missing or full. */
+  let inFlight: Transfer | null = null;
+  let saved = true;
 
   const dispatch = (event: FundingEvent): void => store.set(fundingReducer(store.get(), event));
 
-  function record(transfer: Transfer, status: LogStatus, stellarTxHash?: string): void {
+  function note(transfer: Transfer, status: LogStatus, stellarTxHash?: string): void {
     deps.log?.(transfer.twin)?.put({
       id: `fund:${transfer.burnTxHash.toLowerCase()}`,
       kind: "receive",
@@ -243,17 +262,30 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
     return isTransfer(value, network.name, owner) ? value : null;
   }
 
-  function stopTracking(): void {
+  const onRecord = (): Transfer | null => inFlight ?? stored();
+  const sameBurn = (a: Transfer, hash: Hex): boolean => a.burnTxHash.toLowerCase() === hash.toLowerCase();
+
+  function remember(transfer: Transfer): void {
+    inFlight = transfer;
+    writeJson(storage, key, transfer);
+    const kept = stored();
+    saved = kept !== null && sameBurn(kept, transfer.burnTxHash);
+  }
+
+  function forget(): void {
+    inFlight = null;
+    saved = true;
+    removeKey(storage, key);
+  }
+
+  function halt(): void {
     tracking?.abort();
     tracking = null;
   }
 
-  function fail(reason: FundingFailure, transfer?: Transfer): void {
-    if (transfer) {
-      // A burn that can still be delivered stays on record, so a reload or a retry picks it up.
-      if (!reason.retryable) removeKey(storage, key);
-      record(transfer, reason.retryable ? "pending" : "failed");
-    }
+  /** The server gave a final answer about the burn. It stays on record: only the owner takes it off. */
+  function fail(reason: FundingFailure, transfer: Transfer): void {
+    note(transfer, "failed");
     dispatch({ type: "FAILED", reason, at: now() });
   }
 
@@ -274,11 +306,12 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
         if (!live()) return;
         const { permanent, reason, retryAfterMs } = deliveryFailure(error);
         errors += 1;
-        if (permanent || errors >= maxConsecutiveErrors) {
+        if (permanent) {
           tracking = null;
           fail(reason, transfer);
           return;
         }
+        // An outage says nothing about the burn: keep waiting, more patiently each time.
         dispatch({ type: "PENDING", attestation: "unreachable" });
         await pause(retryAfterMs ?? pollIntervalMs * Math.min(errors, MAX_BACKOFF_STEPS));
         continue;
@@ -289,27 +322,21 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
 
       if (answer.status === "delivered") {
         tracking = null;
-        removeKey(storage, key);
+        forget();
         dispatch({ type: "DELIVERED", hash: answer.hash, route: answer.route, at: now() });
-        record(transfer, "done", answer.hash);
+        note(transfer, "done", answer.hash);
         return;
       }
 
       dispatch({ type: "PENDING", attestation: answer.attestation, delayReason: answer.delayReason });
-      if (answer.attestation === "not_found" && now() - transfer.startedAt > burnNotFoundAfterMs) {
-        tracking = null;
-        fail(
-          failure("burn_not_found", "Circle has not seen this burn. Check the transaction on Base: it may not have gone through.", false),
-          transfer,
-        );
-        return;
-      }
-      await pause(pollIntervalMs);
+      // A burn Circle has not heard of for this long may never have confirmed. It is still asked about, less often.
+      const unseen = answer.attestation === "not_found" && now() - transfer.startedAt > burnNotFoundAfterMs;
+      await pause(unseen ? pollIntervalMs * MAX_BACKOFF_STEPS : pollIntervalMs);
     }
   }
 
   function follow(transfer: Transfer): void {
-    stopTracking();
+    halt();
     const run = new AbortController();
     tracking = run;
     void track(transfer, run);
@@ -318,7 +345,7 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
   async function askFaucet(): Promise<Transfer | null> {
     try {
       const funded = await api.demoFund(owner);
-      return {
+      const transfer: Transfer = {
         network: network.name,
         burnTxHash: funded.burnTxHash,
         sourceDomain: funded.sourceDomain,
@@ -328,6 +355,9 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
         via: "demo",
         startedAt: now(),
       };
+      // On record before anything else is awaited: the faucet has already burned.
+      remember(transfer);
+      return transfer;
     } catch (error) {
       dispatch({ type: "FAILED", reason: faucetFailure(error, network.evm.chain.name), at: now() });
       return null;
@@ -349,6 +379,8 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
     });
 
     let sent: Transfer | null = null;
+    /** The last thing the wallet was asked for: what an error after it can and cannot mean. */
+    const prompt: { step: RequestStep } = { step: "starting" };
     try {
       if (amount <= 0n) throw new Error("Enter an amount above zero");
       const { walletClient, publicClient } = await request.clients();
@@ -373,10 +405,11 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
       }
 
       const observed = observeWrites(walletClient, (step, hash) => {
+        prompt.step = step;
         if (step === "confirming" && hash) {
           // On record from the moment Base has the burn: a reload while it confirms loses nothing.
           sent = transferFor(hash);
-          writeJson(storage, key, sent);
+          remember(sent);
           dispatch({ type: "STEP", step, burnTxHash: hash });
         } else {
           dispatch({ type: "STEP", step, ...(step === "approved" && hash ? { approveTxHash: hash } : {}) });
@@ -385,28 +418,52 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
       const burned = await fund({ walletClient: observed, publicClient, amount, owner, network });
       return sent ?? transferFor(burned.burnTxHash);
     } catch (error) {
-      removeKey(storage, key);
       const problem = describeError(error);
-      if (problem.kind === "rejected") dispatch({ type: "CANCELLED" });
-      else dispatch({ type: "FAILED", reason: walletFailure(problem), at: now() });
+      const burn: Transfer | null = sent;
+      if (burn) {
+        // Base has the transaction. Only a revert means it burned nothing; anything else is followed.
+        if (problem.kind === "error" && problem.code === "reverted") {
+          forget();
+          dispatch({ type: "FAILED", reason: walletFailure(problem), at: now() });
+          return null;
+        }
+        return burn;
+      }
+      if (problem.kind === "rejected") {
+        dispatch({ type: "CANCELLED" });
+      } else if (prompt.step === "burning" && INCONCLUSIVE_CODES.includes(problem.code)) {
+        dispatch({
+          type: "FAILED",
+          reason: failure(
+            "burn_unconfirmed",
+            "The wallet did not say whether the burn was sent. Look at its activity: if the burn is there, follow it by its transaction hash. If it is not, nothing left the wallet.",
+            false,
+            problem,
+          ),
+          at: now(),
+        });
+      } else {
+        dispatch({ type: "FAILED", reason: walletFailure(problem), at: now() });
+      }
       return null;
     }
   }
 
   function begin(transfer: Transfer, event: "BURNED" | "RESUMED"): void {
-    writeJson(storage, key, transfer);
+    remember(transfer);
     dispatch({ type: event, transfer });
     const state = store.get();
     if (state.phase !== "burned" || state.transfer.burnTxHash !== transfer.burnTxHash) return;
-    record(transfer, "pending");
+    note(transfer, "pending");
     follow(transfer);
   }
 
   function resume(burnTxHash: Hex): boolean {
     if (!isTxHash(burnTxHash) || starting || isFundingActive(store.get())) return false;
-    const known = stored();
+    const known = onRecord();
+    if (known && !sameBurn(known, burnTxHash)) return false;
     const transfer: Transfer =
-      known && known.burnTxHash.toLowerCase() === burnTxHash.toLowerCase()
+      known
         ? known
         : {
             network: network.name,
@@ -427,10 +484,10 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
     subscribe: store.subscribe,
 
     async start(request) {
-      if (starting || isFundingActive(store.get())) return;
+      if (starting || isFundingActive(store.get()) || onRecord()) return;
       starting = true;
       try {
-        stopTracking();
+        halt();
         dispatch({
           type: "REQUEST",
           via: request.via,
@@ -450,21 +507,35 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
     resume,
 
     restore() {
-      const known = stored();
+      const known = onRecord();
       return known ? resume(known.burnTxHash) : false;
     },
 
     retry() {
       const state = store.get();
-      if (state.phase !== "failed" || !state.transfer || !state.reason.retryable) return false;
+      if (state.phase !== "failed" || !state.transfer) return false;
       begin(state.transfer, "RESUMED");
       return true;
     },
 
     reset() {
-      stopTracking();
-      removeKey(storage, key);
+      if (onRecord()) return false;
+      halt();
       dispatch({ type: "RESET" });
+      return true;
+    },
+
+    stopTracking() {
+      if (!onRecord()) return false;
+      halt();
+      forget();
+      dispatch({ type: "RESET" });
+      return true;
+    },
+
+    tracked() {
+      const transfer = onRecord();
+      return transfer ? { transfer, saved: inFlight !== null ? saved : true } : null;
     },
   };
 }

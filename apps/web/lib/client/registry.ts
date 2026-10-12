@@ -1,5 +1,5 @@
-import { isDeployed, twinAddress, usdcBalance } from "@paso/sdk";
-import type { Address } from "viem";
+import { erc20Abi, isDeployed, twinAddress, usdcBalance } from "@paso/sdk";
+import { createPublicClient, http, type Address, type PublicClient } from "viem";
 import { createActionController, type ActionController } from "./action/controller";
 import { loadChainActivity, type ChainActivity } from "./activity/events";
 import { activityLogKey, createActivityLog, type ActivityLog } from "./activity/log";
@@ -19,6 +19,7 @@ import { browserStorage } from "./storage";
 export const api = createApi();
 
 const TWIN_REFRESH_MS = 10_000;
+const BASE_BALANCE_REFRESH_MS = 15_000;
 const ACTIVITY_REFRESH_MS = 20_000;
 const HEALTH_REFRESH_MS = 30_000;
 
@@ -82,12 +83,35 @@ const activityByTwin = keyedResources<ChainActivity>((twin) =>
   createResource(() => loadChainActivity(twin, NETWORK, stellarServer()), { intervalMs: ACTIVITY_REFRESH_MS }),
 );
 
+let base: PublicClient | undefined;
+
+/** A reader for Base, over the chain's public endpoint. */
+function baseReader(): PublicClient {
+  base ??= createPublicClient({ chain: NETWORK.evm.chain, transport: http() });
+  return base;
+}
+
+/** USDC an address holds on Base, in 6-decimal units: what its wallet could bring over. */
+const baseBalanceByOwner = keyedResources<bigint>((owner) =>
+  createResource(
+    () =>
+      baseReader().readContract({
+        address: NETWORK.evm.usdc,
+        abi: erc20Abi,
+        functionName: "balanceOf",
+        args: [owner as Address],
+      }),
+    { intervalMs: BASE_BALANCE_REFRESH_MS },
+  ),
+);
+
 const key = (owner: Address): string => owner.toLowerCase();
 
 export const fundingFor = (owner: Address): FundingController => fundingByOwner(key(owner));
 export const actionFor = (owner: Address): ActionController => actionByOwner(key(owner));
 export const twinReadingFor = (owner: Address): Resource<TwinReading> => twinByOwner(key(owner));
 export const chainActivityFor = (twin: string): Resource<ChainActivity> => activityByTwin(twin);
+export const baseBalanceFor = (owner: Address): Resource<bigint> => baseBalanceByOwner(key(owner));
 
 let health: Resource<HealthResponse> | undefined;
 

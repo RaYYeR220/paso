@@ -11,6 +11,7 @@ export const ROUTES = {
   relay: "/api/relay",
   deploy: "/api/deploy",
   deliver: "/api/cctp/deliver",
+  complete: "/api/cctp/complete",
   demoFund: "/api/demo/fund",
   health: "/api/health",
 } as const;

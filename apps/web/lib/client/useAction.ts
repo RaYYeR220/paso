@@ -27,6 +27,11 @@ export interface ActionFlow {
   phase: ActionState["phase"];
   /** True while waiting for the network or the wallet. */
   isBusy: boolean;
+  /**
+   * When the current wait began, in milliseconds: the wallet prompt while
+   * `signing`, the relay request while `relaying`. `null` in every other phase.
+   */
+  since: number | null;
   /** The calls the wallet shows, from the prepared request. `null` before the review. */
   calls: Call[] | null;
   /** The calls that were submitted. `null` until something is. */
@@ -98,6 +103,7 @@ export function useAction(): ActionFlow {
       state,
       phase: state.phase,
       isBusy: isActionBusy(state),
+      since: state.phase === "signing" || state.phase === "relaying" ? state.since : null,
       calls: "calls" in state ? state.calls : (state.phase === "failed" ? (state.review?.calls ?? null) : null),
       attemptedCalls: submitted ? state.attemptedCalls : null,
       panels: panelsOf(state, contractName),

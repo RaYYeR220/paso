@@ -50,6 +50,8 @@ export type FundingFailureCode =
   | "wrong_network"
   /** Circle never saw the burn: wrong hash, or the burn did not confirm. */
   | "burn_not_found"
+  /** The wallet was asked for the burn and never said whether it was sent. */
+  | "burn_unconfirmed"
   /** The burn is attested and cannot be delivered to Stellar. */
   | "undeliverable"
   | "unavailable"

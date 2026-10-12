@@ -190,7 +190,7 @@ export function createActionController(owner: Address, deps: ActionDeps): Action
       return;
     }
 
-    dispatch({ type: "SIGN", tamper: Boolean(options.tamper) });
+    dispatch({ type: "SIGN", tamper: Boolean(options.tamper), at: now() });
     let submitted: Signed;
     try {
       const signed = await signCall(review.prepared, signer);
@@ -213,6 +213,7 @@ export function createActionController(owner: Address, deps: ActionDeps): Action
       type: "SIGNED",
       attempted: entry ? messageOfEntry(entry, network) : review.message,
       tampered: Boolean(options.tamper),
+      at: now(),
     });
 
     try {
@@ -235,6 +236,8 @@ export function createActionController(owner: Address, deps: ActionDeps): Action
             code: problem.code as RefusalCode,
             detail: problem.detail ?? problem.message,
             reason,
+            // The relayer turns a call down before it submits anything: there is no transaction to point at.
+            txHash: null,
           });
         }
       } else if (!current()) {

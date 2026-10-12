@@ -24,6 +24,9 @@ import { describeError } from "./errors";
 import type { EvmClients } from "./funding/controller";
 import { browserStorage, removeKey } from "./storage";
 import { createStore } from "./store";
+import { isDiscovered, pickConnector, walletOptions, type WalletOption } from "./wallets";
+
+export type { WalletOption } from "./wallets";
 
 export type SignerKind = "wallet" | "demo";
 export type SignerStatus = "disconnected" | "connecting" | "connected";
@@ -39,19 +42,14 @@ export interface Signer {
   disconnect(): Promise<void>;
 }
 
-/** A wallet the visitor can connect. */
-export interface WalletOption {
-  id: string;
-  name: string;
-  icon?: string;
-}
-
 export interface WalletSigner extends Signer {
   kind: "wallet";
   /** Connects the named wallet, or the first one the browser offers. */
   connect(connectorId?: string): Promise<void>;
-  /** The wallets found in this browser, plus Coinbase Wallet. */
+  /** The wallets found in this browser, plus Coinbase Wallet: `{ id, name, ready }[]`. */
   options: WalletOption[];
+  /** The id of the wallet being opened while a connection is pending; `null` otherwise. */
+  connectingId: string | null;
   /** Name of the connected wallet. */
   walletName: string | null;
   chainId: number | null;
@@ -71,6 +69,12 @@ export interface DemoSigner extends Signer {
 
 /** The signer in use, with both kinds within reach to connect either. */
 export interface ActiveSigner extends Signer {
+  /** Connects the wallet with this connector id. Without an id, connects the kind in use. */
+  connect(connectorId?: string): Promise<void>;
+  /** The wallets that can be connected: `{ id, name, ready }[]`. The same list as `wallet.options`. */
+  connectors: WalletOption[];
+  /** The id of the wallet being opened while a connection is pending; `null` otherwise. */
+  connectingId: string | null;
   isDemo: boolean;
   wallet: WalletSigner;
   demo: DemoSigner;
@@ -83,12 +87,13 @@ interface LocalState {
   /** Which kind the visitor last chose. */
   chosen: SignerKind | null;
   demoKey: Hex | null;
-  connecting: boolean;
+  /** The connector being opened, while the wallet has not answered yet. */
+  connectingId: string | null;
   error: string | null;
 }
 
 const CHOSEN_STORAGE = "paso.signer";
-const SERVER_STATE: LocalState = { chosen: null, demoKey: null, connecting: false, error: null };
+const SERVER_STATE: LocalState = { chosen: null, demoKey: null, connectingId: null, error: null };
 
 function initialState(): LocalState {
   const storage = browserStorage();
@@ -161,18 +166,9 @@ interface WalletStore {
 
 type Connectors = ReturnType<typeof getConnectors>;
 
-/** A wallet the browser announced itself, as opposed to one named in the configuration. */
-const isDiscovered = (connector: Connectors[number]): boolean => connector.type === "injected" && connector.id !== "injected";
-
-function toOptions(connectors: Connectors): WalletOption[] {
-  const discovered = connectors.some(isDiscovered);
-  return connectors
-    .filter((connector) => !(discovered && connector.id === "injected"))
-    .map((connector) => ({
-      id: connector.id,
-      name: connector.id === "injected" ? "Browser wallet" : connector.name,
-      ...(connector.icon ? { icon: connector.icon } : {}),
-    }));
+/** Whether the browser has a wallet at `window.ethereum`. */
+function injectedProviderPresent(): boolean {
+  return typeof window !== "undefined" && Boolean((window as { ethereum?: unknown }).ethereum);
 }
 
 const walletStores = new WeakMap<Config, WalletStore>();
@@ -193,8 +189,12 @@ function walletStore(config: Config): WalletStore {
     if (listed?.from !== connectors) {
       listed = {
         from: connectors,
-        all: toOptions(connectors),
-        configured: toOptions(connectors.filter((connector) => !isDiscovered(connector))),
+        all: walletOptions(connectors, injectedProviderPresent()),
+        // What the server lists: the configured wallets, none of them asked about yet.
+        configured: walletOptions(
+          connectors.filter((connector) => !isDiscovered(connector)),
+          false,
+        ),
       };
     }
     return listed;
@@ -228,32 +228,40 @@ function walletStore(config: Config): WalletStore {
   return store;
 }
 
-async function connectWallet(config: Config, connectorId?: string): Promise<void> {
-  if (local.get().connecting) return;
-  update({ connecting: true, error: null });
+/**
+ * Connects a wallet. While the wallet has not answered, `connectingId` names
+ * it; a second call in that time is ignored. Declining in the wallet leaves
+ * no error behind.
+ */
+export async function connectWallet(config: Config, connectorId?: string): Promise<void> {
+  if (local.get().connectingId !== null) return;
+  if (getAccount(config).status === "connected") {
+    choose("wallet");
+    return;
+  }
+  const connector = pickConnector(getConnectors(config), connectorId);
+  if (!connector) {
+    update({ error: "No wallet is available in this browser. Install one, or try without a wallet." });
+    return;
+  }
+  update({ connectingId: connector.id, error: null });
   try {
-    if (getAccount(config).status !== "connected") {
-      const connectors = getConnectors(config);
-      const connector =
-        connectors.find((candidate) => candidate.id === connectorId) ??
-        connectors.find(isDiscovered) ??
-        connectors.find((candidate) => candidate.id === "injected") ??
-        connectors[0];
-      if (!connector) throw new Error("No wallet is available in this browser");
-      await connect(config, { connector });
-    }
+    await connect(config, { connector });
     choose("wallet");
   } catch (error) {
     const problem = describeError(error);
-    if (problem.kind === "error" && !/already connected/i.test(problem.detail ?? problem.message)) {
-      update({ error: problem.message });
-    } else if (problem.kind === "error") {
+    if (problem.kind === "error" && /already connected/i.test(problem.detail ?? problem.message)) {
       choose("wallet");
+    } else if (problem.kind === "error") {
+      update({ error: problem.message });
     }
   } finally {
-    update({ connecting: false });
+    update({ connectingId: null });
   }
 }
+
+/** The signer's own state, for watching a connection from outside React. */
+export const signerState = { get: local.get, subscribe: local.subscribe };
 
 async function evmClients(config: Config): Promise<EvmClients> {
   if (getAccount(config).chainId !== baseChainId) {
@@ -283,7 +291,12 @@ export function useSigner(): ActiveSigner {
   const state = useSyncExternalStore(local.subscribe, local.get, () => SERVER_STATE);
 
   const walletAddress = account.address;
-  const walletStatus: SignerStatus = walletAddress ? "connected" : state.connecting || account.restoring ? "connecting" : "disconnected";
+  const connectingId = state.connectingId;
+  const walletStatus: SignerStatus = walletAddress
+    ? "connected"
+    : connectingId !== null || account.restoring
+      ? "connecting"
+      : "disconnected";
   const { walletName, chainId } = account;
 
   const wallet = useMemo<WalletSigner>(
@@ -292,6 +305,7 @@ export function useSigner(): ActiveSigner {
       address: walletAddress,
       status: walletStatus,
       options,
+      connectingId,
       walletName,
       chainId,
       onBase: chainId === baseChainId,
@@ -304,7 +318,7 @@ export function useSigner(): ActiveSigner {
       },
       evmClients: () => evmClients(config),
     }),
-    [config, options, walletAddress, walletStatus, walletName, chainId],
+    [config, options, connectingId, walletAddress, walletStatus, walletName, chainId],
   );
   const demoKey = state.demoKey;
   const demoChosen = state.chosen === "demo" && demoKey !== null;
@@ -342,8 +356,10 @@ export function useSigner(): ActiveSigner {
       address: active.address,
       status: active.status,
       signTypedData: active.signTypedData,
-      connect: () => active.connect(),
+      connect: (connectorId?: string) => (connectorId === undefined ? active.connect() : wallet.connect(connectorId)),
       disconnect: () => active.disconnect(),
+      connectors: wallet.options,
+      connectingId: wallet.connectingId,
       isDemo: demoChosen,
       wallet,
       demo,

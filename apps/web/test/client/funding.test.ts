@@ -343,29 +343,45 @@ describe("following a burn", () => {
     expect(controller.getState()).toMatchObject({ phase: "attesting", attestation: "unreachable" });
   });
 
-  it("stops after too many failed answers, keeps the burn on record and can pick it up again", async () => {
+  it("never calls a burn failed because the route is down, however long", async () => {
     const down = () => new ApiFailure("unavailable", 503, "busy");
-    const h = harness({ deliver: [down(), down(), down(), delivered(STELLAR_HASH)] });
-    const controller = h.make({ maxConsecutiveErrors: 3 });
+    const outage = Array.from({ length: 40 }, down);
+    const h = harness({ deliver: [...outage, delivered(STELLAR_HASH)] });
+    const sleeps: number[] = [];
+    const phases = new Set<string>();
+    const controller = h.make({
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        expect(h.storage.getItem(key)).not.toBeNull();
+      },
+    });
+    controller.subscribe(() => phases.add(controller.getState().phase));
+    await controller.start({ via: "demo" });
+    await until(() => controller.getState().phase === "minted", "minted");
+
+    expect(phases.has("failed")).toBe(false);
+    expect(phases.has("idle")).toBe(false);
+    expect(sleeps.slice(0, 6)).toEqual([2_000, 4_000, 6_000, 8_000, 10_000, 10_000]);
+    expect(h.deliver.calls).toHaveLength(41);
+    expect(h.storage.getItem(key)).toBeNull();
+  });
+
+  it("keeps a burn on record when the server says it cannot be delivered, and can ask again", async () => {
+    const h = harness({
+      deliver: [new ApiFailure("simulation_failed", 422, "The message cannot be delivered: Error(Contract, #1)"), delivered(STELLAR_HASH)],
+    });
+    const controller = h.make();
     await controller.start({ via: "demo" });
     await until(() => controller.getState().phase === "failed", "failed");
-    expect(controller.getState()).toMatchObject({ phase: "failed", reason: { code: "unavailable", retryable: true }, transfer: { burnTxHash: BURN } });
+    expect(controller.getState()).toMatchObject({ phase: "failed", reason: { code: "undeliverable" }, transfer: { burnTxHash: BURN } });
     expect(h.storage.getItem(key)).not.toBeNull();
+    expect(controller.tracked()).toMatchObject({ transfer: { burnTxHash: BURN }, saved: true });
+    expect(h.log.entries.get(`fund:${BURN}`)).toMatchObject({ status: "failed" });
 
     expect(controller.retry()).toBe(true);
     await until(() => controller.getState().phase === "minted", "minted");
     expect(h.storage.getItem(key)).toBeNull();
-  });
-
-  it("gives up for good when the burn cannot be delivered", async () => {
-    const h = harness({ deliver: [new ApiFailure("simulation_failed", 422, "The message cannot be delivered: Error(Contract, #1)")] });
-    const controller = h.make();
-    await controller.start({ via: "demo" });
-    await until(() => controller.getState().phase === "failed", "failed");
-    expect(controller.getState()).toMatchObject({ phase: "failed", reason: { code: "undeliverable", retryable: false } });
-    expect(h.storage.getItem(key)).toBeNull();
-    expect(controller.retry()).toBe(false);
-    expect(h.log.entries.get(`fund:${BURN}`)).toMatchObject({ status: "failed" });
+    expect(controller.tracked()).toBeNull();
   });
 
   it("refuses a hash that is not a USDC burn to Stellar", async () => {
@@ -379,27 +395,150 @@ describe("following a burn", () => {
     });
   });
 
-  it("calls a burn lost when Circle never hears of it", async () => {
-    const h = harness({ deliver: [pending("not_found"), pending("not_found"), pending("not_found")] });
-    const controller = h.make({ burnNotFoundAfterMs: 60_000, sleep: async () => void (h.clock.now += 45_000) });
+  it("goes on waiting, less often, for a burn Circle has not heard of", async () => {
+    const h = harness({ deliver: [pending("not_found"), pending("not_found"), pending("not_found"), delivered(STELLAR_HASH)] });
+    const sleeps: number[] = [];
+    const controller = h.make({
+      burnNotFoundAfterMs: 60_000,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        expect(controller.getState()).toMatchObject({ phase: "attesting", attestation: "not_found" });
+        h.clock.now += 45_000;
+      },
+    });
     await controller.start({ via: "demo" });
-    await until(() => controller.getState().phase === "failed", "failed");
-    expect(controller.getState()).toMatchObject({ phase: "failed", reason: { code: "burn_not_found", retryable: false } });
-    expect(h.deliver.calls).toHaveLength(3);
+    await until(() => controller.getState().phase === "minted", "minted");
+    expect(sleeps).toEqual([2_000, 2_000, 10_000]);
+    expect(h.deliver.calls).toHaveLength(4);
   });
+});
 
-  it("stops asking after a reset", async () => {
-    const h = harness({ deliver: [pending()] });
+describe("a burn on record", () => {
+  async function inFlight(script: Parameters<typeof harness>[0] = { deliver: [pending()] }) {
+    const h = harness(script);
     let wake: () => void = () => undefined;
     const controller = h.make({ sleep: () => new Promise<void>((resolve) => (wake = resolve)) });
     await controller.start({ via: "demo" });
     await until(() => controller.getState().phase === "attesting", "attesting");
-    controller.reset();
+    return { h, controller, wake: () => wake() };
+  }
+
+  it("is written before the faucet's answer is acted on", async () => {
+    const h = harness({ deliver: [] });
+    const seen: (string | null)[] = [];
+    const controller = h.make();
+    controller.subscribe(() => {
+      if (controller.getState().phase === "burned") seen.push(h.storage.getItem(key));
+    });
+    await controller.start({ via: "demo" });
+    expect(seen).toHaveLength(1);
+    expect(JSON.parse(seen[0] ?? "null")).toMatchObject({ burnTxHash: BURN, via: "demo" });
+  });
+
+  it("refuses a reset: the burn stays followed and stored", async () => {
+    const { h, controller, wake } = await inFlight({ deliver: [pending(), delivered(STELLAR_HASH)] });
+    expect(controller.reset()).toBe(false);
+    expect(controller.getState().phase).toBe("attesting");
+    expect(h.storage.getItem(key)).not.toBeNull();
+    wake();
+    await until(() => controller.getState().phase === "minted", "minted");
+  });
+
+  it("refuses a second start, and a different burn by hash, without touching the first", async () => {
+    const { h, controller } = await inFlight();
+    await controller.start({ via: "demo" });
+    expect(controller.resume(OTHER_BURN)).toBe(false);
+    expect(h.demoFund.calls).toHaveLength(1);
+    expect(JSON.parse(h.storage.getItem(key) ?? "null")).toMatchObject({ burnTxHash: BURN });
+  });
+
+  it("refuses a new start after a final answer too, until the owner stops tracking", async () => {
+    const h = harness({
+      demoFund: [funded(), funded(OTHER_BURN)],
+      deliver: [new ApiFailure("bad_request", 400, "That transaction does not carry a USDC transfer")],
+    });
+    const controller = h.make();
+    await controller.start({ via: "demo" });
+    await until(() => controller.getState().phase === "failed", "failed");
+
+    await controller.start({ via: "demo" });
+    expect(controller.reset()).toBe(false);
+    expect(h.demoFund.calls).toHaveLength(1);
+    expect(controller.getState()).toMatchObject({ phase: "failed", transfer: { burnTxHash: BURN } });
+
+    expect(controller.stopTracking()).toBe(true);
+    expect(controller.getState()).toBe(IDLE_FUNDING);
+    expect(h.storage.getItem(key)).toBeNull();
+    await controller.start({ via: "demo" });
+    expect(h.demoFund.calls).toHaveLength(2);
+  });
+
+  it("is taken off only by stopping the tracker, which also stops the questions", async () => {
+    const { h, controller, wake } = await inFlight();
+    expect(controller.stopTracking()).toBe(true);
     wake();
     await settle();
     expect(controller.getState()).toBe(IDLE_FUNDING);
+    expect(controller.tracked()).toBeNull();
     expect(h.deliver.calls).toHaveLength(1);
     expect(h.storage.getItem(key)).toBeNull();
+    expect(controller.stopTracking()).toBe(false);
+  });
+
+  it("is cleared when the USDC is delivered", async () => {
+    const { h, controller, wake } = await inFlight({ deliver: [pending(), delivered(STELLAR_HASH)] });
+    expect(controller.tracked()).not.toBeNull();
+    wake();
+    await until(() => controller.getState().phase === "minted", "minted");
+    expect(controller.tracked()).toBeNull();
+    expect(h.storage.getItem(key)).toBeNull();
+    expect(controller.reset()).toBe(true);
+  });
+
+  it("resumes after a reload that happened during an outage, and after a final answer", async () => {
+    const down = new ApiFailure("network", 0, "The server could not be reached");
+    const before = harness({ deliver: [down] });
+    await before.make().start({ via: "demo" });
+    await settle();
+
+    const reloaded = harness({ storage: before.storage, deliver: [new ApiFailure("simulation_failed", 422, "no")] }).make();
+    expect(reloaded.restore()).toBe(true);
+    await until(() => reloaded.getState().phase === "failed", "failed");
+
+    const again = harness({ storage: before.storage, deliver: [delivered(STELLAR_HASH)] }).make();
+    expect(again.restore()).toBe(true);
+    await until(() => again.getState().phase === "minted", "minted");
+    expect(before.storage.getItem(key)).toBeNull();
+  });
+
+  it("lives in memory when the browser keeps no storage, and says so", async () => {
+    const blocked: KeyValueStore = {
+      getItem: () => null,
+      setItem: () => {
+        throw new Error("QuotaExceededError");
+      },
+      removeItem: () => undefined,
+    };
+    for (const storage of [blocked, null]) {
+      const deliver = scripted<DeliverResponse>([pending(), delivered(STELLAR_HASH)]);
+      let wake: () => void = () => undefined;
+      const controller = createFundingController(owner.address, {
+        network,
+        api: { demoFund: scripted<DemoFundResponse>([funded()]), deliver },
+        storage,
+        sleep: () => new Promise<void>((resolve) => (wake = resolve)),
+        after: () => () => undefined,
+      });
+      await controller.start({ via: "demo" });
+      await until(() => controller.getState().phase === "attesting", "attesting");
+      expect(controller.tracked()).toMatchObject({ transfer: { burnTxHash: BURN }, saved: false });
+      expect(controller.reset()).toBe(false);
+      await controller.start({ via: "demo" });
+      expect(controller.getState().phase).toBe("attesting");
+      wake();
+      await until(() => controller.getState().phase === "minted", "minted");
+      expect(controller.tracked()).toBeNull();
+    }
   });
 });
 
@@ -568,6 +707,40 @@ describe("funding from the wallet", () => {
     expect(noGas.getState()).toMatchObject({ phase: "failed", reason: { code: "insufficient_gas" } });
   });
 
+  it("follows a burn whose confirmation could not be read", async () => {
+    const h = harness({ deliver: [pending("not_found")] });
+    const { clients } = wallet();
+    const fund = async ({ walletClient }: FundFromEvmArgs): Promise<FundFromEvmResult> => {
+      const write = walletClient.writeContract as unknown as (args: { functionName: string }) => Promise<Hex>;
+      await write({ functionName: "depositForBurnWithHook" });
+      throw new Error("fetch failed");
+    };
+    const controller = h.make({ fund });
+    await controller.start({ via: "wallet", amount: 10_000_000n, clients });
+    await until(() => controller.getState().phase === "attesting", "attesting");
+    expect(controller.getState()).toMatchObject({ phase: "attesting", transfer: { burnTxHash: BURN, amount: "10000000" } });
+    expect(JSON.parse(h.storage.getItem(key) ?? "null")).toMatchObject({ burnTxHash: BURN });
+  });
+
+  it("says so when the wallet never reports whether the burn was sent", async () => {
+    const h = harness();
+    const { clients, fund } = wallet({
+      write: async ({ functionName }) => {
+        if (functionName === "approve") return OTHER_BURN;
+        throw new Error("Internal JSON-RPC error.");
+      },
+    });
+    const controller = h.make({ fund });
+    await controller.start({ via: "wallet", amount: 10_000_000n, clients });
+    const state = controller.getState();
+    expect(state).toMatchObject({ phase: "failed", reason: { code: "burn_unconfirmed", retryable: false } });
+    expect(state.phase === "failed" && state.reason.message).toMatch(/did not say whether the burn was sent.*activity/);
+    expect(controller.tracked()).toBeNull();
+
+    expect(controller.resume(BURN)).toBe(true);
+    expect(controller.getState()).toMatchObject({ phase: "burned", transfer: { burnTxHash: BURN } });
+  });
+
   it("forgets a burn that reverted", async () => {
     const h = harness();
     const { clients } = wallet();
@@ -604,7 +777,7 @@ describe("funding from the wallet", () => {
       const state = controller.getState();
       return state.phase === "requesting" && state.step === "confirming";
     }, "the burn to be sent");
-    controller.reset();
+    expect(controller.reset()).toBe(false);
     finish();
     await started;
     await until(() => controller.getState().phase === "minted", "minted");
