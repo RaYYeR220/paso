@@ -2,11 +2,11 @@
   "network": "mainnet",
   "rpcUrl": "https://mainnet.sorobanrpc.com",
   "networkPassphrase": "Public Global Stellar Network ; September 2015",
-  "hub": "",
-  "accountWasmHash": "",
+  "hub": "CDZCHMNSAAIST5K2DNP4DP6H3DE4UJISUOMDFQTKD7IK6CD477AB7LJK",
+  "accountWasmHash": "2ee1ac08ca6407667db15bcffe75c8cbb4e41d95b2d047541b5dad133cfe75ee",
   "usdc": "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75",
   "tokenMessenger": "CAE2G5Z77UP7GYPYGFOWFGW7C7J6I4YP2AFGSADRKQY62SYUFLPNFTXL",
   "messageTransmitter": "CACMENFFJPJMSDAJQLX4R7K3SFZIW2LJSE3R2UMLGSWHFHS353FVXAZV",
   "forwarder": "CBZL2IH7F6BIDAA3WBNXYKIXSATJGMSW7K5P5MJ6STX5RXN47TZJDF5T",
-  "deployedAt": ""
+  "deployedAt": "2026-10-12T17:42:07.464Z"
 }
