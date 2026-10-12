@@ -148,3 +148,7 @@ USDC moves between Base and Stellar through Circle's contracts and Circle's atte
 ## Reporting an issue
 
 Open an issue at <https://github.com/RaYYeR220/paso/issues>. There is no private channel and no bounty. The contracts on mainnet are unaudited and cannot be paused or upgraded; do not keep in an account more than you can afford to lose.
+
+## Limits of the hosted relayer
+
+Rate limits, daily budgets and the record of transactions in flight are kept in memory by each server instance, so on a host that runs several instances each one enforces its own, and a restart starts them over. The worst case is therefore bounded per instance and per day: the test USDC the faucet's payer holds above its reserve, the daily fee budget in test XLM, and the test ETH spent on gas for the daily number of mints on Base. The relayer never holds user funds: it cannot move or redirect them, and a call it relays can only do what its owner signed. Everything the relayer does (deploying an account, relaying a signed call, delivering a transfer to Stellar, completing one on Base) can be done by anyone with their own funded account, using the SDK or the scripts.
