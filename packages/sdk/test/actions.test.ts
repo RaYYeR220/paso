@@ -1,4 +1,4 @@
-import { Address, Keypair, rpc, StrKey, Transaction, TransactionBuilder, xdr } from "@stellar/stellar-sdk";
+import { Account, Address, Keypair, Operation, rpc, StrKey, Transaction, TransactionBuilder, xdr } from "@stellar/stellar-sdk";
 import { recoverTypedDataAddress, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -10,10 +10,15 @@ import {
   RelayError,
   relayRequest,
   sign,
+  signedFromRelayRequest,
+  simulateSigned,
   SimulationError,
+  submitWith,
+  withArgument,
   type Action,
+  type Signed,
 } from "../src/actions";
-import { authPayload } from "../src/auth";
+import { AuthorizationEntriesError, authPayload, entryTypedData } from "../src/auth";
 import { renderArg } from "../src/render";
 import { twinAddress } from "../src/twin";
 import { hex, HUB, ISSUER, OTHER_KEY, OWNER, OWNER_KEY, testNetwork, USDC } from "./helpers";
@@ -77,6 +82,35 @@ function recordingServer(extraEntries: xdr.SorobanAuthorizationEntry[] = []) {
     };
   });
   return { simulateTransaction } as unknown as rpc.Server & { simulateTransaction: typeof simulateTransaction };
+}
+
+const noop = new xdr.SorobanAuthorizedInvocation({
+  function: xdr.SorobanAuthorizedFunction.sorobanAuthorizedFunctionTypeContractFn(
+    new xdr.InvokeContractArgs({ contractAddress: new Address(USDC).toScAddress(), functionName: "noop", args: [] }),
+  ),
+  subInvocations: [],
+});
+
+/** An entry the transaction's source account would satisfy just by signing the envelope. */
+function sourceAccountEntry(): xdr.SorobanAuthorizationEntry {
+  return new xdr.SorobanAuthorizationEntry({
+    credentials: xdr.SorobanCredentials.sorobanCredentialsSourceAccount(),
+    rootInvocation: noop,
+  });
+}
+
+function addressEntry(address: string): xdr.SorobanAuthorizationEntry {
+  return new xdr.SorobanAuthorizationEntry({
+    credentials: xdr.SorobanCredentials.sorobanCredentialsAddressV2(
+      new xdr.SorobanAddressCredentials({
+        address: new Address(address).toScAddress(),
+        nonce: NONCE,
+        signatureExpirationLedger: LATEST_LEDGER + 10,
+        signature: xdr.ScVal.scvVoid(),
+      }),
+    ),
+    rootInvocation: noop,
+  });
 }
 
 const unreachableServer = {
@@ -196,24 +230,18 @@ describe("prepare", () => {
     expect(prepared.validUntilLedger).toBe(LATEST_LEDGER + 30);
   });
 
-  it("keeps entries that belong to someone else untouched", async () => {
-    const foreign = new xdr.SorobanAuthorizationEntry({
-      credentials: xdr.SorobanCredentials.sorobanCredentialsSourceAccount(),
-      rootInvocation: new xdr.SorobanAuthorizedInvocation({
-        function: xdr.SorobanAuthorizedFunction.sorobanAuthorizedFunctionTypeContractFn(
-          new xdr.InvokeContractArgs({
-            contractAddress: new Address(USDC).toScAddress(),
-            functionName: "noop",
-            args: [],
-          }),
-        ),
-        subInvocations: [],
-      }),
-    });
-    const prepared = await prepare(transfer, { ...options, server: recordingServer([foreign]) });
+  it("refuses a call that needs the source account's authorisation as well", async () => {
+    const failure = await prepare(transfer, { ...options, server: recordingServer([sourceAccountEntry()]) }).catch(
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(AuthorizationEntriesError);
+    expect((failure as Error).message).toMatch(/source account/);
+  });
 
-    expect(prepared.entries).toHaveLength(2);
-    expect(prepared.entries[0]).toBe(foreign.toXdr("base64"));
+  it("refuses a call that needs the authorisation of another address", async () => {
+    await expect(prepare(transfer, { ...options, server: recordingServer([addressEntry(ISSUER)]) })).rejects.toThrow(
+      new RegExp(`authorisation from ${ISSUER}`),
+    );
   });
 
   it("surfaces a failed simulation with the network's explanation", async () => {
@@ -292,6 +320,13 @@ describe("relay", () => {
     expect(JSON.parse(init.body as string)).toEqual(relayRequest(signed));
   });
 
+  it("returns the deployment hash when the relayer had to deploy the account first", async () => {
+    const signed = await signedTransfer();
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ hash: "abc123", deployHash: "def456" }))));
+
+    expect(await relay(signed, "https://paso.example/api/relay")).toEqual({ hash: "abc123", deployHash: "def456" });
+  });
+
   it("raises the relayer's error code so the caller can ask for a new signature", async () => {
     const signed = await signedTransfer();
     vi.stubGlobal(
@@ -313,6 +348,200 @@ describe("relay", () => {
     expect(failure).toBeInstanceOf(RelayError);
     expect((failure as RelayError).code).toBe("relay_failed");
     expect((failure as RelayError).status).toBe(502);
+  });
+});
+
+describe("a signed call that carries more than the account's entry", () => {
+  const fetchMock = vi.fn(async () => {
+    throw new Error("the network must not be reached");
+  });
+  const source = Keypair.random();
+  const submitOptions = { network: testNetwork, server: unreachableServer };
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  async function signedWith(extra: xdr.SorobanAuthorizationEntry[]): Promise<Signed> {
+    const prepared = await prepare(transfer, { ...options, server: recordingServer() });
+    const signed = await sign(prepared, privateKeyToAccount(OWNER_KEY));
+    return { ...signed, entries: [...extra.map((entry) => entry.toXdr("base64")), ...signed.entries] };
+  }
+
+  it("is not submitted when an entry would spend the fee payer's own authority", async () => {
+    vi.stubGlobal("fetch", fetchMock);
+    const signed = await signedWith([sourceAccountEntry()]);
+
+    await expect(submitWith(signed, source, submitOptions)).rejects.toThrow(AuthorizationEntriesError);
+    await expect(submitWith(signed, source, submitOptions)).rejects.toThrow(/source account/);
+    await expect(simulateSigned(signed, submitOptions)).rejects.toThrow(AuthorizationEntriesError);
+    expect(() => relayRequest(signed)).toThrow(AuthorizationEntriesError);
+    await expect(relay(signed, "https://paso.example/api/relay")).rejects.toThrow(AuthorizationEntriesError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("is not submitted when the source-account entry is the only one", async () => {
+    const signed = await signedWith([]);
+    const only: Signed = { ...signed, entries: [sourceAccountEntry().toXdr("base64")] };
+
+    await expect(submitWith(only, source, submitOptions)).rejects.toThrow(/source account/);
+    expect(() => relayRequest(only)).toThrow(/source account/);
+  });
+
+  it("is not submitted when an entry belongs to another address", async () => {
+    const signed = await signedWith([addressEntry(ISSUER)]);
+
+    await expect(submitWith(signed, source, submitOptions)).rejects.toThrow(new RegExp(`authorisation from ${ISSUER}`));
+    expect(() => relayRequest(signed)).toThrow(AuthorizationEntriesError);
+  });
+
+  it("is not submitted when the account's entry appears twice", async () => {
+    const signed = await signedWith([]);
+    const twice: Signed = { ...signed, entries: [...signed.entries, ...signed.entries] };
+
+    await expect(submitWith(twice, source, submitOptions)).rejects.toThrow(/2 separate authorisations/);
+    expect(() => relayRequest(twice)).toThrow(/2 separate authorisations/);
+  });
+
+  it("is checked against the account derived from the owner, not the one the call names", async () => {
+    const signed = await signedWith([]);
+    const stranger = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+    const renamed: Signed = { ...signed, owner: stranger };
+
+    await expect(submitWith(renamed, source, submitOptions)).rejects.toThrow(
+      new RegExp(`not the owner's account ${twinAddress(stranger, testNetwork)}`),
+    );
+  });
+
+  it("is not submitted when it uploads code instead of calling a contract", async () => {
+    const signed = await signedWith([]);
+    const tx = TransactionBuilder.fromXdr(signed.txXdr, testNetwork.stellar.networkPassphrase) as Transaction;
+    const upload = new TransactionBuilder(new Account(tx.source, "0"), {
+      fee: "100",
+      networkPassphrase: testNetwork.stellar.networkPassphrase,
+    })
+      .addOperation(Operation.uploadContractWasm({ wasm: Buffer.from("00", "hex") }))
+      .setTimeout(60)
+      .build();
+    const uploading: Signed = { ...signed, txXdr: upload.toEnvelope().toXdr("base64") };
+
+    await expect(submitWith(uploading, source, submitOptions)).rejects.toThrow(/Only contract calls/);
+    expect(() => relayRequest(uploading)).toThrow(/Only contract calls/);
+  });
+});
+
+describe("signedFromRelayRequest", () => {
+  async function signedTransfer() {
+    const prepared = await prepare(transfer, { ...options, server: recordingServer() });
+    return sign(prepared, privateKeyToAccount(OWNER_KEY));
+  }
+
+  it("reads a request back into the signed call it was built from", async () => {
+    const signed = await signedTransfer();
+    const read = signedFromRelayRequest(relayRequest(signed), testNetwork);
+
+    // The carrier transaction is rebuilt, with time bounds of its own; everything it carries is the same.
+    expect({ ...read, txXdr: "" }).toEqual({ ...signed, txXdr: "" });
+    expect(relayRequest(read)).toEqual(relayRequest(signed));
+    expect(sourceOf(read.txXdr)).toBe(sourceOf(signed.txXdr));
+  });
+
+  it("derives the account from the owner and refuses an entry for any other", async () => {
+    const request = relayRequest(await signedTransfer());
+    const stranger = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+
+    expect(() => signedFromRelayRequest({ ...request, owner: stranger }, testNetwork)).toThrow(
+      new RegExp(`not the owner's account ${twinAddress(stranger, testNetwork)}`),
+    );
+  });
+
+  it("refuses a request that would spend the fee payer's authority", async () => {
+    const request = relayRequest(await signedTransfer());
+    const borrowed = { ...request, auth: [sourceAccountEntry().toXdr("base64")] };
+    const both = { ...request, auth: [...request.auth, sourceAccountEntry().toXdr("base64")] };
+
+    expect(() => signedFromRelayRequest(borrowed, testNetwork)).toThrow(AuthorizationEntriesError);
+    expect(() => signedFromRelayRequest(both, testNetwork)).toThrow(/source account/);
+  });
+
+  it("refuses a second entry, even for the same account", async () => {
+    const request = relayRequest(await signedTransfer());
+
+    expect(() => signedFromRelayRequest({ ...request, auth: [...request.auth, ...request.auth] }, testNetwork)).toThrow(
+      /2 separate authorisations/,
+    );
+    expect(() =>
+      signedFromRelayRequest({ ...request, auth: [...request.auth, addressEntry(ISSUER).toXdr("base64")] }, testNetwork),
+    ).toThrow(new RegExp(`authorisation from ${ISSUER}`));
+  });
+
+  it("refuses a host function that uploads code or creates a contract", async () => {
+    const request = relayRequest(await signedTransfer());
+    const upload = xdr.HostFunction.hostFunctionTypeUploadContractWasm(Buffer.from("0061736d", "hex"));
+
+    expect(() => signedFromRelayRequest({ ...request, func: upload.toXdr("base64") }, testNetwork)).toThrow(
+      /Only contract calls can be relayed/,
+    );
+  });
+
+  it("refuses an entry that was never signed", async () => {
+    const prepared = await prepare(transfer, { ...options, server: recordingServer() });
+    const request = { ...relayRequest(await signedTransfer()), auth: prepared.entries };
+
+    expect(() => signedFromRelayRequest(request, testNetwork)).toThrow(/not signed/);
+  });
+
+  it("refuses anything that is not a well-formed request", async () => {
+    const request = relayRequest(await signedTransfer());
+
+    expect(() => signedFromRelayRequest({ ...request, func: "not xdr" }, testNetwork)).toThrow(/not valid XDR/);
+    expect(() => signedFromRelayRequest({ ...request, owner: "nobody" as `0x${string}` }, testNetwork)).toThrow(
+      /Ethereum address/,
+    );
+    expect(() => signedFromRelayRequest({ ...request, network: "mainnet" }, testNetwork)).toThrow(/not for testnet/);
+    expect(() => signedFromRelayRequest({ ...request, auth: "x" as unknown as string[] }, testNetwork)).toThrow(
+      /list of authorisation entries/,
+    );
+  });
+});
+
+describe("withArgument", () => {
+  async function signedTransfer() {
+    const prepared = await prepare(transfer, { ...options, server: recordingServer() });
+    return sign(prepared, privateKeyToAccount(OWNER_KEY));
+  }
+  const larger = xdr.ScVal.scvI128(new xdr.Int128Parts({ hi: 0n, lo: 9_000_000_000n }));
+
+  it("changes the argument in the call and in the entry, and keeps the signature", async () => {
+    const signed = await signedTransfer();
+    const changed = withArgument(signed, 2, larger);
+
+    const func = xdr.HostFunction.fromXdr(relayRequest(changed).func, "base64");
+    if (func.type !== "hostFunctionTypeInvokeContract") throw new Error("not a contract call");
+    expect(func.invokeContract.args.map(renderArg)).toEqual([TWIN, ISSUER, "9000000000"]);
+
+    const entry = xdr.SorobanAuthorizationEntry.fromXdr(changed.entries[0]!, "base64");
+    const original = xdr.SorobanAuthorizationEntry.fromXdr(signed.entries[0]!, "base64");
+    expect(entry.credentials.toXdr("base64")).toBe(original.credentials.toXdr("base64"));
+    const authorised = entry.rootInvocation.function;
+    if (authorised.type !== "sorobanAuthorizedFunctionTypeContractFn") throw new Error("not a contract call");
+    expect(authorised.contractFn.args.map(renderArg)).toEqual([TWIN, ISSUER, "9000000000"]);
+
+    expect(changed.signature).toBe(signed.signature);
+    expect(changed.calls).toEqual(signed.calls);
+    expect(sourceOf(changed.txXdr)).toBe(sourceOf(signed.txXdr));
+  });
+
+  it("produces a call the signature no longer matches", async () => {
+    const signed = await signedTransfer();
+    const changed = withArgument(signed, 2, larger);
+    const entry = xdr.SorobanAuthorizationEntry.fromXdr(changed.entries[0]!, "base64");
+
+    const signedBy = await recoverTypedDataAddress({ ...entryTypedData(entry, testNetwork), signature: signed.signature });
+    expect(signedBy).not.toBe(OWNER);
+  });
+
+  it("refuses an argument the call does not have", async () => {
+    const signed = await signedTransfer();
+    expect(() => withArgument(signed, 3, larger)).toThrow(/no argument 3/);
   });
 });
 

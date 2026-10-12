@@ -10,6 +10,7 @@ import {
   StrKey,
   TransactionBuilder,
   xdr,
+  type Transaction,
 } from "@stellar/stellar-sdk";
 import {
   getAddress,
@@ -22,13 +23,15 @@ import {
   type Hex,
 } from "viem";
 import {
-  accountEntryIndex,
+  assertOnlyAccountEntries,
   attachSignature,
+  entryExpiration,
+  entrySignature,
   entryTypedData,
   setExpiration,
   type TypedDataSigner,
 } from "./auth";
-import { FAST_FINALITY, fetchBurnFee, maxFeeFor } from "./iris";
+import { deliverOperation, FAST_FINALITY, fetchBurnFee, maxFeeFor, type Attestation } from "./iris";
 import { requireHub, resolveNetwork, type Network, type NetworkConfig, type NetworkName } from "./networks";
 import { renderCalls, type Call } from "./render";
 import { twinAddress } from "./twin";
@@ -94,7 +97,7 @@ export interface Prepared {
   account: string;
   /** The simulated transaction envelope, base64. Its source is the placeholder, never the final payer. */
   txXdr: string;
-  /** Every authorisation entry the call needs, base64, in order. The account's entry has its expiration set. */
+  /** The one authorisation entry the call needs, base64: the account's, with its expiration set. */
   entries: string[];
   /** What the wallet signs. */
   typedData: AuthorizationTypedData;
@@ -117,14 +120,38 @@ export interface RelayRequest {
   owner: Address;
   /** The host function to run: base64 `HostFunction` XDR. */
   func: string;
-  /** Signed authorisation entries: base64 `SorobanAuthorizationEntry` XDR, in order. */
+  /** The account's signed authorisation entry, as a one-element list: base64 `SorobanAuthorizationEntry` XDR. */
   auth: string[];
 }
 
-export type RelayErrorCode = "expired" | "bad_signature" | "simulation_failed";
+/**
+ * Why a relayer declined.
+ *
+ * - `expired`: the signature's last valid ledger has passed; prepare and sign again.
+ * - `bad_signature`: the account refused the signature for this call.
+ * - `simulation_failed`: the call itself would fail, or costs more than the relayer pays for.
+ * - `bad_request`: the request is not one signed call from the owner's account.
+ * - `rate_limited`: too many requests; try again later.
+ * - `transaction_failed`: the transaction was submitted and did not apply.
+ * - `unavailable`: the relayer could not reach the network.
+ */
+export type RelayErrorCode =
+  | "expired"
+  | "bad_signature"
+  | "simulation_failed"
+  | "bad_request"
+  | "rate_limited"
+  | "transaction_failed"
+  | "unavailable";
+
+/** A relayed call: its transaction, and the one that deployed the account when this was its first call. */
+export interface RelayResult {
+  hash: string;
+  deployHash?: string;
+}
 
 /** What a relayer answers: the hash of the submitted transaction, or why it declined. */
-export type RelayResponse = { hash: string } | { error: RelayErrorCode; detail?: string };
+export type RelayResponse = RelayResult | { error: RelayErrorCode; detail?: string; hash?: string };
 
 export class RelayError extends Error {
   constructor(
@@ -272,17 +299,18 @@ export async function prepare(action: Action, options: PrepareOptions): Promise<
     throw new SimulationError(simulation.error);
   }
 
-  const entries = simulation.result?.auth ?? [];
-  const index = accountEntryIndex(entries, account);
+  // A call that needs anyone else's authorisation, the fee payer's included,
+  // is not something the owner's signature can cover: it stops here.
+  const recorded = assertOnlyAccountEntries(simulation.result?.auth ?? [], account);
   const validUntilLedger = simulation.latestLedger + (options.validForLedgers ?? DEFAULT_VALIDITY_LEDGERS);
-  const entry = setExpiration(entries[index]!, validUntilLedger);
+  const entry = setExpiration(recorded, validUntilLedger);
 
   return {
     network: config.name,
     owner: getAddress(options.owner),
     account,
     txXdr: tx.toEnvelope().toXdr("base64"),
-    entries: entries.map((other, i) => (i === index ? entry : other).toXdr("base64")),
+    entries: [entry.toXdr("base64")],
     typedData: entryTypedData(entry, config),
     calls: renderCalls(entry),
     validUntilLedger,
@@ -299,9 +327,8 @@ export async function prepare(action: Action, options: PrepareOptions): Promise<
 export async function sign(prepared: Prepared, signer: TypedDataSigner): Promise<Signed> {
   const signature = await signer.signTypedData(prepared.typedData);
 
-  const entries = decodeEntries(prepared.entries);
-  const index = accountEntryIndex(entries, prepared.account);
-  const signedEntry = attachSignature(entries[index]!, signature);
+  const entry = assertOnlyAccountEntries(decodeEntries(prepared.entries), prepared.account);
+  const signedEntry = attachSignature(entry, signature);
 
   const signedBy = await recoverTypedDataAddress({ ...prepared.typedData, signature });
   if (!isAddressEqual(signedBy, prepared.owner)) {
@@ -310,28 +337,149 @@ export async function sign(prepared: Prepared, signer: TypedDataSigner): Promise
 
   return {
     ...prepared,
-    entries: prepared.entries.map((entry, i) => (i === index ? signedEntry.toXdr("base64") : entry)),
+    entries: [signedEntry.toXdr("base64")],
     signature,
   };
 }
 
-function hostFunction(txXdr: string): xdr.HostFunction {
+function hostFunction(txXdr: string) {
   const envelope = xdr.TransactionEnvelope.fromXdr(txXdr, "base64");
   const body = envelope.type === "envelopeTypeTx" ? envelope.v1.tx.operations[0]?.body : undefined;
   if (body?.type !== "invokeHostFunction") {
     throw new Error("Expected a transaction with a single contract invocation");
   }
-  return body.invokeHostFunctionOp.hostFunction;
+  const { hostFunction: func } = body.invokeHostFunctionOp;
+  if (func.type !== "hostFunctionTypeInvokeContract") {
+    throw new Error("Only contract calls can be made from an account; this transaction uploads or creates a contract");
+  }
+  return func;
 }
 
-/** The relayer request for a signed call. */
+/**
+ * The relayer request for a signed call.
+ *
+ * Throws when the signed call carries anything but the account's own entry.
+ */
 export function relayRequest(signed: Signed): RelayRequest {
+  assertOnlyAccountEntries(decodeEntries(signed.entries), signed.account);
   return {
     network: signed.network,
     owner: signed.owner,
     func: hostFunction(signed.txXdr).toXdr("base64"),
     auth: signed.entries,
   };
+}
+
+/**
+ * Reads a relayer request back into the signed call it stands for.
+ *
+ * This is the relayer's side of `relayRequest`, and the place where it is
+ * decided what a fee payer will wrap in its own transaction: a contract call
+ * with exactly one authorisation entry, signed, for the account derived from
+ * `owner`. Anything else throws, so a request can never borrow the fee
+ * payer's authority or make it upload code.
+ */
+export function signedFromRelayRequest(request: RelayRequest, network: Network = request.network): Signed {
+  const config = resolveNetwork(network);
+  if (request.network !== config.name) {
+    throw new Error(`This request is for ${String(request.network)}, not for ${config.name}`);
+  }
+  if (typeof request.owner !== "string" || !isAddress(request.owner, { strict: false })) {
+    throw new Error("The request does not name the Ethereum address that owns the account");
+  }
+  if (typeof request.func !== "string" || !Array.isArray(request.auth)) {
+    throw new Error("The request needs a host function and a list of authorisation entries");
+  }
+
+  let func: xdr.HostFunction;
+  let entries: xdr.SorobanAuthorizationEntry[];
+  try {
+    func = xdr.HostFunction.fromXdr(request.func, "base64");
+    entries = decodeEntries(request.auth);
+  } catch {
+    throw new Error("The host function or an authorisation entry is not valid XDR");
+  }
+  if (func.type !== "hostFunctionTypeInvokeContract") {
+    throw new Error("Only contract calls can be relayed; this request uploads or creates a contract");
+  }
+
+  const account = twinAddress(request.owner, config);
+  const entry = assertOnlyAccountEntries(entries, account);
+  const validUntilLedger = entryExpiration(entry);
+  const signature = entrySignature(entry);
+  if (validUntilLedger === 0 || signature === null) {
+    throw new Error("The authorisation entry is not signed");
+  }
+
+  const tx = new TransactionBuilder(new Account(NULL_ACCOUNT, "0"), {
+    fee: BASE_FEE,
+    networkPassphrase: config.stellar.networkPassphrase,
+  })
+    .addOperation(Operation.invokeHostFunction({ func, auth: [] }))
+    .setTimeout(TRANSACTION_TIMEOUT_SECONDS)
+    .build();
+
+  return {
+    network: config.name,
+    owner: getAddress(request.owner),
+    account,
+    txXdr: tx.toEnvelope().toXdr("base64"),
+    entries: [entry.toXdr("base64")],
+    typedData: entryTypedData(entry, config),
+    calls: renderCalls(entry),
+    validUntilLedger,
+    signature,
+  };
+}
+
+/**
+ * Returns the signed call with one argument of its root call replaced, in the
+ * call itself and in the signed authorisation entry alike, while the
+ * signature and everything the wallet showed stay as they were.
+ *
+ * This is the change a dishonest relayer or front end would have to make to
+ * alter a call after the owner approved it. The account contract rebuilds the
+ * signed text from what is about to run, so it refuses the result with
+ * `BadSignature`. It exists to demonstrate that refusal.
+ */
+export function withArgument(signed: Signed, index: number, value: xdr.ScVal): Signed {
+  const config = resolveNetwork(signed.network);
+  const call = hostFunction(signed.txXdr).invokeContract;
+  const entry = assertOnlyAccountEntries(decodeEntries(signed.entries), signed.account);
+
+  const authorised = entry.rootInvocation.function;
+  const sameCall =
+    authorised.type === "sorobanAuthorizedFunctionTypeContractFn" &&
+    authorised.contractFn.toXdr("base64") === call.toXdr("base64");
+  if (!sameCall) {
+    throw new Error("The account authorises this call through a nested invocation, not as the call itself");
+  }
+  if (!Number.isInteger(index) || index < 0 || index >= call.args.length) {
+    throw new Error(`The call has ${call.args.length} arguments; there is no argument ${index}`);
+  }
+
+  const changed = new xdr.InvokeContractArgs({
+    contractAddress: call.contractAddress,
+    functionName: call.functionName,
+    args: call.args.map((arg, i) => (i === index ? value : arg)),
+  });
+  const { source } = TransactionBuilder.fromXdr(signed.txXdr, config.stellar.networkPassphrase) as Transaction;
+  const tx = new TransactionBuilder(new Account(source, "0"), {
+    fee: BASE_FEE,
+    networkPassphrase: config.stellar.networkPassphrase,
+  })
+    .addOperation(Operation.invokeHostFunction({ func: xdr.HostFunction.hostFunctionTypeInvokeContract(changed), auth: [] }))
+    .setTimeout(TRANSACTION_TIMEOUT_SECONDS)
+    .build();
+  const changedEntry = new xdr.SorobanAuthorizationEntry({
+    credentials: entry.credentials,
+    rootInvocation: new xdr.SorobanAuthorizedInvocation({
+      function: xdr.SorobanAuthorizedFunction.sorobanAuthorizedFunctionTypeContractFn(changed),
+      subInvocations: entry.rootInvocation.subInvocations,
+    }),
+  });
+
+  return { ...signed, txXdr: tx.toEnvelope().toXdr("base64"), entries: [changedEntry.toXdr("base64")] };
 }
 
 /**
@@ -353,7 +501,7 @@ export async function relay(
   signed: Signed,
   relayerUrl: string,
   options: { signal?: AbortSignal } = {},
-): Promise<{ hash: string }> {
+): Promise<RelayResult> {
   const response = await fetch(relayerUrl, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -362,7 +510,7 @@ export async function relay(
   });
 
   const text = await response.text();
-  let body: Partial<{ hash: string; error: RelayErrorCode; detail: string }> = {};
+  let body: Partial<{ hash: string; deployHash: string; error: RelayErrorCode; detail: string }> = {};
   try {
     body = JSON.parse(text);
   } catch {
@@ -370,7 +518,9 @@ export async function relay(
   }
 
   if (response.ok && typeof body.hash === "string") {
-    return { hash: body.hash };
+    return typeof body.deployHash === "string"
+      ? { hash: body.hash, deployHash: body.deployHash }
+      : { hash: body.hash };
   }
   throw new RelayError(body.error ?? "relay_failed", response.status, body.detail ?? (body.error ? undefined : text));
 }
@@ -381,14 +531,30 @@ export interface SubmitOptions {
   server?: rpc.Server;
 }
 
-async function submitOperation(
+/**
+ * The operation a fee payer wraps in its own transaction: the call, and the
+ * one entry signed by the owner's account. The account is derived from the
+ * owner again here, so nothing else in `signed` decides whose entry is let
+ * through.
+ */
+function signedOperation(signed: Signed, config: NetworkConfig): xdr.Operation {
+  const entry = assertOnlyAccountEntries(decodeEntries(signed.entries), twinAddress(signed.owner, config));
+  return Operation.invokeHostFunction({ func: hostFunction(signed.txXdr), auth: [entry] });
+}
+
+/**
+ * Simulates an operation as `source` would send it. With signed entries
+ * attached the network enforces them, so this is where a signature is
+ * accepted or refused.
+ */
+async function simulateOperation(
   operation: xdr.Operation,
-  source: Keypair,
+  source: Account,
   config: NetworkConfig,
   server: rpc.Server,
   validUntilLedger?: number,
-): Promise<string> {
-  const tx = new TransactionBuilder(await server.getAccount(source.publicKey()), {
+) {
+  const tx = new TransactionBuilder(source, {
     fee: BASE_FEE,
     networkPassphrase: config.stellar.networkPassphrase,
   })
@@ -404,6 +570,41 @@ async function submitOperation(
   if (rpc.Api.isSimulationRestore(simulation)) {
     throw new SimulationError("ledger entries this call needs are archived and have to be restored first");
   }
+  return { tx, simulation };
+}
+
+/**
+ * Checks a signed call against the network without submitting it.
+ *
+ * The account contract verifies the signature exactly as it would on
+ * submission, so this resolves only for a call the network would accept. A
+ * wrong signer, a call that differs from what was signed, or an expired
+ * signature throws a `SimulationError`. The account has to be deployed.
+ */
+export async function simulateSigned(
+  signed: Signed,
+  options: SubmitOptions & { source?: string } = {},
+): Promise<void> {
+  const config = resolveNetwork(options.network ?? signed.network);
+  const source = new Account(options.source ?? NULL_ACCOUNT, "0");
+  await simulateOperation(
+    signedOperation(signed, config),
+    source,
+    config,
+    serverFor(config, options.server),
+    signed.validUntilLedger,
+  );
+}
+
+async function submitOperation(
+  operation: xdr.Operation,
+  source: Keypair,
+  config: NetworkConfig,
+  server: rpc.Server,
+  validUntilLedger?: number,
+): Promise<string> {
+  const account = await server.getAccount(source.publicKey());
+  const { tx, simulation } = await simulateOperation(operation, account, config, server, validUntilLedger);
 
   const ready = rpc.assembleTransaction(tx, simulation).build();
   ready.sign(source);
@@ -457,6 +658,10 @@ export async function ensureDeployed(
  * Deploys the owner's account first when it does not exist yet, then
  * simulates again with the signed entry in place, so the transaction pays for
  * the account contract's signature check, and waits for the result.
+ *
+ * `source` only pays: a signed call that carries anything but the entry of
+ * the owner's account is refused before the network is contacted, so the
+ * source's own authority is never lent to the call.
  */
 export async function submitWith(
   signed: Signed,
@@ -465,12 +670,32 @@ export async function submitWith(
 ): Promise<{ hash: string }> {
   const config = resolveNetwork(options.network ?? signed.network);
   const server = serverFor(config, options.server);
+  const operation = signedOperation(signed, config);
 
   await ensureDeployed(signed.owner, source, config, server);
 
-  const operation = Operation.invokeHostFunction({
-    func: hostFunction(signed.txXdr),
-    auth: decodeEntries(signed.entries),
-  });
-  return { hash: await submitOperation(operation, source, config, server, signed.validUntilLedger) };
+  const hash = await submitOperation(operation, source, config, server, signed.validUntilLedger);
+  return { hash };
+}
+
+/**
+ * Delivers an attested burn on Stellar from any funded account, with no
+ * relayer. Anyone may do this: Circle's contracts check the attestation and
+ * decide where the USDC goes, and `source` only pays the fee.
+ *
+ * Throws a `SimulationError` when the message cannot be delivered, which
+ * includes a message that has been delivered before.
+ */
+export async function deliverWith(
+  attestation: Pick<Attestation, "message" | "attestation">,
+  source: Keypair,
+  network: Network,
+  server?: rpc.Server,
+): Promise<{ hash: string }> {
+  const config = resolveNetwork(network);
+  const operation = deliverOperation(
+    { message: attestation.message, attestation: attestation.attestation, caller: source.publicKey() },
+    config,
+  );
+  return { hash: await submitOperation(operation, source, config, serverFor(config, server)) };
 }

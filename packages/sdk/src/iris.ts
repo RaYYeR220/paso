@@ -120,6 +120,23 @@ async function pollIris(
 }
 
 /**
+ * Asks Iris once about the burn in `txHash`. `attestation` is present when
+ * the status is `complete`; every other status means: ask again later.
+ */
+export function fetchAttestation(
+  sourceDomain: number,
+  txHash: string,
+  network: Network,
+  options: { signal?: AbortSignal } = {},
+): Promise<{ status: AttestationStatus; attestation?: Attestation }> {
+  return pollIris(messagesUrl(sourceDomain, txHash, network), options.signal);
+}
+
+function messagesUrl(sourceDomain: number, txHash: string, network: Network): string {
+  return `${resolveNetwork(network).irisUrl}/v2/messages/${sourceDomain}?transactionHash=${txHash}`;
+}
+
+/**
  * Polls Iris until the burn in `txHash` is attested.
  *
  * It never gives up on its own: a missing message, a pending attestation and
@@ -133,7 +150,7 @@ export async function waitForAttestation(
   options: WaitForAttestationOptions = {},
 ): Promise<Attestation> {
   const { signal, onStatus, intervalMs = DEFAULT_POLL_INTERVAL_MS } = options;
-  const url = `${resolveNetwork(network).irisUrl}/v2/messages/${sourceDomain}?transactionHash=${txHash}`;
+  const url = messagesUrl(sourceDomain, txHash, network);
 
   for (;;) {
     signal?.throwIfAborted();

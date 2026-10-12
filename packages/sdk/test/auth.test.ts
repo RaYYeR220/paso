@@ -4,7 +4,9 @@ import { privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it } from "vitest";
 import {
   accountEntryIndex,
+  assertOnlyAccountEntries,
   attachSignature,
+  AuthorizationEntriesError,
   authPayload,
   entryTypedData,
   setExpiration,
@@ -208,5 +210,50 @@ describe("accountEntryIndex", () => {
   it("fails when the account would have to sign more than once", () => {
     const entries = [unsignedEntry("sorobanCredentialsAddress"), unsignedEntry("sorobanCredentialsAddressV2")];
     expect(() => accountEntryIndex(entries, ACCOUNT)).toThrow(/2 separate authorisations/);
+  });
+});
+
+describe("assertOnlyAccountEntries", () => {
+  it.each(["sorobanCredentialsAddress", "sorobanCredentialsAddressV2"] as const)(
+    "returns the account's single entry with %s",
+    (kind) => {
+      const entry = unsignedEntry(kind);
+      expect(assertOnlyAccountEntries([entry], ACCOUNT)).toBe(entry);
+    },
+  );
+
+  it("refuses an entry with source-account credentials, alone or beside the account's", () => {
+    expect(() => assertOnlyAccountEntries([sourceAccountEntry()], ACCOUNT)).toThrow(AuthorizationEntriesError);
+    expect(() => assertOnlyAccountEntries([sourceAccountEntry()], ACCOUNT)).toThrow(/source account/);
+    expect(() =>
+      assertOnlyAccountEntries([unsignedEntry("sorobanCredentialsAddressV2"), sourceAccountEntry()], ACCOUNT),
+    ).toThrow(/source account/);
+  });
+
+  it("refuses credentials that delegate the authorisation", () => {
+    const delegated = new xdr.SorobanAuthorizationEntry({
+      credentials: xdr.SorobanCredentials.sorobanCredentialsAddressWithDelegates(
+        new xdr.SorobanAddressCredentialsWithDelegates({
+          addressCredentials: credentialsOf(unsignedEntry("sorobanCredentialsAddress")),
+          delegates: [],
+        }),
+      ),
+      rootInvocation: transferInvocation(),
+    });
+    expect(() => assertOnlyAccountEntries([delegated], ACCOUNT)).toThrow(/sorobanCredentialsAddressWithDelegates/);
+  });
+
+  it("refuses an entry for any other address", () => {
+    const entries = [unsignedEntry("sorobanCredentialsAddressV2"), unsignedEntry("sorobanCredentialsAddressV2", ISSUER)];
+    expect(() => assertOnlyAccountEntries(entries, ACCOUNT)).toThrow(new RegExp(`authorisation from ${ISSUER}`));
+    expect(() => assertOnlyAccountEntries([unsignedEntry("sorobanCredentialsAddress", ISSUER)], ACCOUNT)).toThrow(
+      AuthorizationEntriesError,
+    );
+  });
+
+  it("refuses no entry at all and more than one", () => {
+    expect(() => assertOnlyAccountEntries([], ACCOUNT)).toThrow(/does not need.*authoris/i);
+    const twice = [unsignedEntry("sorobanCredentialsAddress"), unsignedEntry("sorobanCredentialsAddressV2")];
+    expect(() => assertOnlyAccountEntries(twice, ACCOUNT)).toThrow(/2 separate authorisations/);
   });
 });

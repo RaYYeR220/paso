@@ -1,8 +1,9 @@
-import { Address, Keypair, xdr } from "@stellar/stellar-sdk";
+import { Account, Address, Keypair, rpc, StrKey, xdr } from "@stellar/stellar-sdk";
 import type { Hex } from "viem";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   decodeBurnMessage,
+  fetchAttestation,
   fetchBurnFee,
   inboundRouteOf,
   maxFeeFor,
@@ -11,6 +12,7 @@ import {
   waitForAttestation,
   type AttestationStatus,
 } from "../src/iris";
+import { deliverWith, SimulationError } from "../src/actions";
 import { forwardRecipientHookData } from "../src/evm";
 import { renderArg } from "../src/render";
 import { twinAddress, twinContractId } from "../src/twin";
@@ -153,6 +155,55 @@ describe("waitForAttestation", () => {
   });
 });
 
+describe("fetchAttestation", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("asks Iris once and reports a burn it has not indexed", async () => {
+    const fetchMock = vi.fn(async () => json({ error: "Message not found" }, 404));
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(await fetchAttestation(6, TX_HASH, testNetwork)).toEqual({ status: { state: "not_found" } });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((fetchMock.mock.calls[0] as unknown as [string])[0]).toBe(
+      `https://iris-api-sandbox.circle.com/v2/messages/6?transactionHash=${TX_HASH}`,
+    );
+  });
+
+  it("reports a pending attestation without one", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => json({ messages: [{ message: "0x", attestation: "PENDING", status: "pending_confirmations" }] })),
+    );
+
+    expect(await fetchAttestation(6, TX_HASH, testNetwork)).toEqual({ status: { state: "pending" } });
+  });
+
+  it("returns the message, the attestation and the nonce once complete", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => json({ messages: [{ message: DIRECT_MESSAGE, attestation: ATTESTATION, status: "complete" }] })),
+    );
+
+    expect(await fetchAttestation(6, TX_HASH, testNetwork)).toEqual({
+      status: { state: "complete" },
+      attestation: { message: DIRECT_MESSAGE, attestation: ATTESTATION, nonce: NONCE },
+    });
+  });
+
+  it("reports an Iris that cannot be reached instead of throwing", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("socket hang up");
+      }),
+    );
+
+    expect(await fetchAttestation(6, TX_HASH, testNetwork)).toEqual({
+      status: { state: "unreachable", detail: "socket hang up" },
+    });
+  });
+});
+
 describe("decodeBurnMessage", () => {
   it("reads the fields at Circle's offsets", () => {
     const hookData = forwardRecipientHookData(TWIN);
@@ -216,5 +267,55 @@ describe("delivery operations", () => {
       args: [caller, DIRECT_MESSAGE, ATTESTATION],
       types: ["scvAddress", "scvBytes", "scvBytes"],
     });
+  });
+});
+
+describe("deliverWith", () => {
+  const source = Keypair.random();
+
+  /** A server that knows the source account and answers every simulation with `error`. */
+  function refusingServer(error: string) {
+    const simulateTransaction = vi.fn(async (_tx: unknown) => ({ id: "1", latestLedger: 5_000_000, events: [], _parsed: true, error }));
+    const getAccount = vi.fn(async (address: string) => new Account(address, "41"));
+    return { simulateTransaction, getAccount } as unknown as rpc.Server & {
+      simulateTransaction: typeof simulateTransaction;
+    };
+  }
+
+  function simulatedCall(server: ReturnType<typeof refusingServer>) {
+    const tx = server.simulateTransaction.mock.calls[0]![0] as { source: string; toEnvelope(): xdr.TransactionEnvelope };
+    const envelope = tx.toEnvelope();
+    if (envelope.type !== "envelopeTypeTx") throw new Error("unexpected envelope");
+    const body = envelope.v1.tx.operations[0]!.body;
+    if (body.type !== "invokeHostFunction") throw new Error("unexpected operation");
+    const func = body.invokeHostFunctionOp.hostFunction;
+    if (func.type !== "hostFunctionTypeInvokeContract") throw new Error("not a contract call");
+    return { source: tx.source, call: func.invokeContract };
+  }
+
+  it("pays from the given account and calls the message transmitter itself for a direct burn", async () => {
+    const server = refusingServer("HostError: Error(Contract, #6908)");
+    const failure = await deliverWith({ message: DIRECT_MESSAGE, attestation: ATTESTATION }, source, testNetwork, server).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(SimulationError);
+    expect((failure as SimulationError).detail).toContain("#6908");
+    const { source: payer, call } = simulatedCall(server);
+    expect(payer).toBe(source.publicKey());
+    expect(Address.fromScAddress(call.contractAddress).toString()).toBe(testNetwork.stellar.messageTransmitter);
+    expect(call.functionName.toString()).toBe("receive_message");
+    expect(renderArg(call.args[0]!)).toBe(source.publicKey());
+  });
+
+  it("goes through the forwarder for a burn that names it", async () => {
+    const forwarder = Buffer.from(StrKey.decodeContract(testNetwork.stellar.forwarder)).toString("hex");
+    const message = burnMessage(forwarder, forwardRecipientHookData(TWIN));
+    const server = refusingServer("HostError: Error(Contract, #6908)");
+
+    await expect(deliverWith({ message, attestation: ATTESTATION }, source, testNetwork, server)).rejects.toThrow(SimulationError);
+    const { call } = simulatedCall(server);
+    expect(Address.fromScAddress(call.contractAddress).toString()).toBe(testNetwork.stellar.forwarder);
+    expect(call.functionName.toString()).toBe("mint_and_forward");
   });
 });

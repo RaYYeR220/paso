@@ -44,7 +44,7 @@ const { hash } = await relay(signed, "https://example.org/api/relay");
 | `{ kind: "exit", amount, recipient }` | `hub.exit(account, amount, domain, recipient, max_fee, min_finality_threshold)`: USDC leaves for `recipient` on Base. Optional `destinationDomain`, `maxFee`, `minFinalityThreshold`. |
 | `{ kind: "invoke", contract, fn, args }` | Any contract function that asks the account for authorisation. |
 
-`prepare(action, { owner, network })` returns plain JSON: `{ network, owner, account, txXdr, entries, typedData, calls, validUntilLedger }`. The signature is accepted up to and including `validUntilLedger` (about ten minutes by default; set `validForLedgers` to change it). `isExpired(prepared, latestLedger)` tells when to prepare again.
+`prepare(action, { owner, network })` returns plain JSON: `{ network, owner, account, txXdr, entries, typedData, calls, validUntilLedger }`. `entries` holds exactly one authorisation entry, the account's: a call that also needs the authorisation of anyone else, the fee payer included, is refused at this point. The signature is accepted up to and including `validUntilLedger` (about ten minutes by default; set `validForLedgers` to change it). `isExpired(prepared, latestLedger)` tells when to prepare again.
 
 ## What the wallet signs
 
@@ -81,7 +81,9 @@ Arguments are rendered by `renderArg`:
 | `"forwarder"` (default) | `depositForBurnWithHook`, mint recipient and destination caller set to Circle's CctpForwarder, the account named in the hook data | `mintAndForwardOperation(message, attestation, network)` |
 | `"direct"` | `depositForBurn`, mint recipient set to the account's contract id, no destination caller | `receiveMessageOperation(caller, message, attestation, network)` |
 
-`waitForAttestation(sourceDomain, txHash, network, { signal, onStatus })` polls Circle's Iris service until the burn is attested and resolves to `{ message, attestation, nonce }`. It reports `not_found`, `pending`, `unreachable` and `complete` through `onStatus` and keeps polling until aborted. `deliverOperation({ message, attestation, caller }, network)` picks the right delivery call from the message itself.
+`waitForAttestation(sourceDomain, txHash, network, { signal, onStatus })` polls Circle's Iris service until the burn is attested and resolves to `{ message, attestation, nonce }`. It reports `not_found`, `pending`, `unreachable` and `complete` through `onStatus` and keeps polling until aborted. `fetchAttestation(sourceDomain, txHash, network)` asks once and returns `{ status, attestation? }`. For a burn made on Stellar, `txHash` is the transaction hash without `0x`.
+
+`deliverOperation({ message, attestation, caller }, network)` picks the right delivery call from the message itself, and `deliverWith({ message, attestation }, keypair, network)` submits it from any funded Stellar account. Delivery is permissionless: Circle's contracts check the attestation and decide where the USDC goes.
 
 ## Relayer
 
@@ -99,13 +101,50 @@ Arguments are rendered by `renderArg`:
 - `network`: `"testnet"` or `"mainnet"`.
 - `owner`: the Ethereum address that owns the account, so the relayer can deploy the account before its first call.
 - `func`: the host function to invoke.
-- `auth`: every authorisation entry the call needs, in order, with the owner's signature attached.
+- `auth`: one element, the account's authorisation entry with the owner's signature attached.
 
-The relayer answers `200` with `{ "hash": "<transaction hash>" }`, or a non-2xx status with `{ "error": "expired" | "bad_signature" | "simulation_failed", "detail": "…" }`. `relay` throws a `RelayError` carrying that `error` as `code`; on `expired`, prepare and sign again.
+The relayer answers `200` with `{ "hash": "<transaction hash>" }`, plus `"deployHash"` when it deployed the account for this first call, or a non-2xx status with `{ "error": "<code>", "detail": "…" }`. `relay` throws a `RelayError` carrying that `error` as `code`:
 
-A relayer builds its own transaction around `func` and `auth` and pays the fee. It can decline. It cannot change the call or its arguments: the signature covers them. The types are exported as `RelayRequest` and `RelayResponse`, and `relayRequest(signed)` builds the body.
+| `error` | Meaning |
+|---|---|
+| `expired` | The signature's last valid ledger has passed. Prepare and sign again. |
+| `bad_signature` | The account refused the signature for this call. |
+| `simulation_failed` | The call itself would fail, or costs more than the relayer pays for. |
+| `bad_request` | The request is not one signed call from the owner's account. |
+| `rate_limited` | Too many requests; try again later. |
+| `transaction_failed` | The transaction was submitted and did not apply. |
+| `unavailable` | The relayer could not reach the network. |
+
+A relayer builds its own transaction around `func` and `auth` and pays the fee. It can decline. It cannot change the call or its arguments: the signature covers them. The types are exported as `RelayRequest`, `RelayResult` and `RelayResponse`, and `relayRequest(signed)` builds the body.
 
 Without a relayer, `submitWith(signed, keypair)` does the same from any funded Stellar account, deploying the owner's account first if it does not exist.
+
+### What a fee payer will not pass along
+
+Whoever pays the fee signs the transaction envelope, and on Stellar that signature also satisfies any authorisation entry with source-account credentials. A fee payer that forwarded entries unchecked could be made to authorise a transfer of its own funds. So every path that puts someone else's signed call into a transaction first runs `assertOnlyAccountEntries(entries, account)`:
+
+- exactly one entry;
+- plain address credentials (either encoding), never source-account credentials or delegated ones;
+- for the account derived from the owner, and no other address.
+
+`prepare`, `sign`, `relayRequest`, `simulateSigned` and `submitWith` all apply it, and `submitWith` derives the account from the owner again instead of trusting the one named in the call. Only contract calls are accepted: a host function that uploads code or creates a contract is refused.
+
+`signedFromRelayRequest(request, network)` is the relayer's side of `relayRequest`: it reads a request back into a `Signed`, applying the same checks, and throws on anything else.
+
+## Reading the chain
+
+These simulate a read and need no account or fee:
+
+- `usdcBalance(address, network)`: USDC held by a `G…` or `C…` address, in 7-decimal units.
+- `ownerOf(account, network)`: the Ethereum address stored in an account contract, or `null` when nothing is deployed there.
+- `isDeployed(owner, network)`: whether the owner's account contract exists yet.
+- `readContract(contract, fn, args, network)`: any read-only contract function.
+
+## Showing the refusal
+
+`withArgument(signed, index, value)` returns the signed call with one argument replaced in the call and in the authorisation entry alike, and the signature left as it was. It is the change a dishonest relayer or front end would have to make. The account rebuilds the signed text from what is about to run, so `simulateSigned` and any relayer refuse the result, and on chain the transaction fails with the account's `BadSignature` error.
+
+`simulateSigned(signed)` checks a signed call against the network without submitting it. The account contract verifies the signature exactly as it would on submission, so it resolves only for a call the network would accept and throws a `SimulationError` for a wrong signer, a call that differs from what was signed, or an expired signature.
 
 ## Units
 
@@ -132,9 +171,14 @@ Contract ids come from `deployments/<network>.json` at build time. Deriving an a
 ## Develop
 
 ```sh
-pnpm --filter @paso/sdk test        # unit tests; tests against the testnet hub run once it is deployed
+pnpm --filter @paso/sdk test
 pnpm --filter @paso/sdk typecheck
 pnpm --filter @paso/sdk build
 ```
 
-Set `PASO_OFFLINE=1` to skip the tests that reach the network.
+The tests reach Stellar testnet once the hub is deployed there; set `PASO_OFFLINE=1` to skip those. Two more are opt-in:
+
+| Variable | Enables |
+|---|---|
+| `PASO_E2E_OWNER_KEY` | The private key of an Ethereum address whose account is deployed. Signs a transfer of nothing and checks that the account accepts it, then that it refuses the same signature on a changed call. Simulation only: no funds, nothing submitted. |
+| `PASO_E2E_OWNER_KEY` and `PASO_E2E_SOURCE_SECRET` | Also submits a real 0.01 USDC transfer out of that account, paid for by the Stellar secret key. |

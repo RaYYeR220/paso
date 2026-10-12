@@ -81,6 +81,76 @@ export function accountEntryIndex(entries: xdr.SorobanAuthorizationEntry[], acco
   return index;
 }
 
+/** Last ledger at which the signature of an entry is accepted, or 0 when none has been set. */
+export function entryExpiration(entry: xdr.SorobanAuthorizationEntry): number {
+  return addressCredentials(entry).signatureExpirationLedger;
+}
+
+/** The signature an entry carries (`r ‖ s ‖ v`), or `null` when it has not been signed. */
+export function entrySignature(entry: xdr.SorobanAuthorizationEntry): Hex | null {
+  const { signature } = addressCredentials(entry);
+  return signature.type === "scvBytes" ? toHex(signature.bytes.toBytes()) : null;
+}
+
+/** Raised when a set of authorisation entries is not exactly the one entry an account signs. */
+export class AuthorizationEntriesError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AuthorizationEntriesError";
+  }
+}
+
+/**
+ * Checks that `entries` is exactly one entry, with plain address credentials,
+ * for `account`, and returns it.
+ *
+ * Whoever pays the fee signs the transaction envelope, and that signature
+ * also satisfies any entry with source-account credentials. Entries that come
+ * from someone else must therefore never be passed along unchecked: an entry
+ * with source-account credentials would spend the fee payer's own authority.
+ * Everything except the account's single entry is refused, whatever it
+ * claims to authorise.
+ */
+export function assertOnlyAccountEntries(
+  entries: xdr.SorobanAuthorizationEntry[],
+  account: string,
+): xdr.SorobanAuthorizationEntry {
+  for (const entry of entries) {
+    const { credentials } = entry;
+    switch (credentials.type) {
+      case "sorobanCredentialsAddress":
+      case "sorobanCredentialsAddressV2":
+        break;
+      case "sorobanCredentialsSourceAccount":
+        throw new AuthorizationEntriesError(
+          "This call asks the transaction's source account to authorise something; " +
+            "only the authorisation of the owner's account can be passed along",
+        );
+      default:
+        throw new AuthorizationEntriesError(
+          `Authorisation entries with ${credentials.type} are not supported; expected plain address credentials`,
+        );
+    }
+    const address = entryAddress(entry);
+    if (address !== account) {
+      throw new AuthorizationEntriesError(
+        `This call needs an authorisation from ${address}, which is not the owner's account ${account}`,
+      );
+    }
+  }
+
+  const [entry] = entries;
+  if (!entry) {
+    throw new AuthorizationEntriesError(`This call does not need ${account} to authorise anything`);
+  }
+  if (entries.length > 1) {
+    throw new AuthorizationEntriesError(
+      `This call needs ${entries.length} separate authorisations from ${account}; only one is supported`,
+    );
+  }
+  return entry;
+}
+
 /** Returns the entry with its signature expiration ledger set. */
 export function setExpiration(
   entry: xdr.SorobanAuthorizationEntry,
