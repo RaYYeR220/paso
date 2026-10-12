@@ -220,6 +220,34 @@ describe("receiveMessageOnEvm", () => {
     expect(publicClient.waitForTransactionReceipt).toHaveBeenCalledWith({ hash: MINT_HASH });
   });
 
+  it("sends with the gas limit, the fee caps and the confirmations it is given", async () => {
+    const { args, publicClient, walletClient } = base();
+
+    await receiveMessageOnEvm({ ...args, gas: 240_000n, maxFeePerGas: 7n, maxPriorityFeePerGas: 3n, confirmations: 2 });
+
+    expect(walletClient.writeContract.mock.calls[0]![0]).toMatchObject({ gas: 240_000n, maxFeePerGas: 7n, maxPriorityFeePerGas: 3n });
+    expect(publicClient.waitForTransactionReceipt).toHaveBeenCalledWith({ hash: MINT_HASH, confirmations: 2 });
+
+    const plain = base();
+    await receiveMessageOnEvm(plain.args);
+    const request = plain.walletClient.writeContract.mock.calls[0]![0] as unknown as Record<string, unknown>;
+    expect("gas" in request || "maxFeePerGas" in request || "maxPriorityFeePerGas" in request).toBe(false);
+  });
+
+  it("never sends a failed call a second time", async () => {
+    const refused = base({
+      write: async () => {
+        throw new Error("insufficient funds for gas");
+      },
+    });
+    await expect(receiveMessageOnEvm(refused.args)).rejects.toThrow();
+    expect(refused.walletClient.writeContract).toHaveBeenCalledTimes(1);
+
+    const reverted = base({ status: "reverted" });
+    await expect(receiveMessageOnEvm(reverted.args)).rejects.toThrow();
+    expect(reverted.walletClient.writeContract).toHaveBeenCalledTimes(1);
+  });
+
   it("asks the chain for the message's nonce before spending anything", async () => {
     const { args, publicClient, walletClient } = base({ used: [1n] });
 

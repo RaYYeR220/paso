@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   decodeBurnMessage,
   fetchAttestation,
+  fetchAttestations,
   fetchBurnFee,
   inboundRouteOf,
   maxFeeFor,
@@ -204,6 +205,88 @@ describe("fetchAttestation", () => {
   });
 });
 
+describe("fetchAttestations", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  const answer = (body: unknown, status = 200) => vi.stubGlobal("fetch", vi.fn(async () => json(body, status)));
+  const complete = (message: string = DIRECT_MESSAGE, attestation: string = ATTESTATION) => ({ message, attestation, status: "complete" });
+  const lookUp = (limits = {}) => fetchAttestations(27, "ab".repeat(32), testNetwork, limits);
+
+  it("returns every message of the transaction once all are attested", async () => {
+    const second = burnMessage("33".repeat(32));
+    answer({ messages: [complete(), complete(second)] });
+
+    expect(await lookUp()).toEqual({
+      state: "complete",
+      attestations: [
+        { message: DIRECT_MESSAGE, attestation: ATTESTATION, nonce: NONCE },
+        { message: second, attestation: ATTESTATION, nonce: NONCE },
+      ],
+    });
+  });
+
+  it("is pending while any message is, and says why when Iris does", async () => {
+    answer({ messages: [complete(), { message: "0x", attestation: "PENDING", status: "pending_confirmations", delayReason: "insufficient_fee" }] });
+    expect(await lookUp()).toEqual({ state: "pending", delayReason: "insufficient_fee" });
+
+    answer({ messages: [{ status: "pending_confirmations" }] });
+    expect(await lookUp()).toEqual({ state: "pending" });
+  });
+
+  it("tells a burn Iris does not know from an Iris that cannot be reached", async () => {
+    answer({ error: "Message not found" }, 404);
+    expect(await lookUp()).toEqual({ state: "not_found" });
+    answer({ messages: [] });
+    expect(await lookUp()).toEqual({ state: "not_found" });
+
+    answer("Bad Gateway", 502);
+    expect(await lookUp()).toEqual({ state: "unreachable", detail: "Iris answered 502" });
+  });
+
+  it("does not read an answer past its limit", async () => {
+    let sent = 0;
+    const endless = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        sent += 65_536;
+        controller.enqueue(new Uint8Array(65_536).fill(0x20));
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(endless)));
+    expect(await lookUp()).toEqual({ state: "malformed", detail: "the answer is too large" });
+    expect(sent).toBeLessThan(1_000_000);
+
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { headers: { "content-length": "99999999" } })));
+    expect(await lookUp()).toEqual({ state: "malformed", detail: "the answer is too large" });
+
+    answer({ messages: [complete()] });
+    expect(await lookUp({ maxResponseBytes: 100 })).toEqual({ state: "malformed", detail: "the answer is too large" });
+  });
+
+  it("refuses more messages, or larger ones, than a transfer has", async () => {
+    answer({ messages: new Array(17).fill(complete()) });
+    expect(await lookUp()).toEqual({ state: "malformed", detail: "the transaction carries too many messages" });
+
+    answer({ messages: [complete(`${DIRECT_MESSAGE}${"00".repeat(8_192)}`)] });
+    expect(await lookUp()).toEqual({ state: "malformed", detail: "a message is too large" });
+
+    answer({ messages: [complete(DIRECT_MESSAGE, `0x${"ee".repeat(2_049)}`)] });
+    expect(await lookUp()).toEqual({ state: "malformed", detail: "an attestation is too large" });
+  });
+
+  it("refuses anything that is not a list of well-formed messages", async () => {
+    for (const body of [null, 5, "text", [], {}, { messages: "many" }, { messages: { 0: complete() } }]) {
+      answer(body);
+      expect((await lookUp()).state).toBe("malformed");
+    }
+    for (const entry of [null, "complete", {}, { status: 1 }, { status: "complete" }, complete("0xzz"), complete("0x1234"), complete(DIRECT_MESSAGE, "PENDING"), complete(5 as unknown as string)]) {
+      answer({ messages: [entry] });
+      expect((await lookUp()).state).toBe("malformed");
+    }
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("<html>")));
+    expect(await lookUp()).toEqual({ state: "malformed", detail: "the answer is not JSON" });
+  });
+});
+
 describe("decodeBurnMessage", () => {
   it("reads the fields at Circle's offsets", () => {
     const hookData = forwardRecipientHookData(TWIN);
@@ -214,11 +297,13 @@ describe("decodeBurnMessage", () => {
       destinationDomain: 27,
       nonce: NONCE,
       destinationCaller: `0x${"22".repeat(32)}`,
+      burnToken: `0x${"00".repeat(12)}036cbd53842c5426634e7929541ec2318f3dcf7e`,
       mintRecipient: `0x${Buffer.from(Address.fromString(testNetwork.stellar.forwarder).toBuffer()).toString("hex")}`,
       amount: 1_000_000n,
       messageSender: `0x${"00".repeat(12)}70997970c51812dc3a010c7d01b50e0d17dc79c8`,
       maxFee: 156n,
       feeExecuted: 130n,
+      expirationBlock: 0n,
       hookData,
     });
   });

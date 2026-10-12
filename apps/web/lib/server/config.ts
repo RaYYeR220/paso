@@ -32,6 +32,8 @@ export const DEFAULT_BASE_MINTS_PER_CALLER_PER_HOUR = 10;
 export const DEFAULT_BASE_MINTS_PER_DAY = 100;
 /** The server stops paying for mints while its account on Base holds less than this, in wei (0.0001 ETH). */
 export const DEFAULT_BASE_MINT_PAYER_ETH_FLOOR = BigInt(100_000_000_000_000);
+/** The most the server offers per unit of gas for a mint, in wei (0.25 gwei). Base usually asks a small fraction of it. */
+export const DEFAULT_BASE_MINT_MAX_FEE_PER_GAS = BigInt(250_000_000);
 
 export interface ServerConfig {
   network: NetworkConfig;
@@ -61,6 +63,8 @@ export interface ServerConfig {
     perDay: number;
     /** ETH the account keeps, in wei: below this the server stops paying for mints. */
     payerEthFloor: bigint;
+    /** Fee cap per unit of gas, in wei: while Base asks more, the server does not mint. */
+    maxFeePerGas: bigint;
   };
 }
 
@@ -137,6 +141,7 @@ export function loadConfig(env: Env = process.env): ServerConfig {
       perCallerPerHour: positiveInteger(env, "BASE_MINTS_PER_CALLER_PER_HOUR", DEFAULT_BASE_MINTS_PER_CALLER_PER_HOUR),
       perDay: positiveInteger(env, "BASE_MINTS_PER_DAY", DEFAULT_BASE_MINTS_PER_DAY),
       payerEthFloor: amount(env, "BASE_MINT_PAYER_ETH_FLOOR", DEFAULT_BASE_MINT_PAYER_ETH_FLOOR, "wei"),
+      maxFeePerGas: amount(env, "BASE_MINT_MAX_FEE_PER_GAS", DEFAULT_BASE_MINT_MAX_FEE_PER_GAS, "wei"),
     },
   };
 }

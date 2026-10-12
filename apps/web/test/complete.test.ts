@@ -1,5 +1,6 @@
-import { NETWORKS } from "@paso/sdk";
+import { messageTransmitterAbi, NETWORKS } from "@paso/sdk";
 import { Keypair } from "@stellar/stellar-sdk";
+import { ContractFunctionRevertedError } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { POST as completeRoute } from "@/app/api/cctp/complete/route";
@@ -18,8 +19,30 @@ const MESSAGE = exit.message as `0x${string}`;
 const ATTESTATION = exit.attestation as `0x${string}`;
 const MINT_HASH = `0x${"c3".repeat(32)}`;
 const ETH = 10 ** 15;
+const BLOCK = 1_000_000;
+
+/** Where the fields of a CCTP message start, in bytes: its header is 148 bytes, the burn message follows. */
+const FIELD = {
+  sourceDomain: 4,
+  destinationDomain: 8,
+  nonce: 12,
+  destinationCaller: 108,
+  burnToken: 148 + 4,
+  mintRecipient: 148 + 36,
+  amount: 148 + 68,
+  messageSender: 148 + 100,
+  expirationBlock: 148 + 196,
+} as const;
+
+/** The exit with one field overwritten, as hex of the field's own length. */
+function exitWith(field: keyof typeof FIELD, hex: string, message: string = MESSAGE): string {
+  const start = 2 + FIELD[field] * 2;
+  return `${message.slice(0, start)}${hex}${message.slice(start + hex.length)}`;
+}
+const word = (value: number | bigint) => BigInt(value).toString(16).padStart(64, "0");
 
 const payerKey = generatePrivateKey();
+const payer = privateKeyToAccount(payerKey);
 const env = { RELAYER_SECRET: Keypair.random().secret(), DEMO_PAYER_PRIVATE_KEY: payerKey };
 
 let exits = 0;
@@ -40,19 +63,30 @@ function stubIris(answer: () => Response) {
   return lookups;
 }
 
-const attested = (message: string = MESSAGE) =>
-  Response.json({ messages: [{ message, attestation: ATTESTATION, status: "complete" }] });
+const attested = (...messages: string[]) =>
+  Response.json({
+    messages: (messages.length ? messages : [MESSAGE]).map((message) => ({ message, attestation: ATTESTATION, status: "complete" })),
+  });
+
+const reverting = (reason: string) => async (): Promise<bigint> => {
+  throw new ContractFunctionRevertedError({ abi: messageTransmitterAbi, functionName: "receiveMessage", message: reason });
+};
 
 interface Base {
   /** What `usedNonces` answers, read after read; the last answer from then on. */
   used?: number[];
   wei?: number;
+  block?: number;
+  /** What simulating the mint answers: the gas it needs, or a failure. */
+  simulate?: () => Promise<bigint>;
+  feePerGas?: number;
   write?: () => Promise<string>;
+  receipt?: string;
   env?: Record<string, string>;
 }
 
-/** A relayer whose view of Base is scripted: nonce state, the payer's ETH, and what sending the mint does. */
-function completing({ used = [0], wei = ETH, write, env: overrides = {} }: Base = {}) {
+/** A relayer whose view of Base is scripted: nonce state, the payer's ETH, the simulation, and what sending does. */
+function completing({ used = [0], wei = ETH, block = BLOCK, simulate, feePerGas = 6_000_000, write, receipt = "success", env: overrides = {} }: Base = {}) {
   const relayer = new Relayer(loadConfig({ ...env, ...overrides }));
   const reads = [...used];
   const publicClient = {
@@ -60,17 +94,25 @@ function completing({ used = [0], wei = ETH, write, env: overrides = {} }: Base 
       BigInt(reads.length > 1 ? reads.shift()! : reads[0]!),
     ),
     getBalance: vi.fn(async () => BigInt(wei)),
-    waitForTransactionReceipt: vi.fn(async () => ({ status: "success" })),
+    getBlockNumber: vi.fn(async () => BigInt(block)),
+    estimateContractGas: vi.fn<(call: { args: readonly unknown[]; account: string }) => Promise<bigint>>(async () =>
+      simulate ? simulate() : BigInt(150_000),
+    ),
+    estimateFeesPerGas: vi.fn(async () => ({ maxFeePerGas: BigInt(feePerGas), maxPriorityFeePerGas: BigInt(1_000_000) })),
+    waitForTransactionReceipt: vi.fn(async () => ({ status: receipt })),
   };
   const walletClient = {
-    account: privateKeyToAccount(payerKey),
-    writeContract: vi.fn<(call: { address: string; functionName: string; args: readonly unknown[] }) => Promise<string>>(
-      async () => (write ? write() : MINT_HASH),
-    ),
+    account: payer,
+    writeContract: vi.fn<
+      (call: { address: string; functionName: string; args: readonly unknown[]; gas: bigint; maxFeePerGas: bigint }) => Promise<string>
+    >(async () => (write ? write() : MINT_HASH)),
   };
   vi.spyOn(relayer as unknown as { evmClients: () => unknown }, "evmClients").mockReturnValue({ publicClient, walletClient });
   return { relayer, publicClient, walletClient };
 }
+
+const refusal = async (relayer: Relayer, body: unknown = request(), caller = "caller") =>
+  (await relayer.complete(body, caller).catch((error: unknown) => error)) as ApiError;
 
 afterEach(() => {
   vi.useRealTimers();
@@ -113,24 +155,41 @@ describe("POST /api/cctp/complete, while Circle has not attested the exit", () =
 });
 
 describe("POST /api/cctp/complete, once the exit is attested", () => {
-  it("submits one receiveMessage with exactly the bytes Circle returned, and returns its hash", async () => {
+  it("simulates the call, then submits it once with exactly the bytes Circle returned", async () => {
     const { relayer, publicClient, walletClient } = completing();
     const lookups = stubIris(() => attested());
     const asked = request();
 
     expect(await relayer.complete(asked, "caller")).toEqual({ status: "minted", hash: MINT_HASH });
 
+    expect(publicClient.estimateContractGas).toHaveBeenCalledTimes(1);
+    expect(publicClient.estimateContractGas.mock.calls[0]![0]).toMatchObject({ args: [MESSAGE, ATTESTATION], account: payer.address });
     expect(walletClient.writeContract).toHaveBeenCalledTimes(1);
     const call = walletClient.writeContract.mock.calls[0]![0];
     expect(call.address).toBe(NETWORKS.testnet.evm.messageTransmitter);
     expect(call.functionName).toBe("receiveMessage");
     expect(call.args).toEqual([MESSAGE, ATTESTATION]);
-    expect(publicClient.waitForTransactionReceipt).toHaveBeenCalledWith({ hash: MINT_HASH });
+    expect(publicClient.waitForTransactionReceipt).toHaveBeenCalledWith({ hash: MINT_HASH, confirmations: 2 });
 
     // Asked again, it answers from memory: no lookup, no second transaction.
     expect(await relayer.complete(asked, "someone else")).toEqual({ status: "minted", hash: MINT_HASH });
     expect(lookups).toHaveBeenCalledTimes(1);
     expect(walletClient.writeContract).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends with a gas limit of its own and the network's fee, both bounded", async () => {
+    const { relayer, walletClient } = completing({ simulate: async () => BigInt(390_000), feePerGas: 250_000_000 });
+    stubIris(() => attested());
+
+    await relayer.complete(request(), "caller");
+
+    const call = walletClient.writeContract.mock.calls[0]![0];
+    expect(call.gas).toBe(BigInt(400_000));
+    expect(call.maxFeePerGas).toBe(BigInt(250_000_000));
+
+    const usual = completing();
+    await usual.relayer.complete(request(), "caller");
+    expect(usual.walletClient.writeContract.mock.calls[0]![0].gas).toBe(BigInt(180_000));
   });
 
   it("takes nothing but the hash from the caller", async () => {
@@ -142,88 +201,188 @@ describe("POST /api/cctp/complete, once the exit is attested", () => {
     expect(walletClient.writeContract.mock.calls[0]![0].args).toEqual([MESSAGE, ATTESTATION]);
   });
 
-  it("sends one transaction when the same exit is asked about twice at once", async () => {
+  it("looks, simulates and sends once when the same exit is asked about several times at once", async () => {
     let finish: (hash: string) => void = () => undefined;
-    const { relayer, walletClient } = completing({ write: () => new Promise<string>((resolve) => (finish = resolve)) });
-    stubIris(() => attested());
+    const { relayer, publicClient, walletClient } = completing({ write: () => new Promise<string>((resolve) => (finish = resolve)) });
+    const lookups = stubIris(() => attested());
     const asked = request();
 
-    const both = Promise.all([relayer.complete(asked, "caller"), relayer.complete(asked, "caller")]);
+    const all = Promise.all([
+      relayer.complete(asked, "one"),
+      relayer.complete(asked, "two"),
+      relayer.complete({ ...asked, txHash: asked.txHash.toUpperCase() }, "three"),
+    ]);
     await vi.waitFor(() => expect(walletClient.writeContract).toHaveBeenCalledTimes(1));
     finish(MINT_HASH);
 
-    expect(await both).toEqual([
-      { status: "minted", hash: MINT_HASH },
-      { status: "minted", hash: MINT_HASH },
-    ]);
+    expect(await all).toEqual(new Array(3).fill({ status: "minted", hash: MINT_HASH }));
+    expect(lookups).toHaveBeenCalledTimes(1);
+    expect(publicClient.estimateContractGas).toHaveBeenCalledTimes(1);
     expect(walletClient.writeContract).toHaveBeenCalledTimes(1);
   });
 
   it("answers minted without a hash when Base has the message already, and spends nothing", async () => {
-    const { relayer, walletClient } = completing({ used: [1], env: { BASE_MINTS_PER_DAY: "1" } });
+    const { relayer, publicClient, walletClient } = completing({ used: [1], env: { BASE_MINTS_PER_DAY: "1" } });
     stubIris(() => attested());
 
     expect(await relayer.complete(request(), "caller")).toEqual({ status: "minted" });
     expect(await relayer.complete(request(), "caller")).toEqual({ status: "minted" });
+    expect(publicClient.estimateContractGas).not.toHaveBeenCalled();
     expect(walletClient.writeContract).not.toHaveBeenCalled();
   });
 
-  it("answers minted without a hash when its own call lost the race", async () => {
-    const { relayer, walletClient } = completing({
-      used: [0, 0, 1],
+  it("answers minted without a hash when someone else got there while it waited or sent", async () => {
+    const whileWaiting = completing({ used: [0, 1], env: { BASE_MINTS_PER_DAY: "1" } });
+    stubIris(() => attested());
+    expect(await whileWaiting.relayer.complete(request(), "caller")).toEqual({ status: "minted" });
+    expect(whileWaiting.walletClient.writeContract).not.toHaveBeenCalled();
+    // Nothing was submitted, so the day's one mint is still there.
+    expect(await whileWaiting.relayer.complete(request(), "caller")).toEqual({ status: "minted" });
+
+    const whileSending = completing({
+      used: [0, 0, 0, 1],
       write: async () => {
         throw new Error("execution reverted: Nonce already used");
       },
     });
-    stubIris(() => attested());
+    expect(await whileSending.relayer.complete(request(), "caller")).toEqual({ status: "minted" });
+    expect(whileSending.walletClient.writeContract).toHaveBeenCalledTimes(1);
+  });
 
-    expect(await relayer.complete(request(), "caller")).toEqual({ status: "minted" });
-    expect(walletClient.writeContract).toHaveBeenCalledTimes(1);
+  it("picks the exit by what the message says when the transaction carries others", async () => {
+    const { relayer, walletClient } = completing();
+    const elsewhere = exitWith("destinationDomain", "00000003");
+    const notOurs = exitWith("messageSender", "ab".repeat(32));
+    stubIris(() => attested(inbound.message, elsewhere, notOurs, MESSAGE));
+
+    expect(await relayer.complete(request(), "caller")).toEqual({ status: "minted", hash: MINT_HASH });
+    expect(walletClient.writeContract.mock.calls[0]![0].args).toEqual([MESSAGE, ATTESTATION]);
+  });
+});
+
+describe("an exit that cannot be minted", () => {
+  /** Asked twice: refused both times, the second time from memory, with nothing sent and nothing charged. */
+  async function terminal(base: ReturnType<typeof completing>, message: string, detail: RegExp, code = "simulation_failed") {
+    const lookups = stubIris(() => attested(message));
+    const asked = request();
+
+    const first = await refusal(base.relayer, asked);
+    expect(first).toMatchObject({ code, detail: expect.stringMatching(detail) });
+    const work = [lookups, base.publicClient.readContract, base.publicClient.estimateContractGas].map((mock) => mock.mock.calls.length);
+
+    expect(await refusal(base.relayer, asked, "someone else")).toBe(first);
+    expect([lookups, base.publicClient.readContract, base.publicClient.estimateContractGas].map((mock) => mock.mock.calls.length)).toEqual(work);
+    expect(base.walletClient.writeContract).not.toHaveBeenCalled();
+    return first;
+  }
+  /** The shared allowances are untouched: with one mint a day and one per caller, the same caller still gets a mint. */
+  const scarce = { BASE_MINTS_PER_DAY: "1", BASE_MINTS_PER_CALLER_PER_HOUR: "1" };
+  async function stillMints(base: ReturnType<typeof completing>) {
+    stubIris(() => attested());
+    expect(await base.relayer.complete(request(), "caller")).toEqual({ status: "minted", hash: MINT_HASH });
+  }
+
+  it("is refused for good when only another address may complete it", async () => {
+    const base = completing({ env: scarce });
+    const refused = await terminal(base, exitWith("destinationCaller", `${"00".repeat(12)}${"ab".repeat(20)}`), /not this server/);
+
+    expect(refused.status).toBe(422);
+    expect(base.publicClient.estimateContractGas).not.toHaveBeenCalled();
+    await stillMints(base);
+  });
+
+  it("is completed when the one address allowed is the server's own", async () => {
+    const { relayer } = completing();
+    stubIris(() => attested(exitWith("destinationCaller", `${"00".repeat(12)}${payer.address.slice(2).toLowerCase()}`)));
+
+    expect(await relayer.complete(request(), "caller")).toEqual({ status: "minted", hash: MINT_HASH });
+  });
+
+  it("is refused when its attestation has expired on Base, and minted while it has not", async () => {
+    const base = completing({ block: BLOCK, env: scarce });
+    const refused = await terminal(base, exitWith("expirationBlock", word(BLOCK)), new RegExp(`expired at block ${BLOCK}`));
+    expect(refused.status).toBe(422);
+    await stillMints(base);
+
+    const inTime = completing({ block: BLOCK });
+    stubIris(() => attested(exitWith("expirationBlock", word(BLOCK + 1))));
+    expect(await inTime.relayer.complete(request(), "caller")).toEqual({ status: "minted", hash: MINT_HASH });
+  });
+
+  it("is refused when its recipient, its token or its amount is not what a mint on Base needs", async () => {
+    await terminal(completing(), exitWith("mintRecipient", `${"11".repeat(12)}${"ab".repeat(20)}`), /recipient is not an address/);
+    await terminal(completing(), exitWith("mintRecipient", "00".repeat(32)), /recipient is not an address/);
+    await terminal(completing(), exitWith("burnToken", "cd".repeat(32)), /not the USDC that Circle mints/);
+    await terminal(completing(), exitWith("amount", word(9_999)), /too small/);
+  });
+
+  it("is refused when simulating the mint reverts: nothing is sent and nothing is charged", async () => {
+    const base = completing({ simulate: reverting("Invalid attestation signature"), env: scarce });
+    const refused = await terminal(base, MESSAGE, /would revert on Base Sepolia \(Invalid attestation signature\)/);
+
+    expect(refused.status).toBe(422);
+    expect(base.publicClient.estimateContractGas).toHaveBeenCalledTimes(1);
+
+    // The same server, once Base accepts the call: the day's one mint and the caller's one mint are both still there.
+    base.publicClient.estimateContractGas.mockResolvedValue(BigInt(150_000));
+    await stillMints(base);
+  });
+
+  it("is refused when its mint would need more gas than the server pays for", async () => {
+    await terminal(completing({ simulate: async () => BigInt(400_001) }), MESSAGE, /more gas than the server pays for/);
+  });
+
+  it("is refused when it is one of several exits in a transaction, or not a transfer the server completes", async () => {
+    const twin = exitWith("nonce", "9a".repeat(32));
+    const several = completing();
+    const lookups = stubIris(() => attested(MESSAGE, twin));
+    expect(await refusal(several.relayer)).toMatchObject({ code: "bad_request", detail: expect.stringContaining("several exits") });
+    expect(lookups).toHaveBeenCalledTimes(1);
+    expect(several.publicClient.readContract).not.toHaveBeenCalled();
+
+    await terminal(completing(), inbound.message, /from CCTP domain 1 to 27/, "bad_request");
+    await terminal(completing(), exitWith("destinationDomain", "00000003"), /from CCTP domain 27 to 3/, "bad_request");
+    await terminal(completing(), exitWith("sourceDomain", "00000000"), /from CCTP domain 0 to 6/, "bad_request");
+    await terminal(completing(), exitWith("messageSender", "ab".repeat(32)), /not sent through the hub/, "bad_request");
+    await terminal(completing(), MESSAGE.slice(0, 300), /does not carry a USDC transfer/, "bad_request");
+  });
+
+  it("compares fields whatever case Circle writes the hex in", async () => {
+    const { relayer, walletClient } = completing();
+    const shouting = `0x${MESSAGE.slice(2).toUpperCase()}`;
+    stubIris(() => attested(shouting));
+
+    expect(await relayer.complete(request(), "caller")).toEqual({ status: "minted", hash: MINT_HASH });
+    expect(walletClient.writeContract.mock.calls[0]![0].args[0]).toBe(shouting);
+  });
+});
+
+describe("what Circle's answer may be", () => {
+  it("is not read past its limit, nor acted on when it is not a short list of messages", async () => {
+    const base = completing();
+    const oversized = () => new Response(JSON.stringify({ messages: [], padding: "x".repeat(300_000) }));
+    const lookups = stubIris(oversized);
+    const asked = request();
+
+    expect(await refusal(base.relayer, asked)).toMatchObject({ code: "bad_request", detail: expect.stringContaining("the answer is too large") });
+    expect(await refusal(base.relayer, asked)).toMatchObject({ code: "bad_request" });
+    expect(lookups).toHaveBeenCalledTimes(1);
+
+    stubIris(() => attested(...new Array<string>(17).fill(MESSAGE)));
+    expect(await refusal(base.relayer)).toMatchObject({ code: "bad_request", detail: expect.stringContaining("too many messages") });
+
+    stubIris(() => attested(`${MESSAGE}${"00".repeat(8_192)}`));
+    expect(await refusal(base.relayer)).toMatchObject({ code: "bad_request", detail: expect.stringContaining("too large") });
+
+    stubIris(() => Response.json({ messages: [{ status: "complete", message: MESSAGE }] }));
+    expect(await refusal(base.relayer)).toMatchObject({ code: "bad_request", detail: expect.stringContaining("missing its bytes") });
+
+    expect(base.publicClient.readContract).not.toHaveBeenCalled();
+    expect(base.walletClient.writeContract).not.toHaveBeenCalled();
   });
 });
 
 describe("what the server will not complete", () => {
-  const refusal = async (relayer: Relayer, body: unknown = request()) =>
-    (await relayer.complete(body, "caller").catch((error: unknown) => error)) as ApiError;
-
-  it("refuses a transfer that does not go from Stellar to Base", async () => {
-    const { relayer, publicClient, walletClient } = completing();
-
-    // A real message the other way round: Ethereum to Stellar.
-    stubIris(() => attested(inbound.message));
-    expect(await refusal(relayer)).toMatchObject({ code: "bad_request", detail: expect.stringContaining("from CCTP domain 1 to 27") });
-
-    // From Stellar, but to Arbitrum.
-    stubIris(() => attested(`${MESSAGE.slice(0, 18)}00000003${MESSAGE.slice(26)}`));
-    expect(await refusal(relayer)).toMatchObject({ code: "bad_request", detail: expect.stringContaining("from CCTP domain 27 to 3") });
-
-    // To Base, but not from Stellar.
-    stubIris(() => attested(`${MESSAGE.slice(0, 10)}00000000${MESSAGE.slice(18)}`));
-    expect(await refusal(relayer)).toMatchObject({ code: "bad_request", detail: expect.stringContaining("from CCTP domain 0 to 6") });
-
-    expect(publicClient.readContract).not.toHaveBeenCalled();
-    expect(walletClient.writeContract).not.toHaveBeenCalled();
-  });
-
-  it("refuses a burn that was not made through the hub", async () => {
-    const { relayer, walletClient } = completing();
-    const sender = 2 + (148 + 100) * 2;
-    stubIris(() => attested(`${MESSAGE.slice(0, sender)}${"ab".repeat(32)}${MESSAGE.slice(sender + 64)}`));
-
-    expect(await refusal(relayer)).toMatchObject({ code: "bad_request", detail: expect.stringContaining("not sent through the hub") });
-    expect(walletClient.writeContract).not.toHaveBeenCalled();
-  });
-
-  it("refuses a message too large to be a transfer, and one that is not a transfer at all", async () => {
-    const { relayer } = completing();
-
-    stubIris(() => attested(`${MESSAGE}${"00".repeat(8_192)}`));
-    expect(await refusal(relayer)).toMatchObject({ code: "bad_request", detail: expect.stringContaining("too large") });
-
-    stubIris(() => attested(MESSAGE.slice(0, 300)));
-    expect(await refusal(relayer)).toMatchObject({ code: "bad_request" });
-  });
-
   it("refuses a hash with 0x, of the wrong length, or for another network", async () => {
     const { relayer } = completing();
     const lookups = stubIris(() => attested());
@@ -283,6 +442,7 @@ describe("what the server pays for", () => {
       detail: "The server is out of gas on Base Sepolia; submit the mint from your own wallet",
     });
     await expect(dry.relayer.complete(request(), "caller")).rejects.toMatchObject({ code: "unavailable" });
+    expect(dry.publicClient.estimateContractGas).not.toHaveBeenCalled();
     expect(dry.walletClient.writeContract).not.toHaveBeenCalled();
 
     const enough = completing({ wei: 10 ** 14 });
@@ -292,13 +452,32 @@ describe("what the server pays for", () => {
     await expect(lean.relayer.complete(request(), "caller")).resolves.toMatchObject({ status: "minted" });
   });
 
+  it("does not mint while gas on Base costs more than its cap, and does when it costs less again", async () => {
+    const base = completing({ feePerGas: 250_000_001 });
+    stubIris(() => attested());
+    const asked = request();
+
+    await expect(base.relayer.complete(asked, "caller")).rejects.toMatchObject({
+      code: "unavailable",
+      detail: expect.stringContaining("costs more right now"),
+    });
+    expect(base.walletClient.writeContract).not.toHaveBeenCalled();
+
+    base.publicClient.estimateFeesPerGas.mockResolvedValue({ maxFeePerGas: BigInt(1_000), maxPriorityFeePerGas: BigInt(5_000) });
+    await expect(base.relayer.complete(asked, "caller")).resolves.toEqual({ status: "minted", hash: MINT_HASH });
+    expect(base.walletClient.writeContract.mock.calls[0]![0]).toMatchObject({ maxFeePerGas: BigInt(1_000), maxPriorityFeePerGas: BigInt(1_000) });
+
+    const dearer = completing({ feePerGas: 5, env: { BASE_MINT_MAX_FEE_PER_GAS: "4" } });
+    await expect(dearer.relayer.complete(request(), "caller")).rejects.toMatchObject({ code: "unavailable" });
+  });
+
   it("pays for a set number of mints per caller in an hour", async () => {
     const { relayer, walletClient } = completing({ env: { BASE_MINTS_PER_CALLER_PER_HOUR: "2" } });
     stubIris(() => attested());
 
     await relayer.complete(request(), "203.0.113.1");
     await relayer.complete(request(), "203.0.113.1");
-    const refused = (await relayer.complete(request(), "203.0.113.1").catch((error: unknown) => error)) as ApiError;
+    const refused = await refusal(relayer, request(), "203.0.113.1");
 
     expect(refused).toMatchObject({ code: "rate_limited", status: 429 });
     expect(refused.extra.retryAfterSeconds).toBeGreaterThan(0);
@@ -306,21 +485,33 @@ describe("what the server pays for", () => {
     expect(walletClient.writeContract).toHaveBeenCalledTimes(3);
   });
 
-  it("pays for a set number of mints a day, whoever asks", async () => {
+  it("pays for a set number of mints a day, whoever asks, counted when a mint is submitted", async () => {
     const { relayer, walletClient } = completing({ env: { BASE_MINTS_PER_DAY: "2" } });
     stubIris(() => attested());
 
     await relayer.complete(request(), "203.0.113.1");
     await relayer.complete(request(), "203.0.113.2");
 
-    await expect(relayer.complete(request(), "203.0.113.3")).rejects.toMatchObject({
+    const asked = request();
+    await expect(relayer.complete(asked, "203.0.113.3")).rejects.toMatchObject({
       code: "unavailable",
       detail: expect.stringContaining("in a day"),
     });
     expect(walletClient.writeContract).toHaveBeenCalledTimes(2);
   });
 
-  it("counts an attempt that failed, and keeps the provider's words out of the answer", async () => {
+  it("examines a bounded number of attested exits per caller", async () => {
+    const { relayer, publicClient } = completing({ used: [1] });
+    stubIris(() => attested());
+
+    for (let i = 0; i < 30; i += 1) await relayer.complete(request(), "203.0.113.1");
+    await expect(relayer.complete(request(), "203.0.113.1")).rejects.toMatchObject({ code: "rate_limited", status: 429 });
+
+    expect(publicClient.readContract).toHaveBeenCalledTimes(30);
+    await expect(relayer.complete(request(), "203.0.113.2")).resolves.toEqual({ status: "minted" });
+  });
+
+  it("never sends a mint that failed a second time, and keeps the provider's words out of the answer", async () => {
     const { relayer, walletClient } = completing({
       env: { BASE_MINTS_PER_CALLER_PER_HOUR: "1" },
       write: async () => {
@@ -329,26 +520,47 @@ describe("what the server pays for", () => {
         });
       },
     });
-    stubIris(() => attested());
+    const lookups = stubIris(() => attested());
     const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const asked = request();
 
-    const failed = (await relayer.complete(request(), "caller").catch((error: unknown) => error)) as ApiError;
-
-    expect(failed).toMatchObject({ code: "unavailable", detail: "The server could not submit the mint on Base Sepolia; try again later" });
+    const failed = await refusal(relayer, asked);
+    expect(failed).toMatchObject({ code: "simulation_failed", status: 422, detail: expect.stringContaining("will not send it again") });
     expect(JSON.stringify([failed.detail, failed.extra, logged.mock.calls])).not.toContain("secret-api-key");
-    await expect(relayer.complete(request(), "caller")).rejects.toMatchObject({ code: "rate_limited" });
+
+    // Asked again, by anyone: the same answer, nothing looked up, nothing sent.
+    expect(await refusal(relayer, asked, "someone else")).toBe(failed);
+    expect(lookups).toHaveBeenCalledTimes(1);
+    expect(walletClient.writeContract).toHaveBeenCalledTimes(1);
+
+    // The attempt was submitted, so it stays counted against the caller.
+    expect(await refusal(relayer)).toMatchObject({ code: "rate_limited" });
+  });
+
+  it("does not send again a mint that Base included and reverted", async () => {
+    const { relayer, walletClient } = completing({ receipt: "reverted" });
+    stubIris(() => attested());
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const asked = request();
+
+    expect(await refusal(relayer, asked)).toMatchObject({ code: "simulation_failed", detail: expect.stringContaining("did not go through") });
+    expect(await refusal(relayer, asked)).toMatchObject({ code: "simulation_failed" });
     expect(walletClient.writeContract).toHaveBeenCalledTimes(1);
   });
 
-  it("says only that Base could not be reached when it cannot be", async () => {
-    const { relayer, publicClient } = completing();
-    publicClient.getBalance.mockRejectedValue(new Error("fetch failed: https://base.example/v2/secret-api-key"));
+  it("says only that Base could not be reached when it cannot be, and decides nothing on that", async () => {
+    const base = completing();
     stubIris(() => attested());
+    const asked = request();
+    const unreachable = { code: "unavailable", detail: "The server could not reach Base Sepolia; try again later" };
 
-    await expect(relayer.complete(request(), "caller")).rejects.toMatchObject({
-      code: "unavailable",
-      detail: "The server could not reach Base Sepolia; try again later",
-    });
+    base.publicClient.getBalance.mockRejectedValueOnce(new Error("fetch failed: https://base.example/v2/secret-api-key"));
+    await expect(base.relayer.complete(asked, "caller")).rejects.toMatchObject(unreachable);
+
+    base.publicClient.estimateContractGas.mockRejectedValueOnce(new Error("socket hang up: https://base.example/v2/secret-api-key"));
+    await expect(base.relayer.complete(asked, "caller")).rejects.toMatchObject(unreachable);
+
+    await expect(base.relayer.complete(asked, "caller")).resolves.toEqual({ status: "minted", hash: MINT_HASH });
   });
 
   it("sends mints and the faucet's burns one at a time, from the one account they share", async () => {
@@ -389,15 +601,29 @@ describe("what the server pays for", () => {
     }
   });
 
-  it("gives up on a mint that hangs instead of holding the account's queue", async () => {
-    vi.useFakeTimers();
-    const { relayer } = completing({ write: () => new Promise<string>(() => undefined) });
+  it("keeps looking at exits out of the queue the account's transactions wait in", async () => {
+    const { relayer, publicClient } = completing({ simulate: reverting("Invalid attestation signature") });
+    const queue = vi.spyOn(relayer as unknown as { evmQueue: (task: unknown) => Promise<unknown> }, "evmQueue");
     stubIris(() => attested());
 
-    const stuck = relayer.complete(request(), "caller").catch((error: unknown) => error);
+    for (let i = 0; i < 10; i += 1) await refusal(relayer);
+
+    expect(publicClient.estimateContractGas).toHaveBeenCalledTimes(10);
+    expect(queue).not.toHaveBeenCalled();
+  });
+
+  it("gives up on a mint that hangs instead of holding the queue, and does not send it again by itself", async () => {
+    vi.useFakeTimers();
+    const { relayer, walletClient } = completing({ write: () => new Promise<string>(() => undefined) });
+    stubIris(() => attested());
+    const asked = request();
+
+    const stuck = refusal(relayer, asked);
     await vi.advanceTimersByTimeAsync(55_000);
 
-    expect(await stuck).toMatchObject({ code: "unavailable", detail: expect.stringContaining("too long") });
+    expect(await stuck).toMatchObject({ code: "unavailable", detail: expect.stringContaining("has not confirmed it yet") });
+    expect(await refusal(relayer, asked)).toMatchObject({ code: "unavailable" });
+    expect(walletClient.writeContract).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -426,13 +652,13 @@ describe("the route", () => {
 describe.skipIf(!live)("on testnet", () => {
   it("answers minted, without a hash and without spending gas, for an exit Base has already received", async () => {
     const relayer = new Relayer(loadConfig());
-    const payer = relayer.config.payer!.address;
+    const address = relayer.config.payer!.address;
     const clients = (relayer as unknown as { evmClients: () => { publicClient: { getBalance(args: { address: string }): Promise<bigint> } } }).evmClients();
-    const before = await clients.publicClient.getBalance({ address: payer });
+    const before = await clients.publicClient.getBalance({ address });
 
     const result = await relayer.complete({ network: "testnet", txHash: exit.stellarTransaction }, "caller");
 
     expect(result).toEqual({ status: "minted" });
-    expect(await clients.publicClient.getBalance({ address: payer })).toBe(before);
+    expect(await clients.publicClient.getBalance({ address })).toBe(before);
   });
 });

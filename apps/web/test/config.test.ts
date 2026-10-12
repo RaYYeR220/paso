@@ -23,6 +23,7 @@ describe("loadConfig", () => {
       perCallerPerHour: 10,
       perDay: 100,
       payerEthFloor: BigInt(100_000_000_000_000),
+      maxFeePerGas: BigInt(250_000_000),
     });
   });
 
@@ -88,7 +89,8 @@ describe("loadConfig", () => {
     expect(loadConfig({ ...mainnet, PAY_BASE_MINTS_ON_MAINNET: "true" }).baseMints.enabled).toBe(true);
     expect(
       loadConfig({ ...base, BASE_MINTS_PER_CALLER_PER_HOUR: "3", BASE_MINTS_PER_DAY: "9", BASE_MINT_PAYER_ETH_FLOOR: "5" }).baseMints,
-    ).toEqual({ enabled: true, perCallerPerHour: 3, perDay: 9, payerEthFloor: BigInt(5) });
+    ).toEqual({ enabled: true, perCallerPerHour: 3, perDay: 9, payerEthFloor: BigInt(5), maxFeePerGas: BigInt(250_000_000) });
+    expect(loadConfig({ ...base, BASE_MINT_MAX_FEE_PER_GAS: "77" }).baseMints.maxFeePerGas).toBe(BigInt(77));
     expect(() => loadConfig({ ...base, BASE_MINT_PAYER_ETH_FLOOR: "0.1" })).toThrow(/whole number of wei/);
   });
 

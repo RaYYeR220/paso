@@ -166,8 +166,8 @@ export interface FundFromEvmResult {
   maxFee: bigint;
 }
 
-async function confirmed(publicClient: EvmReader, hash: Hex, what: string): Promise<void> {
-  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+async function confirmed(publicClient: EvmReader, hash: Hex, what: string, confirmations?: number): Promise<void> {
+  const receipt = await publicClient.waitForTransactionReceipt(confirmations ? { hash, confirmations } : { hash });
   if (receipt.status !== "success") {
     throw new Error(`The ${what} reverted on Base: ${hash}`);
   }
@@ -272,6 +272,16 @@ export interface ReceiveOnEvmArgs {
   message: Hex;
   attestation: Hex;
   network: Network;
+  /**
+   * Gas limit for the call. When given, the wallet does not estimate it, so
+   * nothing stops a call that would revert: simulate first.
+   */
+  gas?: bigint;
+  /** Fee caps for the call, in wei per gas. Left to the wallet when not given. */
+  maxFeePerGas?: bigint;
+  maxPriorityFeePerGas?: bigint;
+  /** How many blocks deep the mint has to be before this resolves. Defaults to one. */
+  confirmations?: number;
 }
 
 export interface ReceiveOnEvmResult {
@@ -287,10 +297,11 @@ export interface ReceiveOnEvmResult {
  *
  * A message is received once. If someone else got there first, before the
  * call or while it was on its way, this resolves with `alreadyReceived`
- * instead of failing: the USDC is where it belongs either way.
+ * instead of failing: the USDC is where it belongs either way. A call that
+ * fails for any other reason is reported and never sent a second time.
  */
 export async function receiveMessageOnEvm(args: ReceiveOnEvmArgs): Promise<ReceiveOnEvmResult> {
-  const { walletClient, publicClient, message, attestation } = args;
+  const { walletClient, publicClient, message, attestation, gas, maxFeePerGas, maxPriorityFeePerGas } = args;
   const config = resolveNetwork(args.network);
   const account = walletClient.account;
   if (!account) {
@@ -308,8 +319,11 @@ export async function receiveMessageOnEvm(args: ReceiveOnEvmArgs): Promise<Recei
       args: [message, attestation],
       chain: config.evm.chain,
       account,
+      ...(gas === undefined ? {} : { gas }),
+      ...(maxFeePerGas === undefined ? {} : { maxFeePerGas }),
+      ...(maxPriorityFeePerGas === undefined ? {} : { maxPriorityFeePerGas }),
     });
-    await confirmed(publicClient, hash, "mint");
+    await confirmed(publicClient, hash, "mint", args.confirmations);
     return { hash, alreadyReceived: false };
   } catch (error) {
     // A call that lost the race reverts with "Nonce already used". The chain is asked rather than the error read.

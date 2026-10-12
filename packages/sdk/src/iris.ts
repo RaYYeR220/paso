@@ -91,6 +91,42 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+/** Raised when an answer is larger than the reader is willing to hold. */
+class TooLargeError extends Error {}
+
+/**
+ * The body of a response as text, read no further than `maxBytes`. An answer
+ * that declares or sends more is abandoned, not buffered.
+ */
+async function boundedText(response: Response, maxBytes: number): Promise<string> {
+  const declared = response.headers.get("content-length");
+  if (declared !== null && Number(declared) > maxBytes) throw new TooLargeError();
+
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    received += value.byteLength;
+    if (received > maxBytes) {
+      await reader.cancel().catch(() => undefined);
+      throw new TooLargeError();
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+const MAX_RESPONSE_BYTES = 1_048_576;
+
 async function pollIris(
   url: string,
   signal?: AbortSignal,
@@ -100,13 +136,13 @@ async function pollIris(
     const response = await fetch(url, { signal });
     if (response.status === 404) return { status: { state: "not_found" } };
     if (!response.ok) return { status: { state: "unreachable", detail: `Iris answered ${response.status}` } };
-    body = await response.json();
+    body = JSON.parse(await boundedText(response, MAX_RESPONSE_BYTES));
   } catch (error) {
     if (signal?.aborted) throw error;
     return { status: { state: "unreachable", detail: error instanceof Error ? error.message : String(error) } };
   }
 
-  const first = body.messages?.[0];
+  const first = Array.isArray(body?.messages) ? body.messages[0] : undefined;
   if (!first) return { status: { state: "not_found" } };
 
   const { message, attestation, status, delayReason } = first;
@@ -130,6 +166,96 @@ export function fetchAttestation(
   options: { signal?: AbortSignal } = {},
 ): Promise<{ status: AttestationStatus; attestation?: Attestation }> {
   return pollIris(messagesUrl(sourceDomain, txHash, network), options.signal);
+}
+
+export interface AttestationLimits {
+  /** The largest answer read from Iris, in bytes. */
+  maxResponseBytes?: number;
+  /** The most messages one transaction may carry. */
+  maxMessages?: number;
+  maxMessageBytes?: number;
+  maxAttestationBytes?: number;
+}
+
+/** What Iris holds for one transaction: every message it carries, once all of them are attested. */
+export type AttestationLookup =
+  | { state: "not_found" }
+  | { state: "pending"; delayReason?: string }
+  | { state: "unreachable"; detail: string }
+  /** Iris answered, but not with a list of messages of the expected shape and size. */
+  | { state: "malformed"; detail: string }
+  | { state: "complete"; attestations: Attestation[] };
+
+const HEX_BYTES = /^0x(?:[0-9a-fA-F]{2})*$/;
+
+/**
+ * Asks Iris once for every message the transaction `txHash` carries, and
+ * takes nothing on trust about the answer: its size is bounded, it must be a
+ * list of messages, short enough, and each attested message must be hex of a
+ * plausible length. A transaction can carry several messages; a caller that
+ * acts on one has to pick it by what it says, never by its position.
+ *
+ * `complete` means every message is attested.
+ */
+export async function fetchAttestations(
+  sourceDomain: number,
+  txHash: string,
+  network: Network,
+  options: { signal?: AbortSignal } & AttestationLimits = {},
+): Promise<AttestationLookup> {
+  const {
+    signal,
+    maxResponseBytes = 262_144,
+    maxMessages = 16,
+    maxMessageBytes = 8_192,
+    maxAttestationBytes = 2_048,
+  } = options;
+
+  let body: unknown;
+  try {
+    const response = await fetch(messagesUrl(sourceDomain, txHash, network), { signal });
+    if (response.status === 404) return { state: "not_found" };
+    if (!response.ok) return { state: "unreachable", detail: `Iris answered ${response.status}` };
+    body = JSON.parse(await boundedText(response, maxResponseBytes));
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    if (error instanceof TooLargeError) return { state: "malformed", detail: "the answer is too large" };
+    if (error instanceof SyntaxError) return { state: "malformed", detail: "the answer is not JSON" };
+    return { state: "unreachable", detail: error instanceof Error ? error.message : String(error) };
+  }
+
+  const messages = typeof body === "object" && body !== null ? (body as { messages?: unknown }).messages : undefined;
+  if (!Array.isArray(messages)) return { state: "malformed", detail: "the answer is not a list of messages" };
+  if (messages.length === 0) return { state: "not_found" };
+  if (messages.length > maxMessages) return { state: "malformed", detail: "the transaction carries too many messages" };
+
+  const attestations: Attestation[] = [];
+  let pending: { state: "pending"; delayReason?: string } | undefined;
+  for (const entry of messages as IrisMessage[]) {
+    if (typeof entry !== "object" || entry === null || typeof entry.status !== "string") {
+      return { state: "malformed", detail: "a message has no status" };
+    }
+    if (entry.status !== "complete") {
+      pending ??= typeof entry.delayReason === "string" ? { state: "pending", delayReason: entry.delayReason } : { state: "pending" };
+      continue;
+    }
+    const { message, attestation } = entry;
+    if (typeof message !== "string" || typeof attestation !== "string") {
+      return { state: "malformed", detail: "an attested message is missing its bytes" };
+    }
+    // Lengths are looked at as text first, so nothing oversized is ever decoded.
+    if (message.length > 2 + 2 * maxMessageBytes) return { state: "malformed", detail: "a message is too large" };
+    if (attestation.length > 2 + 2 * maxAttestationBytes) return { state: "malformed", detail: "an attestation is too large" };
+    if (!HEX_BYTES.test(message) || !HEX_BYTES.test(attestation) || message.length < 2 + 2 * NONCE_END) {
+      return { state: "malformed", detail: "an attested message is not hex of a message's length" };
+    }
+    attestations.push({
+      message: message as Hex,
+      attestation: attestation as Hex,
+      nonce: slice(message as Hex, NONCE_START, NONCE_END),
+    });
+  }
+  return pending ?? { state: "complete", attestations };
 }
 
 function messagesUrl(sourceDomain: number, txHash: string, network: Network): string {
@@ -169,17 +295,22 @@ const NONCE_END = 44;
 const DESTINATION_CALLER_START = 108;
 const BODY_START = 148;
 const MINT_RECIPIENT_START = BODY_START + 36;
+const BURN_TOKEN_START = BODY_START + 4;
 const AMOUNT_START = BODY_START + 68;
 const MESSAGE_SENDER_START = BODY_START + 100;
 const MAX_FEE_START = BODY_START + 132;
 const FEE_EXECUTED_START = BODY_START + 164;
+const EXPIRATION_BLOCK_START = BODY_START + 196;
 const HOOK_DATA_START = BODY_START + 228;
 
 export interface BurnMessage {
   sourceDomain: number;
   destinationDomain: number;
   nonce: Hex;
+  /** Who alone may deliver the message on the destination chain; all zeros when anyone may. */
   destinationCaller: Hex;
+  /** The token burned, as the source chain names it. */
+  burnToken: Hex;
   mintRecipient: Hex;
   /** Amount burned, in 6-decimal units whatever the chains involved. */
   amount: bigint;
@@ -188,6 +319,8 @@ export interface BurnMessage {
   maxFee: bigint;
   /** Fee Circle kept, in 6-decimal units; the recipient is minted `amount - feeExecuted`. */
   feeExecuted: bigint;
+  /** Block of the destination chain from which the message is no longer accepted; zero when it never expires. */
+  expirationBlock: bigint;
   hookData: Hex;
 }
 
@@ -202,11 +335,13 @@ export function decodeBurnMessage(message: Hex): BurnMessage {
     destinationDomain: hexToNumber(slice(message, DESTINATION_DOMAIN_START, DESTINATION_DOMAIN_START + 4)),
     nonce: slice(message, NONCE_START, NONCE_END),
     destinationCaller: word(DESTINATION_CALLER_START),
+    burnToken: word(BURN_TOKEN_START),
     mintRecipient: word(MINT_RECIPIENT_START),
     amount: hexToBigInt(word(AMOUNT_START)),
     messageSender: word(MESSAGE_SENDER_START),
     maxFee: hexToBigInt(word(MAX_FEE_START)),
     feeExecuted: hexToBigInt(word(FEE_EXECUTED_START)),
+    expirationBlock: hexToBigInt(word(EXPIRATION_BLOCK_START)),
     hookData: size(message) > HOOK_DATA_START ? slice(message, HOOK_DATA_START) : "0x",
   };
 }

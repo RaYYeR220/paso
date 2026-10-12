@@ -5,11 +5,13 @@ import {
   deployOperation,
   erc20Abi,
   fetchAttestation,
+  fetchAttestations,
   formatAmount,
   formatEvmAmount,
   fundFromEvm,
   inboundRouteOf,
   isReceivedOnEvm,
+  messageTransmitterAbi,
   isDeployed,
   isExpired,
   readContract,
@@ -18,12 +20,16 @@ import {
   simulateSigned,
   SimulationError,
   twinAddress,
+  type Attestation,
+  type BurnMessage,
   type InboundRoute,
   type RelayResult,
   type Signed,
 } from "@paso/sdk";
 import { Account, Operation, rpc, StrKey, TransactionBuilder, xdr } from "@stellar/stellar-sdk";
 import {
+  BaseError,
+  ContractFunctionRevertedError,
   createPublicClient,
   createWalletClient,
   formatEther,
@@ -31,6 +37,7 @@ import {
   hexToBytes,
   http,
   isAddress,
+  pad,
   size,
   toHex,
   type Address,
@@ -81,6 +88,23 @@ const MAX_MESSAGE_BYTES = 8_192;
 const MAX_ATTESTATION_BYTES = 2_048;
 const MAX_DIAGNOSTIC_CHARS = 4_000;
 const REMEMBERED_DELIVERIES = 1_000;
+
+/**
+ * Bounds on a mint the server pays for on Base. It is sent only after the
+ * exact call has been simulated, with this much gas at most, and waited for
+ * this many blocks deep before it is called done.
+ */
+const MINT_GAS_LIMIT = BigInt(400_000);
+const MINT_CONFIRMATIONS = 2;
+/** The smallest exit worth the server's gas, in 6-decimal units (0.01 USDC). */
+const MIN_MINT_AMOUNT = BigInt(10_000);
+/** How many attested exits one caller may have examined in an hour: each costs several requests to Base. */
+const EXIT_CHECKS_PER_CALLER_PER_HOUR = 30;
+const REMEMBERED_EXITS = 1_000;
+/** How long an answer that may yet change is remembered: a re-attested exit, a reverting simulation, a mint on its way. */
+const SHORT_MEMORY_MS = 5 * 60 * 1000;
+const UNCONFIRMED_MEMORY_MS = 2 * 60 * 1000;
+const ZERO_BYTES32 = `0x${"00".repeat(32)}`;
 
 /** The one key of a limit that applies to all callers together. */
 const EVERYONE = "everyone";
@@ -217,7 +241,9 @@ export class Relayer {
   private readonly deliveries = new Map<string, Promise<DeliverResult>>();
   private readonly delivered = new Map<string, DeliverResult>();
   private readonly completions = new Map<string, Promise<CompleteResult>>();
-  private readonly completed = new Map<string, CompleteResult>();
+  /** What is known about an exit, by its transaction: its answer, or why the server cannot complete it. */
+  private readonly exits = new Map<string, { until: number; result?: CompleteResult; refusal?: ApiError }>();
+  private readonly exitChecksPerCaller = createLimiter({ limit: EXIT_CHECKS_PER_CALLER_PER_HOUR, windowMs: HOUR_MS });
   private readonly mintsPerCaller: Limiter;
   private readonly mintsOverall: Limiter;
   /** Fees of the relayer account over the last day, counted when a transaction is signed. */
@@ -322,10 +348,14 @@ export class Relayer {
    *
    * The server pays the gas and decides nothing else. The call is built from
    * what Circle returned for the transaction, never from bytes a caller
-   * sent, and only for an exit made through the hub, from Stellar to Base. A
-   * message that has been received already counts as minted. How many mints
-   * the server pays for is limited per caller and per day; an attempt counts
-   * once it starts, whatever becomes of it.
+   * sent, and only for an exit made through the hub, from Stellar to Base.
+   * Nothing is sent that has not just been simulated successfully, and a
+   * mint that fails is never sent a second time.
+   *
+   * An exit has one of three answers. `pending`: ask again. `minted`. Or a
+   * refusal that says why this server cannot complete it; that answer is
+   * final, or at least lasting, and like `minted` it is remembered, so asking
+   * again costs neither the networks nor anyone's allowance.
    */
   async complete(body: unknown, caller: string): Promise<CompleteResult> {
     const txHash = this.readExit(body);
@@ -340,8 +370,12 @@ export class Relayer {
       throw new ApiError("unavailable", "The server has no account on Base to submit the mint from");
     }
 
-    const known = this.completed.get(txHash);
-    if (known) return known;
+    const known = this.exits.get(txHash);
+    if (known && known.until > Date.now()) {
+      if (known.refusal) throw known.refusal;
+      if (known.result) return known.result;
+    }
+    // One look per exit at a time: requests that arrive together share it, and its answer.
     const running = this.completions.get(txHash);
     if (running) return running;
     if (this.completions.size >= MAX_IN_FLIGHT) {
@@ -351,13 +385,7 @@ export class Relayer {
     const completion = this.completeOnce(txHash, caller).finally(() => this.completions.delete(txHash));
     this.completions.set(txHash, completion);
     const result = await completion;
-    if (result.status === "minted") {
-      if (this.completed.size >= REMEMBERED_DELIVERIES) {
-        const oldest = this.completed.keys().next();
-        if (!oldest.done) this.completed.delete(oldest.value);
-      }
-      this.completed.set(txHash, result);
-    }
+    if (result.status === "minted") this.rememberExit(txHash, { result });
     return result;
   }
 
@@ -673,55 +701,238 @@ export class Relayer {
     }
   }
 
+  private rememberExit(txHash: string, answer: { result?: CompleteResult; refusal?: ApiError }, forMs = Infinity): void {
+    this.exits.delete(txHash);
+    if (this.exits.size >= REMEMBERED_EXITS) {
+      const oldest = this.exits.keys().next();
+      if (!oldest.done) this.exits.delete(oldest.value);
+    }
+    this.exits.set(txHash, { ...answer, until: Date.now() + forMs });
+  }
+
+  /** A refusal that will hold for this exit however often it is asked about, remembered so that it is not worked out again. */
+  private refuseExit(txHash: string, code: "bad_request" | "simulation_failed" | "unavailable", detail: string, forMs = Infinity) {
+    const refusal = new ApiError(code, detail);
+    this.rememberExit(txHash, { refusal }, forMs);
+    return refusal;
+  }
+
+  /**
+   * The one exit through the hub that a transaction carries. A transaction
+   * can carry several messages, so the one to act on is chosen by what it
+   * says: burned on Stellar, for Base, at the request of the hub.
+   */
+  private hubExit(txHash: string, attestations: Attestation[]): { burn: BurnMessage; attestation: Attestation } {
+    const { stellar, evm } = this.config.network;
+    const hub = stellar.hub ? toHex(StrKey.decodeContract(stellar.hub)) : null;
+    const transfers = attestations.flatMap((attestation) => {
+      try {
+        // Read in one letter case, so comparing fields never depends on how the hex was written.
+        return [{ burn: decodeBurnMessage(attestation.message.toLowerCase() as Hex), attestation }];
+      } catch {
+        return [];
+      }
+    });
+    const onRoute = transfers.filter(
+      ({ burn }) => burn.sourceDomain === stellar.cctpDomain && burn.destinationDomain === evm.cctpDomain,
+    );
+    const exits = onRoute.filter(({ burn }) => burn.messageSender === hub);
+
+    const [exit] = exits;
+    if (exit && exits.length === 1) return exit;
+    const [only] = transfers;
+    if (exits.length > 1) {
+      throw this.refuseExit(txHash, "bad_request", "That transaction carries several exits; submit their mints from your own wallet");
+    }
+    if (transfers.length === 0) {
+      throw this.refuseExit(txHash, "bad_request", "That transaction does not carry a USDC transfer");
+    }
+    if (onRoute.length === 0) {
+      throw this.refuseExit(
+        txHash,
+        "bad_request",
+        only && transfers.length === 1
+          ? `That transfer goes from CCTP domain ${only.burn.sourceDomain} to ${only.burn.destinationDomain}, not from Stellar to ${evm.chain.name}`
+          : `That transaction carries no transfer from Stellar to ${evm.chain.name}`,
+      );
+    }
+    throw this.refuseExit(
+      txHash,
+      "bad_request",
+      "That transfer was not sent through the hub; the server completes exits from Paso accounts only",
+    );
+  }
+
+  /**
+   * Why Base would not accept this exit from the server, read off the message
+   * alone, or `null` when nothing in it stands in the way. None of this can
+   * change for the exit, so a reason found here is final.
+   */
+  private unmintable(burn: BurnMessage, payer: Address): string | null {
+    const { stellar } = this.config.network;
+    if (burn.destinationCaller !== ZERO_BYTES32 && burn.destinationCaller !== pad(payer).toLowerCase()) {
+      return "it names the one address allowed to complete it, and that is not this server";
+    }
+    if (!/^0x0{24}[0-9a-f]{40}$/.test(burn.mintRecipient) || burn.mintRecipient === ZERO_BYTES32) {
+      return "its recipient is not an address on Base";
+    }
+    if (burn.burnToken !== toHex(StrKey.decodeContract(stellar.usdc))) {
+      return "what it burned is not the USDC that Circle mints on Base";
+    }
+    if (burn.amount < MIN_MINT_AMOUNT) {
+      return "it is too small for the server to pay its gas";
+    }
+    return null;
+  }
+
   private async completeOnce(txHash: string, caller: string): Promise<CompleteResult> {
     const { network, baseMints } = this.config;
     const { stellar, evm } = network;
-    const { status, attestation } = await this.lookUp(stellar.cctpDomain, txHash);
-    if (!attestation) {
-      return { status: "pending", attestation: status.state === "not_found" ? "not_found" : "pending" };
-    }
 
-    const { message } = attestation;
-    if (size(message) > MAX_MESSAGE_BYTES || size(attestation.attestation) > MAX_ATTESTATION_BYTES) {
-      throw new ApiError("bad_request", "That transaction carries a message too large to be a USDC transfer");
-    }
-    let burn: ReturnType<typeof decodeBurnMessage>;
-    try {
-      burn = decodeBurnMessage(message);
-    } catch {
-      throw new ApiError("bad_request", "That transaction does not carry a USDC transfer");
-    }
-    if (burn.sourceDomain !== stellar.cctpDomain || burn.destinationDomain !== evm.cctpDomain) {
-      throw new ApiError(
+    const lookup = await this.lookUpExit(stellar.cctpDomain, txHash);
+    if (lookup.state === "not_found") return { status: "pending", attestation: "not_found" };
+    if (lookup.state === "pending" || lookup.state === "unreachable") return { status: "pending", attestation: "pending" };
+    if (lookup.state === "malformed") {
+      // Not what an exit looks like. Remembered for a while only, in case the fault was Circle's.
+      throw this.refuseExit(
+        txHash,
         "bad_request",
-        `That transfer goes from CCTP domain ${burn.sourceDomain} to ${burn.destinationDomain}, not from Stellar to ${evm.chain.name}`,
+        `That transaction does not carry a USDC transfer the server can complete: ${lookup.detail}`,
+        SHORT_MEMORY_MS,
       );
     }
-    if (!stellar.hub || burn.messageSender !== toHex(StrKey.decodeContract(stellar.hub))) {
-      throw new ApiError("bad_request", "That transfer was not sent through the hub; the server completes exits from Paso accounts only");
+
+    // From here on an exit costs work, and requests to Base: a caller gets a bounded number of looks.
+    const look = this.exitChecksPerCaller.take(caller);
+    if (!look.ok) {
+      throw new ApiError("rate_limited", "This address has asked about too many exits; try again later", {
+        retryAfterSeconds: look.retryAfterSeconds,
+      });
     }
 
+    const { burn, attestation } = this.hubExit(txHash, lookup.attestations);
+    const { message } = attestation;
     const { publicClient, walletClient } = this.evmClients();
     if (!walletClient) {
       throw new ApiError("unavailable", "The server has no account on Base to submit the mint from");
     }
     const payer = walletClient.account.address;
-    let received: boolean;
-    let gas: bigint;
+    const unreachable = () => new ApiError("unavailable", `The server could not reach ${evm.chain.name}; try again later`);
+
+    // Whether it has been received comes first: if it has, there is nothing left to decide.
+    let block: bigint;
+    let held: bigint;
     try {
-      [received, gas] = await Promise.all([
-        isReceivedOnEvm(publicClient, message, network),
-        publicClient.getBalance({ address: payer }),
-      ]);
+      if (await isReceivedOnEvm(publicClient, message, network)) return { status: "minted" };
+      [block, held] = await Promise.all([publicClient.getBlockNumber(), publicClient.getBalance({ address: payer })]);
     } catch {
-      throw new ApiError("unavailable", `The server could not reach ${evm.chain.name}; try again later`);
+      throw unreachable();
     }
-    if (received) return { status: "minted" };
-    if (gas < baseMints.payerEthFloor) {
+
+    const reason = this.unmintable(burn, payer);
+    if (reason) {
+      throw this.refuseExit(txHash, "simulation_failed", `The server cannot complete this exit: ${reason}`);
+    }
+    if (burn.expirationBlock !== BigInt(0) && burn.expirationBlock <= block) {
+      // Circle can attest an expired exit anew, which makes it a different message: not remembered for long.
+      throw this.refuseExit(
+        txHash,
+        "simulation_failed",
+        `The server cannot complete this exit: its attestation expired at block ${burn.expirationBlock} of ${evm.chain.name}`,
+        SHORT_MEMORY_MS,
+      );
+    }
+    if (held < baseMints.payerEthFloor) {
       throw new ApiError("unavailable", `The server is out of gas on ${evm.chain.name}; submit the mint from your own wallet`);
     }
 
-    // Nothing has been counted so far; from here on the attempt counts, whatever becomes of it.
+    // The exact call, simulated. What does not succeed here is not sent.
+    const call = {
+      address: evm.messageTransmitter,
+      abi: messageTransmitterAbi,
+      functionName: "receiveMessage",
+      args: [message, attestation.attestation],
+    } as const;
+    let gas: bigint;
+    let fees: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint };
+    try {
+      gas = await publicClient.estimateContractGas({ ...call, account: payer });
+      fees = await publicClient.estimateFeesPerGas();
+    } catch (error) {
+      const reverted = revertReason(error);
+      if (reverted === undefined) throw unreachable();
+      throw this.refuseExit(
+        txHash,
+        "simulation_failed",
+        `The server cannot complete this exit: the mint would revert on ${evm.chain.name}${reverted ? ` (${reverted})` : ""}`,
+        SHORT_MEMORY_MS,
+      );
+    }
+    if (gas > MINT_GAS_LIMIT) {
+      throw this.refuseExit(txHash, "simulation_failed", "The server cannot complete this exit: its mint needs more gas than the server pays for");
+    }
+    if (fees.maxFeePerGas > baseMints.maxFeePerGas) {
+      throw new ApiError("unavailable", `Gas on ${evm.chain.name} costs more right now than the server pays; try again later`);
+    }
+    const padded = (gas * BigInt(12)) / BigInt(10);
+    const gasLimit = padded > MINT_GAS_LIMIT ? MINT_GAS_LIMIT : padded;
+
+    // Only the send itself goes through the queue the account's transactions share; looking does not hold it up.
+    const attempt = { submitted: false };
+    try {
+      const sent = await this.evmQueue(async (signal) => {
+        assertStillWanted(signal);
+        if (await isReceivedOnEvm(publicClient, message, network)) return { alreadyReceived: true, hash: undefined };
+        // A mint is counted, against the caller and against the day, when it is about to be submitted and not before.
+        this.countMint(caller);
+        assertStillWanted(signal);
+        attempt.submitted = true;
+        return receiveMessageOnEvm({
+          walletClient,
+          publicClient,
+          message,
+          attestation: attestation.attestation,
+          network,
+          gas: gasLimit,
+          maxFeePerGas: fees.maxFeePerGas,
+          maxPriorityFeePerGas: fees.maxPriorityFeePerGas < fees.maxFeePerGas ? fees.maxPriorityFeePerGas : fees.maxFeePerGas,
+          confirmations: MINT_CONFIRMATIONS,
+        });
+      });
+      return sent.hash ? { status: "minted", hash: sent.hash } : { status: "minted" };
+    } catch (error) {
+      if (!attempt.submitted) {
+        if (error instanceof ApiError) throw error;
+        if (error instanceof QueueFullError) {
+          throw new ApiError("unavailable", "The relayer is busy; try again in a moment");
+        }
+        if (error instanceof QueueTimeoutError) {
+          throw new ApiError("unavailable", "The network took too long to answer; try again in a moment");
+        }
+        throw unreachable();
+      }
+      // Submitted, or on its way. Whatever became of it, the server does not send it again by itself.
+      if (error instanceof QueueTimeoutError) {
+        throw this.refuseExit(
+          txHash,
+          "unavailable",
+          `The mint was sent and ${evm.chain.name} has not confirmed it yet; ask again in a couple of minutes`,
+          UNCONFIRMED_MEMORY_MS,
+        );
+      }
+      // The cause stays in the log: a transport error can quote the endpoint it failed to reach.
+      console.error("Mint on Base failed:", error instanceof Error ? error.name : "unknown error");
+      throw this.refuseExit(
+        txHash,
+        "simulation_failed",
+        `The mint did not go through on ${evm.chain.name} and the server will not send it again; submit it from your own wallet`,
+        HOUR_MS,
+      );
+    }
+  }
+
+  /** Counts one mint against its caller and against the day, or refuses when either has none left. Never given back. */
+  private countMint(caller: string): void {
     const perCaller = this.mintsPerCaller.check(caller);
     if (!perCaller.ok) {
       throw new ApiError("rate_limited", "This address has had the server pay for too many mints; try again later", {
@@ -738,20 +949,22 @@ export class Relayer {
     if (!counted.every((allowance) => allowance.ok)) {
       throw new ApiError("unavailable", "The server cannot pay for a mint right now; try again later");
     }
+  }
 
-    try {
-      // The same queue as the faucet's burns: one account on Base, one transaction at a time.
-      const { hash } = await this.queued(this.evmQueue, (signal) => {
-        assertStillWanted(signal);
-        return receiveMessageOnEvm({ walletClient, publicClient, message, attestation: attestation.attestation, network });
-      });
-      return hash ? { status: "minted", hash } : { status: "minted" };
-    } catch (error) {
-      if (error instanceof ApiError) throw error;
-      // The cause stays in the log: a transport error can quote the endpoint it failed to reach.
-      console.error("Mint on Base failed:", error instanceof Error ? error.name : "unknown error");
-      throw new ApiError("unavailable", `The server could not submit the mint on ${evm.chain.name}; try again later`);
-    }
+  /**
+   * Asks Circle's attestation service for everything a transaction carries,
+   * once, within bounds on time and on the size and shape of the answer.
+   */
+  private async lookUpExit(sourceDomain: number, txHash: string) {
+    const patience = new AbortController();
+    const timer = setTimeout(() => patience.abort(), IRIS_TIMEOUT_MS);
+    return fetchAttestations(sourceDomain, txHash, this.config.network, {
+      signal: patience.signal,
+      maxMessageBytes: MAX_MESSAGE_BYTES,
+      maxAttestationBytes: MAX_ATTESTATION_BYTES,
+    })
+      .catch(() => ({ state: "unreachable" as const, detail: "no answer in time" }))
+      .finally(() => clearTimeout(timer));
   }
 
   /**
@@ -988,6 +1201,22 @@ export class Relayer {
       }
     });
   }
+}
+
+/**
+ * Why a simulated call reverted: the contract's own words when it gave any,
+ * `null` when it reverted without, and `undefined` when the failure was not a
+ * revert at all but the network not answering. Only letters, digits and
+ * plain punctuation of the reason are kept.
+ */
+function revertReason(error: unknown): string | null | undefined {
+  if (!(error instanceof BaseError)) return undefined;
+  const revert = error.walk((cause) => cause instanceof ContractFunctionRevertedError);
+  if (revert instanceof ContractFunctionRevertedError) {
+    const reason = (revert.reason ?? "").replace(/[^A-Za-z0-9 _.,:'-]/g, "").trim().slice(0, 80);
+    return reason || null;
+  }
+  return /execution reverted/i.test(error.shortMessage) ? null : undefined;
 }
 
 /** Stops a queued task the queue has stopped waiting for, before it starts anything new. */
