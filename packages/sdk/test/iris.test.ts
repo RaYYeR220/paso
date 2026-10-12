@@ -1,0 +1,220 @@
+import { Address, Keypair, xdr } from "@stellar/stellar-sdk";
+import type { Hex } from "viem";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  decodeBurnMessage,
+  fetchBurnFee,
+  inboundRouteOf,
+  maxFeeFor,
+  mintAndForwardOperation,
+  receiveMessageOperation,
+  waitForAttestation,
+  type AttestationStatus,
+} from "../src/iris";
+import { forwardRecipientHookData } from "../src/evm";
+import { renderArg } from "../src/render";
+import { twinAddress, twinContractId } from "../src/twin";
+import { OWNER, testNetwork } from "./helpers";
+
+const TX_HASH = `0x${"cd".repeat(32)}`;
+const ATTESTATION = `0x${"ee".repeat(65)}` as Hex;
+const NONCE = `0x${"07".repeat(32)}`;
+const TWIN = twinAddress(OWNER, testNetwork);
+
+const word = (value: bigint | number) => BigInt(value).toString(16).padStart(64, "0");
+const u32 = (value: number) => value.toString(16).padStart(8, "0");
+const bytes32 = (value: string) => value.replace(/^0x/, "").padStart(64, "0");
+
+/** A CCTP v2 burn message laid out field by field. */
+function burnMessage(mintRecipient: string, hookData = ""): Hex {
+  const header = [
+    u32(1), // version
+    u32(6), // source domain
+    u32(27), // destination domain
+    bytes32(NONCE),
+    bytes32("8fe6b999dc680ccfdd5bf7eb0974218be2542daa"), // sender
+    "11".repeat(32), // recipient
+    "22".repeat(32), // destination caller
+    u32(1000), // minimum finality threshold
+    u32(1000), // finality threshold executed
+  ];
+  const body = [
+    u32(1), // version
+    bytes32("036cbd53842c5426634e7929541ec2318f3dcf7e"), // burn token
+    bytes32(mintRecipient),
+    word(1_000_000n), // amount
+    bytes32("70997970c51812dc3a010c7d01b50e0d17dc79c8"), // message sender
+    word(156n), // max fee
+    word(130n), // fee executed
+    word(0n), // expiration block
+    hookData.replace(/^0x/, ""),
+  ];
+  return `0x${header.join("")}${body.join("")}`;
+}
+
+const DIRECT_MESSAGE = burnMessage(twinContractId(OWNER, testNetwork));
+
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status });
+}
+
+describe("fetchBurnFee and maxFeeFor", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("reads the fee for the requested finality", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () =>
+      json([
+        { finalityThreshold: 1000, minimumFee: 1.3 },
+        { finalityThreshold: 2000, minimumFee: 0 },
+      ]),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(await fetchBurnFee(6, 27, "testnet")).toBe(1.3);
+    expect(await fetchBurnFee(6, 27, "testnet", { finalityThreshold: 2000 })).toBe(0);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe("https://iris-api-sandbox.circle.com/v2/burn/USDC/fees/6/27");
+  });
+
+  it("fails loudly when Iris does not answer with a fee", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => json({ error: "nope" }, 500)));
+    await expect(fetchBurnFee(6, 27, "testnet")).rejects.toThrow(/Iris.*500/);
+  });
+
+  it("rounds the fee up and leaves headroom", () => {
+    expect(maxFeeFor(1_000_000n, 1.3)).toBe(156n);
+    expect(maxFeeFor(1n, 1.3)).toBe(2n);
+    expect(maxFeeFor(123_456_789n, 1)).toBe(14_816n);
+    expect(maxFeeFor(1_000_000n, 0)).toBe(0n);
+  });
+});
+
+describe("waitForAttestation", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("keeps polling until the attestation is complete", async () => {
+    const answers = [
+      () => json({ error: "Message not found for provided parameters" }, 404),
+      () => json({ messages: [{ message: "0x", attestation: "PENDING", status: "pending_confirmations" }] }),
+      () => {
+        throw new TypeError("fetch failed");
+      },
+      () => json({ messages: [{ message: DIRECT_MESSAGE, attestation: ATTESTATION, status: "complete" }] }),
+    ];
+    const fetchMock = vi.fn<typeof fetch>(async () => answers.shift()!());
+    vi.stubGlobal("fetch", fetchMock);
+    const seen: AttestationStatus[] = [];
+
+    const result = await waitForAttestation(6, TX_HASH, "testnet", {
+      intervalMs: 1,
+      onStatus: (status) => seen.push(status),
+    });
+
+    expect(result).toEqual({ message: DIRECT_MESSAGE, attestation: ATTESTATION, nonce: NONCE });
+    expect(seen.map((status) => status.state)).toEqual(["not_found", "pending", "unreachable", "complete"]);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      `https://iris-api-sandbox.circle.com/v2/messages/6?transactionHash=${TX_HASH}`,
+    );
+  });
+
+  it("reports why a fast transfer is being held back", async () => {
+    const answers = [
+      json({
+        messages: [
+          { message: "0x", attestation: "PENDING", status: "pending_confirmations", delayReason: "insufficient_fee" },
+        ],
+      }),
+      json({ messages: [{ message: DIRECT_MESSAGE, attestation: ATTESTATION, status: "complete" }] }),
+    ];
+    vi.stubGlobal("fetch", vi.fn(async () => answers.shift()!));
+    const seen: AttestationStatus[] = [];
+
+    await waitForAttestation(6, TX_HASH, "testnet", { intervalMs: 1, onStatus: (status) => seen.push(status) });
+
+    expect(seen[0]).toEqual({ state: "pending", delayReason: "insufficient_fee" });
+  });
+
+  it("stops when the caller aborts", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => json({ error: "not found" }, 404)));
+    const controller = new AbortController();
+    const waiting = waitForAttestation(6, TX_HASH, "testnet", { intervalMs: 5, signal: controller.signal });
+    setTimeout(() => controller.abort(), 20);
+
+    await expect(waiting).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("does not start when the signal is already aborted", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      waitForAttestation(6, TX_HASH, "testnet", { signal: AbortSignal.abort() }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("decodeBurnMessage", () => {
+  it("reads the fields at Circle's offsets", () => {
+    const hookData = forwardRecipientHookData(TWIN);
+    const message = burnMessage(Buffer.from(Address.fromString(testNetwork.stellar.forwarder).toBuffer()).toString("hex"), hookData);
+
+    expect(decodeBurnMessage(message)).toEqual({
+      sourceDomain: 6,
+      destinationDomain: 27,
+      nonce: NONCE,
+      destinationCaller: `0x${"22".repeat(32)}`,
+      mintRecipient: `0x${Buffer.from(Address.fromString(testNetwork.stellar.forwarder).toBuffer()).toString("hex")}`,
+      amount: 1_000_000n,
+      maxFee: 156n,
+      feeExecuted: 130n,
+      hookData,
+    });
+  });
+
+  it("rejects bytes too short to be a burn message", () => {
+    expect(() => decodeBurnMessage("0x00")).toThrow(/too short/);
+  });
+
+  it("tells the two inbound routes apart by the mint recipient", () => {
+    const forwarded = burnMessage(
+      Buffer.from(Address.fromString(testNetwork.stellar.forwarder).toBuffer()).toString("hex"),
+      forwardRecipientHookData(TWIN),
+    );
+    expect(inboundRouteOf(forwarded, testNetwork)).toBe("forwarder");
+    expect(inboundRouteOf(DIRECT_MESSAGE, testNetwork)).toBe("direct");
+  });
+});
+
+describe("delivery operations", () => {
+  function call(operation: xdr.Operation) {
+    if (operation.body.type !== "invokeHostFunction") throw new Error("not a host function");
+    const { hostFunction } = operation.body.invokeHostFunctionOp;
+    if (hostFunction.type !== "hostFunctionTypeInvokeContract") throw new Error("not a contract call");
+    const { contractAddress, functionName, args } = hostFunction.invokeContract;
+    return {
+      contract: Address.fromScAddress(contractAddress).toString(),
+      fn: functionName.toString(),
+      args: args.map(renderArg),
+      types: args.map((arg) => arg.type),
+    };
+  }
+
+  it("calls mint_and_forward on the forwarder", () => {
+    expect(call(mintAndForwardOperation(DIRECT_MESSAGE, ATTESTATION, testNetwork))).toEqual({
+      contract: testNetwork.stellar.forwarder,
+      fn: "mint_and_forward",
+      args: [DIRECT_MESSAGE, ATTESTATION],
+      types: ["scvBytes", "scvBytes"],
+    });
+  });
+
+  it("calls receive_message on the message transmitter with the caller first", () => {
+    const caller = Keypair.random().publicKey();
+    expect(call(receiveMessageOperation(caller, DIRECT_MESSAGE, ATTESTATION, testNetwork))).toEqual({
+      contract: testNetwork.stellar.messageTransmitter,
+      fn: "receive_message",
+      args: [caller, DIRECT_MESSAGE, ATTESTATION],
+      types: ["scvAddress", "scvBytes", "scvBytes"],
+    });
+  });
+});

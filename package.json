@@ -3,10 +3,14 @@
   "private": true,
   "license": "MIT",
   "packageManager": "pnpm@12.11.2",
-  "engines": { "node": ">=22.12" },
+  "engines": {
+    "node": ">=22.12"
+  },
   "scripts": {
     "build:contracts": "stellar contract build",
-    "test:contracts": "cargo test",
-    "test": "pnpm -r test"
+    "test:contracts": "stellar contract build && cargo test",
+    "build:sdk": "pnpm --filter @paso/sdk build",
+    "test:sdk": "pnpm --filter @paso/sdk test",
+    "test": "pnpm test:contracts && pnpm test:sdk"
   }
 }

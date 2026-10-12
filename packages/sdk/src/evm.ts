@@ -1,0 +1,240 @@
+import { StrKey } from "@stellar/stellar-sdk";
+import {
+  concat,
+  numberToHex,
+  stringToHex,
+  toHex,
+  zeroHash,
+  type Address,
+  type Hex,
+  type PublicClient,
+  type WalletClient,
+} from "viem";
+import { FAST_FINALITY, fetchBurnFee, maxFeeFor } from "./iris";
+import { resolveNetwork, type Network } from "./networks";
+import { twinAddress, twinContractId } from "./twin";
+
+export const erc20Abi = [
+  {
+    type: "function",
+    name: "approve",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "spender", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [{ name: "", type: "bool" }],
+  },
+  {
+    type: "function",
+    name: "allowance",
+    stateMutability: "view",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "spender", type: "address" },
+    ],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "balanceOf",
+    stateMutability: "view",
+    inputs: [{ name: "account", type: "address" }],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+] as const;
+
+export const tokenMessengerAbi = [
+  {
+    type: "function",
+    name: "depositForBurn",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "amount", type: "uint256" },
+      { name: "destinationDomain", type: "uint32" },
+      { name: "mintRecipient", type: "bytes32" },
+      { name: "burnToken", type: "address" },
+      { name: "destinationCaller", type: "bytes32" },
+      { name: "maxFee", type: "uint256" },
+      { name: "minFinalityThreshold", type: "uint32" },
+    ],
+    outputs: [],
+  },
+  {
+    type: "function",
+    name: "depositForBurnWithHook",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "amount", type: "uint256" },
+      { name: "destinationDomain", type: "uint32" },
+      { name: "mintRecipient", type: "bytes32" },
+      { name: "burnToken", type: "address" },
+      { name: "destinationCaller", type: "bytes32" },
+      { name: "maxFee", type: "uint256" },
+      { name: "minFinalityThreshold", type: "uint32" },
+      { name: "hookData", type: "bytes" },
+    ],
+    outputs: [],
+  },
+] as const;
+
+export const messageTransmitterAbi = [
+  {
+    type: "function",
+    name: "receiveMessage",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "message", type: "bytes" },
+      { name: "attestation", type: "bytes" },
+    ],
+    outputs: [{ name: "", type: "bool" }],
+  },
+] as const;
+
+/**
+ * How USDC burned on Base reaches a Stellar account.
+ *
+ * - `forwarder`: mint to Circle's CctpForwarder, which passes the USDC on to
+ *   the account named in the hook data. This is the route Circle documents.
+ * - `direct`: mint straight to the account's contract id.
+ */
+export type InboundRoute = "forwarder" | "direct";
+
+export const DEFAULT_INBOUND_ROUTE: InboundRoute = "forwarder";
+
+const HOOK_DATA_VERSION = 0;
+
+/**
+ * Hook data that tells Circle's CctpForwarder where to send the minted USDC.
+ *
+ *   bytes  0–23  reserved, zero
+ *   bytes 24–27  hook data version, big-endian u32, 0
+ *   bytes 28–31  byte length of the recipient, big-endian u32
+ *   bytes 32–    the recipient strkey as UTF-8 text
+ *
+ * Layout from circlefin/stellar-cctp: `contracts/cctp-forwarder/src/message.rs`
+ * (the parser) and `examples/stellar-utils.ts` (`buildCctpForwarderHookData`).
+ */
+export function forwardRecipientHookData(recipient: string): Hex {
+  const valid =
+    StrKey.isValidContract(recipient) ||
+    StrKey.isValidEd25519PublicKey(recipient) ||
+    StrKey.isValidMed25519PublicKey(recipient);
+  if (!valid) {
+    throw new Error(`"${recipient}" is not a Stellar address (expected C…, G… or M…)`);
+  }
+  const text = stringToHex(recipient);
+  return concat([
+    toHex(0, { size: 24 }),
+    numberToHex(HOOK_DATA_VERSION, { size: 4 }),
+    numberToHex((text.length - 2) / 2, { size: 4 }),
+    text,
+  ]);
+}
+
+/** The part of a viem public client used to read Base. Clients for any chain fit, Base's own included. */
+export type EvmReader = Pick<PublicClient, "readContract" | "waitForTransactionReceipt">;
+
+export interface FundFromEvmArgs {
+  /** Pays the USDC and the gas. Must have its account set and be connected to Base. */
+  walletClient: WalletClient;
+  publicClient: EvmReader;
+  /** USDC to burn, in 6-decimal units. */
+  amount: bigint;
+  /** The Ethereum address whose Stellar account receives the USDC. It need not be the payer. */
+  owner: Address;
+  network: Network;
+  route?: InboundRoute;
+  /** Fee cap in 6-decimal units. Defaults to Circle's current fast-transfer fee plus headroom. */
+  maxFee?: bigint;
+}
+
+export interface FundFromEvmResult {
+  burnTxHash: Hex;
+  /** Present when an approval had to be sent first. */
+  approveTxHash?: Hex;
+  route: InboundRoute;
+  /** The Stellar account being funded. */
+  twin: string;
+  maxFee: bigint;
+}
+
+async function confirmed(publicClient: EvmReader, hash: Hex, what: string): Promise<void> {
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  if (receipt.status !== "success") {
+    throw new Error(`The ${what} reverted on Base: ${hash}`);
+  }
+}
+
+/**
+ * Sends USDC from Base to the Stellar account of `owner`: approves Circle's
+ * TokenMessenger when the allowance is short, then burns with a fast transfer.
+ *
+ * The USDC appears on Stellar once the burn is attested and delivered there;
+ * see `waitForAttestation` and `deliverOperation`.
+ */
+export async function fundFromEvm(args: FundFromEvmArgs): Promise<FundFromEvmResult> {
+  const { walletClient, publicClient, amount, owner, route = DEFAULT_INBOUND_ROUTE } = args;
+  const config = resolveNetwork(args.network);
+  const { chain, usdc, tokenMessenger, cctpDomain } = config.evm;
+  const destinationDomain = config.stellar.cctpDomain;
+
+  if (amount <= 0n) {
+    throw new Error("The amount to send must be positive");
+  }
+  const account = walletClient.account;
+  if (!account) {
+    throw new Error("The wallet client has no account to pay from");
+  }
+  const twin = twinAddress(owner, config);
+
+  const maxFee =
+    args.maxFee ?? maxFeeFor(amount, await fetchBurnFee(cctpDomain, destinationDomain, config));
+  if (maxFee >= amount) {
+    throw new Error(`The fee cap (${maxFee}) must be less than the amount (${amount})`);
+  }
+
+  let approveTxHash: Hex | undefined;
+  const allowance = await publicClient.readContract({
+    address: usdc,
+    abi: erc20Abi,
+    functionName: "allowance",
+    args: [account.address, tokenMessenger],
+  });
+  if (allowance < amount) {
+    approveTxHash = await walletClient.writeContract({
+      address: usdc,
+      abi: erc20Abi,
+      functionName: "approve",
+      args: [tokenMessenger, amount],
+      chain,
+      account,
+    });
+    await confirmed(publicClient, approveTxHash, "approval");
+  }
+
+  let burnTxHash: Hex;
+  if (route === "forwarder") {
+    const forwarder = toHex(StrKey.decodeContract(config.stellar.forwarder));
+    burnTxHash = await walletClient.writeContract({
+      address: tokenMessenger,
+      abi: tokenMessengerAbi,
+      functionName: "depositForBurnWithHook",
+      args: [amount, destinationDomain, forwarder, usdc, forwarder, maxFee, FAST_FINALITY, forwardRecipientHookData(twin)],
+      chain,
+      account,
+    });
+  } else {
+    burnTxHash = await walletClient.writeContract({
+      address: tokenMessenger,
+      abi: tokenMessengerAbi,
+      functionName: "depositForBurn",
+      args: [amount, destinationDomain, twinContractId(owner, config), usdc, zeroHash, maxFee, FAST_FINALITY],
+      chain,
+      account,
+    });
+  }
+  await confirmed(publicClient, burnTxHash, "burn");
+
+  return { burnTxHash, approveTxHash, route, twin, maxFee };
+}
