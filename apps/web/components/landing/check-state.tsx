@@ -48,16 +48,31 @@ export function CheckVerdict() {
     <>
       <p className="asked">
         <span className="asked-label">about to run</span>
-        <span className="asked-value">{refused ? "≠ a different call" : "= the same call"}</span>
+        <span className="asked-value">{refused ? "≠ a different amount" : "= the same call"}</span>
+        <span className="stamp" aria-hidden="true">
+          {refused ? "Refused" : "Match"}
+        </span>
       </p>
-      <div className="stamp" aria-hidden="true">
-        {refused ? "Refused" : "Match"}
-      </div>
       <p className="verdict" role="status">
-        {refused ? "Refused — " : "Match — "}
-        <a href={refused ? REFUSED_TX_URL : MATCHED_TX_URL} target="_blank" rel="noreferrer">
-          {refused ? "this is not what was signed" : `signed by ${shorten(DEMO_ADDRESS, 6, 4)}`}
-        </a>
+        {refused ? (
+          <>
+            <span>
+              Refused —{" "}
+              <a href={REFUSED_TX_URL} target="_blank" rel="noreferrer">
+                this is not what was signed
+              </a>
+              . Nothing moved.
+            </span>
+            <span className="answer">The account answered Error(Contract, #2) BadSignature</span>
+          </>
+        ) : (
+          <span>
+            Match —{" "}
+            <a href={MATCHED_TX_URL} target="_blank" rel="noreferrer">
+              signed by {shorten(DEMO_ADDRESS, 6, 4)}
+            </a>
+          </span>
+        )}
       </p>
     </>
   );

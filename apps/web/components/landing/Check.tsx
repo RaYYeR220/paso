@@ -31,7 +31,10 @@ export function Check() {
           <CheckSwitch />
         </div>
         <div className="ticket">
-          <dl className="msg">
+          <p className="slip" id="check-slip">
+            A call signed for amount 1
+          </p>
+          <dl className="msg" aria-labelledby="check-slip">
             <dt>account</dt>
             <dd>CCI3UVOB…QCOH2VME</dd>
             <dt>contract</dt>
@@ -39,11 +42,17 @@ export function Check() {
               CBIELTK6…MXQDAMA<span className="tok">USDC</span>
             </dd>
             <dt>fn</dt>
-            <dd>transfer</dd>
+            <dd>approve</dd>
             <dt>args</dt>
             <dd>CCI3UVOB…QCOH2VME</dd>
-            <dd>CAT44DMN…WIVY7FJ</dd>
-            <dd>1000000</dd>
+            <dd>CBNSNERN…53QGFOBO</dd>
+            <dt>amount</dt>
+            <dd>
+              <span className="signed">1</span>
+              <span className="tamper">
+                <span className="vh">signed, but about to run: </span>≠ 10000000000000
+              </span>
+            </dd>
           </dl>
           <CheckVerdict />
         </div>
