@@ -1,0 +1,20 @@
+{
+  "name": "@paso/evm-verifier-vectors",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Generates the signing vectors shared by the verifier's contract tests and its TypeScript helper.",
+  "scripts": {
+    "generate": "tsx generate.ts"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "17.2.1",
+    "viem": "^2.57.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "~5.9.3"
+  }
+}

@@ -1,0 +1,119 @@
+{
+  "domain": {
+    "name": "Paso verifier",
+    "version": "1"
+  },
+  "domainType": "EIP712Domain(string name,string version,bytes32 salt)",
+  "authorizationType": "Authorization(bytes32 payload)",
+  "vectors": [
+    {
+      "name": "testnet",
+      "network": "testnet",
+      "networkPassphrase": "Test SDF Network ; September 2015",
+      "networkId": "0xcee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
+      "signer": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+      "privateKey": "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "payload": "0x7214aeaad7675913a0fba208d96abb9e96fbe29511b720abc74f978d476dcdba",
+      "domainSeparator": "0x95dee67d2aa9eceb9b4e00a8efb9e6ae3a298da70a4917b74e25d9c916650bff",
+      "digest": "0x5c996f94348b947b8bf1312ceda0313588544a12654fafe459755cc050719b70",
+      "signature": "0x921fa6d7fe4d29d4c7b7d2cc5d9c3eadecd4ff8a59e9254907e2e8d2ba3579925c29e18045456a0b9bfabfc8673d67b942b9c23866af107421c49252417860da1c"
+    },
+    {
+      "name": "another_payload",
+      "network": "testnet",
+      "networkPassphrase": "Test SDF Network ; September 2015",
+      "networkId": "0xcee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
+      "signer": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+      "privateKey": "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "payload": "0x76dc254b51ed4bd9f2229a07320f8d6475968ca5328ac97fa929a989ec3ccd4e",
+      "domainSeparator": "0x95dee67d2aa9eceb9b4e00a8efb9e6ae3a298da70a4917b74e25d9c916650bff",
+      "digest": "0x95812a246695f18201a981e3d097f1b0ee26c879abc82f74ac5988b69368c302",
+      "signature": "0x61c42386e888462f107ae53462b09a43e888f3a6b7050e04b2b3c0e330f1acf17f16f054301768557e3964863479863dc7ef2a513fea7e5d9edb761b031b18181c"
+    },
+    {
+      "name": "second_signer",
+      "network": "testnet",
+      "networkPassphrase": "Test SDF Network ; September 2015",
+      "networkId": "0xcee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
+      "signer": "0x6A9296CEb89D12e1F53b2Dd5Df45d3ADB3A814c2",
+      "privateKey": "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      "payload": "0x7214aeaad7675913a0fba208d96abb9e96fbe29511b720abc74f978d476dcdba",
+      "domainSeparator": "0x95dee67d2aa9eceb9b4e00a8efb9e6ae3a298da70a4917b74e25d9c916650bff",
+      "digest": "0x5c996f94348b947b8bf1312ceda0313588544a12654fafe459755cc050719b70",
+      "signature": "0x2a90c7af4e3769d348019c7a4dfb7dfd533c65157fcaa55b42a7b22f97bba9e41d8d0bbad67057dac40b8e53f6693225074461804a97e89a3043a3bfa2c122791c"
+    },
+    {
+      "name": "mainnet",
+      "network": "mainnet",
+      "networkPassphrase": "Public Global Stellar Network ; September 2015",
+      "networkId": "0x7ac33997544e3175d266bd022439b22cdb16508c01163f26e5cb2a3e1045a979",
+      "signer": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+      "privateKey": "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "payload": "0x7214aeaad7675913a0fba208d96abb9e96fbe29511b720abc74f978d476dcdba",
+      "domainSeparator": "0x11855807d58ec536c5a942428d802e0258430c948b63a0a28018712794886e1a",
+      "digest": "0x54d594a0d8a07e8e10b746e33541f58a58f5f900a07c6123acf18d9883c310b8",
+      "signature": "0xa602d4a9964b4657250828d379b959ce26d55d69afcbcd307b3bd0c4797d6ff11b109a92a6a5d9f083e1e0aee480d02fa1aec31baa5765c7d361341f1432fd6c1c"
+    },
+    {
+      "name": "zero_payload",
+      "network": "testnet",
+      "networkPassphrase": "Test SDF Network ; September 2015",
+      "networkId": "0xcee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
+      "signer": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+      "privateKey": "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "payload": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "domainSeparator": "0x95dee67d2aa9eceb9b4e00a8efb9e6ae3a298da70a4917b74e25d9c916650bff",
+      "digest": "0xc26938d5edfa6cd912505529335f772adf6000c1eee9af08aae29e053eb61aff",
+      "signature": "0x14c277683a4bf9af7e945ea00165b54e909641964ff725f5badec2715fcbe958235e019e7a7c6c37ea0891ee802811b3103a0fdbd51f70920fd6a146b4e383821c"
+    },
+    {
+      "name": "max_payload",
+      "network": "testnet",
+      "networkPassphrase": "Test SDF Network ; September 2015",
+      "networkId": "0xcee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
+      "signer": "0x6A9296CEb89D12e1F53b2Dd5Df45d3ADB3A814c2",
+      "privateKey": "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      "payload": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "domainSeparator": "0x95dee67d2aa9eceb9b4e00a8efb9e6ae3a298da70a4917b74e25d9c916650bff",
+      "digest": "0x1e3c94869b40c4bd893272c1dd8c212aad85a5063d4d01c39a39839713bc4fb0",
+      "signature": "0x391b035c8cf458736214cc9103f3645e5b780b3e7e81978251caa471d62cdf3406fd305db3a8e79fec4140ce7dd8aa4f65db9b9f1c66046c708dce132f8807691c"
+    },
+    {
+      "name": "openzeppelin_auth_digest",
+      "network": "testnet",
+      "networkPassphrase": "Test SDF Network ; September 2015",
+      "networkId": "0xcee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
+      "signer": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+      "privateKey": "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "payload": "0x93184c50b8aeaca7ce955f109614185df25ba4c826368d27e1d95e9cf923cd7e",
+      "openZeppelin": {
+        "signaturePayload": "0xbf26903a27b4e4b1a2fd3b9fca6685dfe09e60ad730ce4e1530dd7d3264e33a3",
+        "contextRuleIds": [
+          0
+        ]
+      },
+      "domainSeparator": "0x95dee67d2aa9eceb9b4e00a8efb9e6ae3a298da70a4917b74e25d9c916650bff",
+      "digest": "0x6d1e76ec5b4b1b438b4185de2b387160fb38ffa29daae60e43610663d611feed",
+      "signature": "0x7f451fc0d325327375d32c6ce18c254b93f8b1281d2aa4fad8fcecee681c40f255ffe485ddf0970ec4f7e1121f82371eb152f93820ddfeb814298c72e375ddd01c"
+    },
+    {
+      "name": "openzeppelin_auth_digest_two_rules",
+      "network": "testnet",
+      "networkPassphrase": "Test SDF Network ; September 2015",
+      "networkId": "0xcee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
+      "signer": "0x6A9296CEb89D12e1F53b2Dd5Df45d3ADB3A814c2",
+      "privateKey": "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      "payload": "0xe94fb5a6151e36f742843af681b8b51efd581029ae92b2786a1243801421152c",
+      "openZeppelin": {
+        "signaturePayload": "0xbef52472b84b15367610f3a4306cb2bf2e6a8e0f48f05e366320ca69fc2bfdeb",
+        "contextRuleIds": [
+          3,
+          0
+        ]
+      },
+      "domainSeparator": "0x95dee67d2aa9eceb9b4e00a8efb9e6ae3a298da70a4917b74e25d9c916650bff",
+      "digest": "0xf2fb0b2d1883c1eba4139ed874bd33211da5c2b861a456394c79c85893c3aacf",
+      "signature": "0xbfcd7f19ec5868f3c33a8430b3840aa4ae3ea8be3386c79de34130aa45d7086178af541f0a08f2b44a712f3dd40f70a74a9ff4d07fcbd212e193fae084f318741b"
+    }
+  ]
+}

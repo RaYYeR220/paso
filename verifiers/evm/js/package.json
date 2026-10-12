@@ -1,0 +1,22 @@
+{
+  "name": "@paso/evm-verifier",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Typed data and signing for the Paso EVM verifier, and a testnet demo with an OpenZeppelin smart account.",
+  "scripts": {
+    "demo": "tsx demo.ts",
+    "test": "tsx --test src/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "17.2.1",
+    "viem": "^2.57.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "~5.9.3"
+  }
+}
