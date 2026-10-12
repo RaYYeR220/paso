@@ -1,4 +1,5 @@
 import { Keypair } from "@stellar/stellar-sdk";
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { post } from "./helpers";
 
@@ -6,12 +7,19 @@ vi.mock("next/server", () => ({ connection: async () => undefined }));
 
 type Handler = (request: Request) => Promise<Response>;
 
-const shared = globalThis as { pasoRelayer?: unknown };
+const shared = globalThis as { pasoRelayer?: unknown; pasoRelayerState?: unknown; pasoRouteLimiters?: unknown };
 
-/** Each test gets routes with limits that have counted nothing, and a relayer of its own. */
+/** What a server process keeps between requests. Forgetting it is what a restart does. */
+function restart(): void {
+  delete shared.pasoRelayer;
+  delete shared.pasoRelayerState;
+  delete shared.pasoRouteLimiters;
+}
+
+/** Each test gets a process that has counted nothing, and a relayer of its own. */
 beforeEach(() => {
   vi.resetModules();
-  delete shared.pasoRelayer;
+  restart();
   vi.stubEnv("RELAYER_SECRET", Keypair.random().secret());
   vi.stubEnv("VERCEL", "");
 });
@@ -19,7 +27,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
-  delete shared.pasoRelayer;
+  restart();
 });
 
 const relayRoute = async (): Promise<Handler> => (await import("@/app/api/relay/route")).POST;
@@ -86,6 +94,84 @@ describe("who a request is counted against", () => {
     expect(await statuses(health, 60, ask)).toEqual(new Array(60).fill(200));
     expect((await health(ask())).status).toBe(429);
     expect(read).toHaveBeenCalledTimes(60);
+  });
+});
+
+describe("replacing the code while the process runs", () => {
+  it("does not start the request counts over", async () => {
+    const spoofing = () => post("/api/relay", "not json");
+    expect(await statuses(await relayRoute(), 30, spoofing)).toEqual(new Array(30).fill(400));
+
+    // What a development server does on an edit: the modules are loaded afresh, the process stays.
+    vi.resetModules();
+    const reloaded = await relayRoute();
+
+    expect((await reloaded(spoofing())).status).toBe(429);
+  });
+});
+
+describe("replacing the relayer's code while the process runs", () => {
+  const randomOwner = () => privateKeyToAccount(generatePrivateKey()).address;
+  type Faucet = { assertFaucetFunded: () => Promise<void>; burnForDemo: () => Promise<unknown> };
+  /** Takes the payer to be funded and the burn to succeed, so that only the relayer's own rules decide. */
+  function funded(relayer: unknown): void {
+    vi.spyOn(relayer as Faucet, "assertFaucetFunded").mockResolvedValue(undefined);
+    vi.spyOn(relayer as Faucet, "burnForDemo").mockResolvedValue({ burnTxHash: "0x00", sourceDomain: 6, twin: "C", amount: "1000000" });
+  }
+  const load = async () => (await import("@/lib/server/relayer")).getRelayer();
+
+  it("keeps what it has counted, spent and sent", async () => {
+    vi.stubEnv("DEMO_PAYER_PRIVATE_KEY", generatePrivateKey());
+    vi.stubEnv("DEMO_FUND_PER_DAY", "1");
+    const first = await load();
+    funded(first);
+    await first.demoFund({ owner: randomOwner() }, "caller");
+    first.state.fees.spend(BigInt(1_234));
+    first.state.sends.set("deploy:0xabc", { hash: "ab".repeat(32), deadline: Date.now() + 60_000 });
+    expect(await load()).toBe(first);
+
+    // The module is loaded afresh, as on an edit: a new class, so a new relayer.
+    vi.resetModules();
+    const second = await load();
+    funded(second);
+
+    expect(second).not.toBe(first);
+    expect(second.state).toBe(first.state);
+    await expect(second.demoFund({ owner: randomOwner() }, "someone else")).rejects.toMatchObject({
+      code: "unavailable",
+      detail: expect.stringContaining("all it gives in a day"),
+    });
+    expect(second.state.fees.spent()).toBe(BigInt(1_234));
+    expect(second.state.sends.has("deploy:0xabc")).toBe(true);
+    expect(second.state.inFlight()).toBe(1);
+  });
+
+  it("pays for nothing until the transactions of code it cannot take over from have settled", async () => {
+    vi.stubEnv("DEMO_PAYER_PRIVATE_KEY", generatePrivateKey());
+    let waiting = 1;
+    shared.pasoRelayerState = { version: -1, inFlight: () => waiting };
+    const relayer = await load();
+    funded(relayer);
+
+    expect(relayer.state.predecessor).toBeDefined();
+    await expect(relayer.demoFund({ owner: randomOwner() }, "caller")).rejects.toMatchObject({
+      code: "unavailable",
+      detail: expect.stringContaining("restarted with transactions on their way"),
+    });
+
+    waiting = 0;
+    await expect(relayer.demoFund({ owner: randomOwner() }, "caller")).resolves.toBeDefined();
+  });
+
+  it("gives itself a few minutes when it cannot even ask the code it replaced", async () => {
+    vi.stubEnv("DEMO_PAYER_PRIVATE_KEY", generatePrivateKey());
+    shared.pasoRelayerState = { queue: "from another time" };
+    const relayer = await load();
+    funded(relayer);
+
+    await expect(relayer.demoFund({ owner: randomOwner() }, "caller")).rejects.toMatchObject({ code: "unavailable" });
+    expect(relayer.state.predecessor?.until).toBeGreaterThan(Date.now() + 170_000);
+    expect(relayer.state.predecessor?.until).toBeLessThanOrEqual(Date.now() + 180_000);
   });
 });
 

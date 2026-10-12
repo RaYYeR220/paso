@@ -166,10 +166,25 @@ export interface FundFromEvmResult {
   maxFee: bigint;
 }
 
+/**
+ * A transaction was included on Base and reverted. This is a known outcome:
+ * unlike a timeout or a transport error, it says the transaction did not do
+ * what it was sent for and never will.
+ */
+export class TransactionRevertedError extends Error {
+  constructor(
+    readonly hash: Hex,
+    what: string,
+  ) {
+    super(`The ${what} reverted on Base: ${hash}`);
+    this.name = "TransactionRevertedError";
+  }
+}
+
 async function confirmed(publicClient: EvmReader, hash: Hex, what: string, confirmations?: number): Promise<void> {
   const receipt = await publicClient.waitForTransactionReceipt(confirmations ? { hash, confirmations } : { hash });
   if (receipt.status !== "success") {
-    throw new Error(`The ${what} reverted on Base: ${hash}`);
+    throw new TransactionRevertedError(hash, what);
   }
 }
 
@@ -282,6 +297,8 @@ export interface ReceiveOnEvmArgs {
   maxPriorityFeePerGas?: bigint;
   /** How many blocks deep the mint has to be before this resolves. Defaults to one. */
   confirmations?: number;
+  /** Called with the transaction hash as soon as the wallet has sent it, before it is confirmed. */
+  onSubmitted?: (hash: Hex) => void;
 }
 
 export interface ReceiveOnEvmResult {
@@ -298,7 +315,9 @@ export interface ReceiveOnEvmResult {
  * A message is received once. If someone else got there first, before the
  * call or while it was on its way, this resolves with `alreadyReceived`
  * instead of failing: the USDC is where it belongs either way. A call that
- * fails for any other reason is reported and never sent a second time.
+ * fails for any other reason is reported and never sent a second time. A
+ * `TransactionRevertedError` says the mint was included and reverted; any
+ * other failure leaves its outcome unknown.
  */
 export async function receiveMessageOnEvm(args: ReceiveOnEvmArgs): Promise<ReceiveOnEvmResult> {
   const { walletClient, publicClient, message, attestation, gas, maxFeePerGas, maxPriorityFeePerGas } = args;
@@ -323,6 +342,7 @@ export async function receiveMessageOnEvm(args: ReceiveOnEvmArgs): Promise<Recei
       ...(maxFeePerGas === undefined ? {} : { maxFeePerGas }),
       ...(maxPriorityFeePerGas === undefined ? {} : { maxPriorityFeePerGas }),
     });
+    args.onSubmitted?.(hash);
     await confirmed(publicClient, hash, "mint", args.confirmations);
     return { hash, alreadyReceived: false };
   } catch (error) {

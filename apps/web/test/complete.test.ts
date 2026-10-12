@@ -100,6 +100,9 @@ function completing({ used = [0], wei = ETH, block = BLOCK, simulate, feePerGas 
     ),
     estimateFeesPerGas: vi.fn(async () => ({ maxFeePerGas: BigInt(feePerGas), maxPriorityFeePerGas: BigInt(1_000_000) })),
     waitForTransactionReceipt: vi.fn(async () => ({ status: receipt })),
+    getTransactionReceipt: vi.fn<(call: { hash: string }) => Promise<{ status: string }>>(async () => {
+      throw new Error("The transaction receipt could not be found");
+    }),
   };
   const walletClient = {
     account: payer,
@@ -511,40 +514,14 @@ describe("what the server pays for", () => {
     await expect(relayer.complete(request(), "203.0.113.2")).resolves.toEqual({ status: "minted" });
   });
 
-  it("never sends a mint that failed a second time, and keeps the provider's words out of the answer", async () => {
-    const { relayer, walletClient } = completing({
-      env: { BASE_MINTS_PER_CALLER_PER_HOUR: "1" },
-      write: async () => {
-        throw Object.assign(new Error("HTTP request failed. URL: https://base.example/v2/secret-api-key"), {
-          shortMessage: "request to https://base.example/v2/secret-api-key failed",
-        });
-      },
-    });
-    const lookups = stubIris(() => attested());
-    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const asked = request();
-
-    const failed = await refusal(relayer, asked);
-    expect(failed).toMatchObject({ code: "simulation_failed", status: 422, detail: expect.stringContaining("will not send it again") });
-    expect(JSON.stringify([failed.detail, failed.extra, logged.mock.calls])).not.toContain("secret-api-key");
-
-    // Asked again, by anyone: the same answer, nothing looked up, nothing sent.
-    expect(await refusal(relayer, asked, "someone else")).toBe(failed);
-    expect(lookups).toHaveBeenCalledTimes(1);
-    expect(walletClient.writeContract).toHaveBeenCalledTimes(1);
-
-    // The attempt was submitted, so it stays counted against the caller.
-    expect(await refusal(relayer)).toMatchObject({ code: "rate_limited" });
-  });
-
   it("does not send again a mint that Base included and reverted", async () => {
     const { relayer, walletClient } = completing({ receipt: "reverted" });
     stubIris(() => attested());
-    vi.spyOn(console, "error").mockImplementation(() => undefined);
     const asked = request();
+    const reverted = { code: "simulation_failed", status: 422, detail: expect.stringContaining("included on Base Sepolia and reverted") };
 
-    expect(await refusal(relayer, asked)).toMatchObject({ code: "simulation_failed", detail: expect.stringContaining("did not go through") });
-    expect(await refusal(relayer, asked)).toMatchObject({ code: "simulation_failed" });
+    expect(await refusal(relayer, asked)).toMatchObject(reverted);
+    expect(await refusal(relayer, asked, "someone else")).toMatchObject(reverted);
     expect(walletClient.writeContract).toHaveBeenCalledTimes(1);
   });
 
@@ -610,6 +587,174 @@ describe("what the server pays for", () => {
 
     expect(publicClient.estimateContractGas).toHaveBeenCalledTimes(10);
     expect(queue).not.toHaveBeenCalled();
+  });
+
+  it("writes its reservation and counts the mint before the transaction goes out", async () => {
+    const asked = request();
+    let seen: unknown;
+    const base = completing({
+      env: { BASE_MINTS_PER_CALLER_PER_HOUR: "1" },
+      write: async () => {
+        seen = {
+          exit: base.relayer.state.exits.get(asked.txHash)?.kind,
+          left: base.relayer.state.mintsPerCaller.check("caller").ok,
+          unsettled: base.relayer.state.unsettled,
+        };
+        return MINT_HASH;
+      },
+    });
+    stubIris(() => attested());
+
+    await base.relayer.complete(asked, "caller");
+
+    expect(seen).toEqual({ exit: "sending", left: false, unsettled: 1 });
+    expect(base.relayer.state.exits.get(asked.txHash)?.kind).toBe("minted");
+    expect(base.relayer.state.unsettled).toBe(0);
+  });
+
+  it("counts one mint for requests that arrive together", async () => {
+    const { relayer, walletClient } = completing({ env: { BASE_MINTS_PER_CALLER_PER_HOUR: "2" } });
+    stubIris(() => attested());
+    const asked = request();
+
+    await Promise.all([relayer.complete(asked, "caller"), relayer.complete(asked, "caller"), relayer.complete(asked, "caller")]);
+    expect(walletClient.writeContract).toHaveBeenCalledTimes(1);
+
+    // One of the caller's two mints was used, not three: there is exactly one left.
+    await expect(relayer.complete(request(), "caller")).resolves.toMatchObject({ status: "minted" });
+    await expect(relayer.complete(request(), "caller")).rejects.toMatchObject({ code: "rate_limited" });
+  });
+
+  it("holds a mint whose outcome it never learned as on its way, and does not send it again", async () => {
+    const base = completing({
+      env: { BASE_MINTS_PER_CALLER_PER_HOUR: "1" },
+      write: async () => {
+        throw Object.assign(new Error("HTTP request failed. URL: https://base.example/v2/secret-api-key"), {
+          shortMessage: "request to https://base.example/v2/secret-api-key failed",
+        });
+      },
+    });
+    const lookups = stubIris(() => attested());
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const asked = request();
+    const onItsWay = { code: "unavailable", status: 503, detail: expect.stringContaining("has not confirmed it yet") };
+
+    const first = await refusal(base.relayer, asked);
+    expect(first).toMatchObject(onItsWay);
+    expect(JSON.stringify([first.detail, first.extra, logged.mock.calls])).not.toContain("secret-api-key");
+    expect(base.relayer.state.exits.get(asked.txHash)?.kind).toBe("sending");
+
+    // Asked again, by anyone: still on its way. Nothing is looked up at Circle, simulated or sent.
+    for (const caller of ["caller", "someone else", "a third"]) expect(await refusal(base.relayer, asked, caller)).toMatchObject(onItsWay);
+    expect(lookups).toHaveBeenCalledTimes(1);
+    expect(base.publicClient.estimateContractGas).toHaveBeenCalledTimes(1);
+    expect(base.walletClient.writeContract).toHaveBeenCalledTimes(1);
+
+    // It was submitted, so it stays counted against the caller.
+    expect(await refusal(base.relayer)).toMatchObject({ code: "rate_limited" });
+
+    // Until Base itself says the message has been received.
+    base.publicClient.readContract.mockResolvedValue(BigInt(1));
+    expect(await base.relayer.complete(asked, "caller")).toEqual({ status: "minted" });
+    expect(base.walletClient.writeContract).toHaveBeenCalledTimes(1);
+  });
+
+  it("settles a mint it stopped waiting for by what Base says became of the transaction", async () => {
+    vi.useFakeTimers();
+    const landed = completing();
+    landed.publicClient.waitForTransactionReceipt.mockImplementation(() => new Promise(() => undefined));
+    stubIris(() => attested());
+    const asked = request();
+
+    const stuck = refusal(landed.relayer, asked);
+    await vi.advanceTimersByTimeAsync(55_000);
+    expect(await stuck).toMatchObject({ code: "unavailable", detail: expect.stringContaining("has not confirmed it yet") });
+    expect(await refusal(landed.relayer, asked)).toMatchObject({ code: "unavailable" });
+    expect(landed.publicClient.getTransactionReceipt).toHaveBeenCalledWith({ hash: MINT_HASH });
+
+    landed.publicClient.getTransactionReceipt.mockResolvedValue({ status: "success" });
+    landed.publicClient.readContract.mockResolvedValue(BigInt(1));
+    expect(await landed.relayer.complete(asked, "caller")).toEqual({ status: "minted", hash: MINT_HASH });
+    expect(landed.walletClient.writeContract).toHaveBeenCalledTimes(1);
+
+    const reverted = completing();
+    reverted.publicClient.waitForTransactionReceipt.mockImplementation(() => new Promise(() => undefined));
+    const other = request();
+    const waiting = refusal(reverted.relayer, other);
+    await vi.advanceTimersByTimeAsync(55_000);
+    await waiting;
+    reverted.publicClient.getTransactionReceipt.mockResolvedValue({ status: "reverted" });
+
+    expect(await refusal(reverted.relayer, other)).toMatchObject({ code: "simulation_failed", detail: expect.stringContaining("reverted") });
+    expect(await refusal(reverted.relayer, other)).toMatchObject({ code: "simulation_failed" });
+    expect(reverted.walletClient.writeContract).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets the transaction's own outcome end the reservation, however late it comes", async () => {
+    vi.useFakeTimers();
+    let land: (hash: string) => void = () => undefined;
+    const { relayer, publicClient, walletClient } = completing({ write: () => new Promise<string>((resolve) => (land = resolve)) });
+    stubIris(() => attested());
+    const asked = request();
+
+    const stuck = refusal(relayer, asked);
+    await vi.advanceTimersByTimeAsync(55_000);
+    await stuck;
+    expect(relayer.state.exits.get(asked.txHash)?.kind).toBe("sending");
+    expect(relayer.state.inFlight()).toBe(2);
+
+    land(MINT_HASH);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(relayer.state.exits.get(asked.txHash)?.kind).toBe("minted");
+    expect(relayer.state.inFlight()).toBe(0);
+    const reads = publicClient.readContract.mock.calls.length;
+    expect(await relayer.complete(asked, "caller")).toEqual({ status: "minted", hash: MINT_HASH });
+    expect(publicClient.readContract).toHaveBeenCalledTimes(reads);
+    expect(walletClient.writeContract).toHaveBeenCalledTimes(1);
+  });
+
+  it("never drops what it has on record to make room: with the table full, no mint is sent or counted", async () => {
+    const { relayer, walletClient } = completing({ env: { BASE_MINTS_PER_CALLER_PER_HOUR: "1" } });
+    const { exits } = relayer.state;
+    for (let i = 0; i < 5_000; i += 1) exits.set(`exit-${i}`, { kind: "sending", until: Date.now() + 60_000, message: MESSAGE });
+    stubIris(() => attested());
+
+    await expect(relayer.complete(request(), "caller")).rejects.toMatchObject({
+      code: "unavailable",
+      detail: expect.stringContaining("busy"),
+    });
+    expect(exits.size).toBe(5_000);
+    expect([...exits.values()].every((exit) => exit.kind === "sending")).toBe(true);
+    expect(walletClient.writeContract).not.toHaveBeenCalled();
+    expect(relayer.state.mintsPerCaller.check("caller").ok).toBe(true);
+
+    // An entry leaves when its own time is up, and that is what makes room.
+    exits.set("exit-7", { kind: "sending", until: Date.now() - 1, message: MESSAGE });
+    await expect(relayer.complete(request(), "caller")).resolves.toEqual({ status: "minted", hash: MINT_HASH });
+    expect(exits.has("exit-7")).toBe(false);
+  });
+
+  it("looks again at an exit it refused, in case someone else has minted it since", async () => {
+    vi.useFakeTimers();
+    const base = completing({ simulate: reverting("Invalid attestation signature") });
+    const lookups = stubIris(() => attested());
+    const asked = request();
+
+    const refused = await refusal(base.relayer, asked);
+    expect(refused).toMatchObject({ code: "simulation_failed" });
+    base.publicClient.readContract.mockResolvedValue(BigInt(1));
+
+    // Within a quarter of a minute the answer comes from memory, untouched.
+    const reads = base.publicClient.readContract.mock.calls.length;
+    expect(await refusal(base.relayer, asked)).toBe(refused);
+    expect(base.publicClient.readContract).toHaveBeenCalledTimes(reads);
+
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(await base.relayer.complete(asked, "caller")).toEqual({ status: "minted" });
+    expect(base.publicClient.readContract).toHaveBeenCalledTimes(reads + 1);
+    expect(lookups).toHaveBeenCalledTimes(1);
+    expect(base.walletClient.writeContract).not.toHaveBeenCalled();
   });
 
   it("gives up on a mint that hangs instead of holding the queue, and does not send it again by itself", async () => {

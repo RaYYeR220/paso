@@ -54,6 +54,7 @@ function scripted({ answers = [], confirmMs = 0, resourceFee = "100", env = {} }
       log.push("confirmed");
       return { status: "SUCCESS", txHash: hash };
     }),
+    getTransaction: vi.fn<(hash: string) => Promise<{ status: string }>>(async () => ({ status: "NOT_FOUND" })),
   };
   (relayer as unknown as { server: unknown }).server = server;
   return { relayer, server, log };
@@ -143,7 +144,11 @@ describe("transactions from the relayer account", () => {
 
     const result = await relayer.deploy({ network: "testnet", owner });
 
-    expect(result).toEqual({ address: twinAddress(owner, "testnet"), hash: "2".padStart(64, "0"), alreadyDeployed: false });
+    expect(result).toEqual({
+      address: twinAddress(owner, "testnet"),
+      hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      alreadyDeployed: false,
+    });
     expect(server.getAccount).toHaveBeenCalledTimes(2);
     expect(log).toEqual(["sequence", "send 101", "sequence", "send 101", "confirmed"]);
   });
@@ -221,6 +226,185 @@ describe("transactions from the relayer account", () => {
     await expect(deployFor(relayer)).rejects.toMatchObject({ code: "unavailable", detail: expect.stringContaining("busy") });
     expect(waiting).toHaveLength(8);
     expect(server.sendTransaction).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("a transaction whose outcome was not learned", () => {
+  /** A deployment whose transaction went out and was never seen to land: the wait for it ran out. */
+  async function unconfirmed() {
+    vi.useFakeTimers();
+    const run = scripted();
+    run.server.pollTransaction.mockImplementationOnce(() => new Promise(() => undefined));
+    const body = { network: "testnet", owner: randomOwner() };
+
+    const stuck = run.relayer.deploy(body).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(50_000);
+    expect(await stuck).toMatchObject({ code: "unavailable" });
+    const [pending] = [...run.relayer.state.sends.values()];
+    return { ...run, body, hash: pending!.hash };
+  }
+
+  it("stays on record, and is not sent a second time while it may still land", async () => {
+    const { relayer, server, body, hash } = await unconfirmed();
+
+    for (let i = 0; i < 3; i += 1) {
+      await expect(relayer.deploy(body)).rejects.toMatchObject({
+        code: "unavailable",
+        detail: expect.stringContaining("is on its way"),
+        extra: { hash },
+      });
+    }
+    expect(server.getTransaction).toHaveBeenCalledWith(hash);
+    expect(server.sendTransaction).toHaveBeenCalledTimes(1);
+    expect(relayer.state.fees.spent()).toBe(BigInt(1_100));
+  });
+
+  it("is answered with its own hash once the network shows it applied", async () => {
+    const { relayer, server, body, hash } = await unconfirmed();
+    server.getTransaction.mockResolvedValue({ status: "SUCCESS" });
+
+    await expect(relayer.deploy(body)).resolves.toMatchObject({ hash, alreadyDeployed: false });
+    expect(server.sendTransaction).toHaveBeenCalledTimes(1);
+    expect(relayer.state.sends.size).toBe(0);
+  });
+
+  it("is reported as failed once the network shows it failed, and only then tried anew", async () => {
+    const { relayer, server, body, hash } = await unconfirmed();
+    server.getTransaction.mockResolvedValue({ status: "FAILED" });
+
+    await expect(relayer.deploy(body)).rejects.toMatchObject({ code: "transaction_failed", extra: { hash } });
+    expect(server.sendTransaction).toHaveBeenCalledTimes(1);
+
+    const anew = relayer.deploy(body);
+    await vi.advanceTimersByTimeAsync(10);
+    await expect(anew).resolves.toMatchObject({ alreadyDeployed: false });
+    expect(server.sendTransaction).toHaveBeenCalledTimes(2);
+  });
+
+  it("is sent anew only once it can no longer be included", async () => {
+    const { relayer, server, body } = await unconfirmed();
+
+    // 50 seconds in: its time bound of a minute, and the margin after it, have not passed.
+    await vi.advanceTimersByTimeAsync(39_000);
+    await expect(relayer.deploy(body)).rejects.toMatchObject({ code: "unavailable" });
+    expect(server.sendTransaction).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    const anew = relayer.deploy(body);
+    await vi.advanceTimersByTimeAsync(10);
+    await expect(anew).resolves.toMatchObject({ alreadyDeployed: false });
+    expect(server.sendTransaction).toHaveBeenCalledTimes(2);
+  });
+
+  it("counts as on its way when the network never said whether it took it", async () => {
+    const { relayer, server } = scripted();
+    server.sendTransaction.mockRejectedValueOnce(new Error("socket hang up"));
+    const body = { network: "testnet", owner: randomOwner() };
+
+    await expect(relayer.deploy(body)).rejects.toMatchObject({
+      code: "unavailable",
+      detail: expect.stringContaining("did not say whether it took it"),
+    });
+    await expect(relayer.deploy(body)).rejects.toMatchObject({ detail: expect.stringContaining("is on its way") });
+    expect(server.sendTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("counts as on its way when it was taken and not seen in a ledger in time", async () => {
+    const { relayer, server } = scripted();
+    server.pollTransaction.mockResolvedValueOnce({ status: "NOT_FOUND", txHash: "" });
+    const body = { network: "testnet", owner: randomOwner() };
+
+    await expect(relayer.deploy(body)).rejects.toMatchObject({ detail: expect.stringContaining("has not been confirmed yet") });
+    await expect(relayer.deploy(body)).rejects.toMatchObject({ detail: expect.stringContaining("is on its way") });
+    expect(server.sendTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("is off the record at once when the network refused it", async () => {
+    const { relayer } = scripted({
+      answers: [{ status: "ERROR", hash: "", errorResult: { result: { type: "txInsufficientBalance" } } }],
+    });
+
+    await expect(deployFor(relayer)).rejects.toMatchObject({ code: "unavailable" });
+    expect(relayer.state.sends.size).toBe(0);
+  });
+});
+
+describe("what the relayer keeps on record", () => {
+  it("is reserved once for requests that arrive together", async () => {
+    const { relayer, server } = scripted({ confirmMs: 10, env: { RELAYER_MAX_DAILY_FEES: "1100" } });
+    const body = { network: "testnet", owner: randomOwner() };
+
+    const [first, second, third] = await Promise.all([relayer.deploy(body), relayer.deploy(body), relayer.deploy(body)]);
+
+    expect(second).toEqual(first);
+    expect(third).toEqual(first);
+    expect(server.sendTransaction).toHaveBeenCalledTimes(1);
+    expect(relayer.state.fees.spent()).toBe(BigInt(1_100));
+  });
+
+  it("is never dropped to make room: with the table full, new sends are declined", async () => {
+    const { relayer, server } = scripted();
+    const { sends } = relayer.state;
+    for (let i = 0; i < 256; i += 1) sends.set(`deploy:${i}`, { hash: String(i), deadline: Date.now() + 60_000 });
+    const standing = [...sends.keys()];
+
+    await expect(deployFor(relayer)).rejects.toMatchObject({
+      code: "unavailable",
+      detail: expect.stringContaining("too many transactions"),
+    });
+    expect([...sends.keys()]).toEqual(standing);
+    expect(server.sendTransaction).not.toHaveBeenCalled();
+    expect(relayer.state.fees.spent()).toBe(BigInt(0));
+
+    // An entry leaves when its own time is up, and that is what makes room.
+    sends.set("deploy:7", { hash: "7", deadline: Date.now() - 31_000 });
+    await expect(deployFor(relayer)).resolves.toMatchObject({ alreadyDeployed: false });
+    expect(sends.has("deploy:7")).toBe(false);
+    expect(sends.size).toBe(255);
+  });
+
+  it("includes the transactions of code it replaced: nothing is paid for until those have settled", async () => {
+    const { relayer, server } = scripted();
+    let waiting = 2;
+    relayer.state.predecessor = { inFlight: () => waiting, until: Date.now() + 60_000 };
+
+    await expect(deployFor(relayer)).rejects.toMatchObject({
+      code: "unavailable",
+      detail: expect.stringContaining("restarted with transactions on their way"),
+    });
+    expect(server.sendTransaction).not.toHaveBeenCalled();
+
+    waiting = 0;
+    await expect(deployFor(relayer)).resolves.toMatchObject({ alreadyDeployed: false });
+    expect(relayer.state.predecessor).toBeUndefined();
+  });
+
+  it("waits out a set time when it cannot see what the replaced code had on its way", async () => {
+    vi.useFakeTimers();
+    const { relayer, server } = scripted();
+    relayer.state.predecessor = { until: Date.now() + 180_000 };
+
+    await expect(deployFor(relayer)).rejects.toMatchObject({ code: "unavailable" });
+    await vi.advanceTimersByTimeAsync(179_000);
+    await expect(deployFor(relayer)).rejects.toMatchObject({ code: "unavailable" });
+    expect(server.sendTransaction).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    const deployed = deployFor(relayer);
+    await vi.advanceTimersByTimeAsync(10);
+    await expect(deployed).resolves.toMatchObject({ alreadyDeployed: false });
+  });
+
+  it("counts what is queued, on its way and unsettled as in flight", async () => {
+    const { relayer, server } = scripted();
+    expect(relayer.state.inFlight()).toBe(0);
+
+    server.pollTransaction.mockResolvedValueOnce({ status: "NOT_FOUND", txHash: "" });
+    await deployFor(relayer).catch(() => undefined);
+    expect(relayer.state.inFlight()).toBe(1);
+
+    relayer.state.unsettled += 1;
+    expect(relayer.state.inFlight()).toBe(2);
   });
 });
 

@@ -10,7 +10,10 @@ export interface QueueOptions {
  * signal that is aborted when the queue has given up on it: it must not
  * start anything new after that.
  */
-export type Queue = <T>(task: (signal: AbortSignal) => Promise<T>) => Promise<T>;
+export type Queue = (<T>(task: (signal: AbortSignal) => Promise<T>) => Promise<T>) & {
+  /** How many tasks are waiting or running. */
+  pending(): number;
+};
 
 /** The queue already holds as many tasks as it takes. */
 export class QueueFullError extends Error {
@@ -45,7 +48,7 @@ export function createQueue({ maxPending, timeoutMs }: QueueOptions): Queue {
   let tail: Promise<unknown> = Promise.resolve();
   let pending = 0;
 
-  return <T>(task: (signal: AbortSignal) => Promise<T>): Promise<T> => {
+  const run = <T>(task: (signal: AbortSignal) => Promise<T>): Promise<T> => {
     if (pending >= maxPending) return Promise.reject(new QueueFullError());
     pending += 1;
 
@@ -66,4 +69,5 @@ export function createQueue({ maxPending, timeoutMs }: QueueOptions): Queue {
     tail = result.then(settled, settled);
     return result;
   };
+  return Object.assign(run, { pending: () => pending });
 }

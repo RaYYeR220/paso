@@ -19,6 +19,7 @@ import {
   signedFromRelayRequest,
   simulateSigned,
   SimulationError,
+  TransactionRevertedError,
   twinAddress,
   type Attestation,
   type BurnMessage,
@@ -26,6 +27,7 @@ import {
   type RelayResult,
   type Signed,
 } from "@paso/sdk";
+import { createHash } from "node:crypto";
 import { Account, Operation, rpc, StrKey, TransactionBuilder, xdr } from "@stellar/stellar-sdk";
 import {
   BaseError,
@@ -88,6 +90,8 @@ const MAX_MESSAGE_BYTES = 8_192;
 const MAX_ATTESTATION_BYTES = 2_048;
 const MAX_DIAGNOSTIC_CHARS = 4_000;
 const REMEMBERED_DELIVERIES = 1_000;
+/** Changes whenever the shape of `RelayerState` does, so that state left by older code is never mistaken for this. */
+export const STATE_VERSION = 1;
 
 /**
  * Bounds on a mint the server pays for on Base. It is sent only after the
@@ -100,10 +104,21 @@ const MINT_CONFIRMATIONS = 2;
 const MIN_MINT_AMOUNT = BigInt(10_000);
 /** How many attested exits one caller may have examined in an hour: each costs several requests to Base. */
 const EXIT_CHECKS_PER_CALLER_PER_HOUR = 30;
-const REMEMBERED_EXITS = 1_000;
-/** How long an answer that may yet change is remembered: a re-attested exit, a reverting simulation, a mint on its way. */
+/**
+ * How much the server remembers at once. None of these tables ever drops an
+ * entry to make room: an entry leaves when its own time is up, and while a
+ * table is full of entries that still stand, new work is declined instead.
+ */
+const MAX_EXITS = 5_000;
+const MAX_PENDING_SENDS = 256;
+/** How long an answer that may yet change is remembered: a re-attested exit, a reverting simulation. */
 const SHORT_MEMORY_MS = 5 * 60 * 1000;
-const UNCONFIRMED_MEMORY_MS = 2 * 60 * 1000;
+/** How often an exit the server refused is looked up on Base again, in case someone else minted it since. */
+const RECHECK_MS = 15_000;
+/** How long after its time bound a Stellar transaction is still looked for before it is given up as never included. */
+const SEND_DEADLINE_MARGIN_MS = 30_000;
+/** How long new code waits for the transactions of code it replaced, when it cannot see them. */
+const PREDECESSOR_GRACE_MS = 3 * 60 * 1000;
 const ZERO_BYTES32 = `0x${"00".repeat(32)}`;
 
 /** The one key of a limit that applies to all callers together. */
@@ -224,6 +239,95 @@ class SimulationFailure extends Error {
 
 type Simulated = rpc.Api.SimulateTransactionSuccessResponse;
 
+/** A Stellar transaction that was handed to the network and whose outcome has not been learned. */
+interface PendingSend {
+  hash: string;
+  /** When the network stops accepting it, in milliseconds since the epoch. */
+  deadline: number;
+}
+
+/**
+ * What the server knows about an exit, by its Stellar transaction.
+ *
+ * `sending` is a reservation: it is written before the mint is sent and
+ * stays until the outcome is known, so a mint that may still land is never
+ * sent twice. `failed` is a mint that was included and reverted, and is not
+ * tried again. The other two are answers kept to save asking again.
+ */
+type Exit =
+  | { kind: "minted"; until: number; result: CompleteResult }
+  | { kind: "refused"; until: number; refusal: ApiError; message?: Hex; checkedAt: number }
+  | { kind: "sending"; until: number; message: Hex; hash?: Hex }
+  | { kind: "failed"; until: number; refusal: ApiError; message: Hex; checkedAt: number };
+
+/**
+ * Everything the relayer keeps between requests: the queues its two accounts
+ * send through, what it has spent and counted, and what it has in flight.
+ *
+ * It is kept apart from the code that uses it, so that replacing the code,
+ * as a development server does on every edit, leaves the guards standing:
+ * the same counts, the same budget, the same transactions on their way.
+ */
+export interface RelayerState {
+  readonly version: number;
+  readonly queue: Queue;
+  readonly evmQueue: Queue;
+  /** Fees of the relayer account over the last day, set aside before a transaction is signed. */
+  readonly fees: Budget;
+  readonly fundsPerCaller: Limiter;
+  readonly fundsPerOwner: Limiter;
+  readonly fundsOverall: Limiter;
+  readonly exitChecksPerCaller: Limiter;
+  readonly mintsPerCaller: Limiter;
+  readonly mintsOverall: Limiter;
+  readonly deployments: Map<string, Promise<string | undefined>>;
+  readonly deliveries: Map<string, Promise<DeliverResult>>;
+  readonly completions: Map<string, Promise<CompleteResult>>;
+  readonly delivered: Map<string, { until: number; result: DeliverResult }>;
+  readonly exits: Map<string, Exit>;
+  readonly sends: Map<string, PendingSend>;
+  /** Transactions on Base that were started and have neither succeeded nor failed yet. */
+  unsettled: number;
+  /**
+   * State of code this replaced without being able to take it over. Nothing
+   * is paid for until its transactions have settled, or, when that cannot be
+   * seen, until enough time has passed for them to have.
+   */
+  predecessor?: { inFlight?: () => number; until: number };
+  /** How many transactions are queued, on their way, or of unknown outcome. */
+  inFlight(): number;
+}
+
+export function createRelayerState(config: ServerConfig): RelayerState {
+  const state: RelayerState = {
+    version: STATE_VERSION,
+    queue: createQueue({ maxPending: MAX_QUEUED_TRANSACTIONS, timeoutMs: SEND_TIMEOUT_MS }),
+    evmQueue: createQueue({ maxPending: MAX_QUEUED_BURNS, timeoutMs: BURN_TIMEOUT_MS }),
+    fees: createBudget({ limit: config.maxDailyFees, windowMs: DAY_MS }),
+    fundsPerCaller: createLimiter({ limit: config.demoFund.perIpPerHour, windowMs: HOUR_MS }),
+    fundsPerOwner: createLimiter({ limit: config.demoFund.perOwnerPerDay, windowMs: DAY_MS }),
+    fundsOverall: createLimiter({ limit: config.demoFund.perDay, windowMs: DAY_MS, maxKeys: 1 }),
+    exitChecksPerCaller: createLimiter({ limit: EXIT_CHECKS_PER_CALLER_PER_HOUR, windowMs: HOUR_MS }),
+    mintsPerCaller: createLimiter({ limit: config.baseMints.perCallerPerHour, windowMs: HOUR_MS }),
+    mintsOverall: createLimiter({ limit: config.baseMints.perDay, windowMs: DAY_MS, maxKeys: 1 }),
+    deployments: new Map(),
+    deliveries: new Map(),
+    completions: new Map(),
+    delivered: new Map(),
+    exits: new Map(),
+    sends: new Map(),
+    unsettled: 0,
+    inFlight() {
+      const now = Date.now();
+      let waiting = state.queue.pending() + state.evmQueue.pending() + state.unsettled;
+      for (const send of state.sends.values()) if (send.deadline + SEND_DEADLINE_MARGIN_MS > now) waiting += 1;
+      for (const exit of state.exits.values()) if (exit.kind === "sending" && exit.until > now) waiting += 1;
+      return waiting;
+    },
+  };
+  return state;
+}
+
 /**
  * The fee-paying side of Paso.
  *
@@ -235,33 +339,49 @@ type Simulated = rpc.Api.SimulateTransactionSuccessResponse;
 export class Relayer {
   readonly address: string;
   private readonly server: rpc.Server;
-  private readonly queue: Queue = createQueue({ maxPending: MAX_QUEUED_TRANSACTIONS, timeoutMs: SEND_TIMEOUT_MS });
-  private readonly evmQueue: Queue = createQueue({ maxPending: MAX_QUEUED_BURNS, timeoutMs: BURN_TIMEOUT_MS });
-  private readonly deployments = new Map<string, Promise<string | undefined>>();
-  private readonly deliveries = new Map<string, Promise<DeliverResult>>();
-  private readonly delivered = new Map<string, DeliverResult>();
-  private readonly completions = new Map<string, Promise<CompleteResult>>();
-  /** What is known about an exit, by its transaction: its answer, or why the server cannot complete it. */
-  private readonly exits = new Map<string, { until: number; result?: CompleteResult; refusal?: ApiError }>();
-  private readonly exitChecksPerCaller = createLimiter({ limit: EXIT_CHECKS_PER_CALLER_PER_HOUR, windowMs: HOUR_MS });
+  private readonly queue: Queue;
+  private readonly evmQueue: Queue;
+  private readonly deployments: RelayerState["deployments"];
+  private readonly deliveries: RelayerState["deliveries"];
+  private readonly delivered: RelayerState["delivered"];
+  private readonly completions: RelayerState["completions"];
+  private readonly exits: RelayerState["exits"];
+  private readonly sends: RelayerState["sends"];
+  private readonly exitChecksPerCaller: Limiter;
   private readonly mintsPerCaller: Limiter;
   private readonly mintsOverall: Limiter;
-  /** Fees of the relayer account over the last day, counted when a transaction is signed. */
   private readonly fees: Budget;
   private readonly fundsPerCaller: Limiter;
   private readonly fundsPerOwner: Limiter;
   private readonly fundsOverall: Limiter;
   private healthReport?: { until: number; report: ReturnType<Relayer["readHealth"]> };
 
-  constructor(readonly config: ServerConfig) {
+  /**
+   * `state` is what the relayer keeps between requests. A relayer made on
+   * its own gets state of its own; the one a server process runs is handed
+   * the state of that process, which outlives it.
+   */
+  constructor(
+    readonly config: ServerConfig,
+    readonly state: RelayerState = createRelayerState(config),
+  ) {
     this.address = config.relayer.publicKey();
     this.server = new rpc.Server(config.network.stellar.rpcUrl, { timeout: RPC_TIMEOUT_MS });
-    this.fees = createBudget({ limit: config.maxDailyFees, windowMs: DAY_MS });
-    this.fundsPerCaller = createLimiter({ limit: config.demoFund.perIpPerHour, windowMs: HOUR_MS });
-    this.fundsPerOwner = createLimiter({ limit: config.demoFund.perOwnerPerDay, windowMs: DAY_MS });
-    this.fundsOverall = createLimiter({ limit: config.demoFund.perDay, windowMs: DAY_MS, maxKeys: 1 });
-    this.mintsPerCaller = createLimiter({ limit: config.baseMints.perCallerPerHour, windowMs: HOUR_MS });
-    this.mintsOverall = createLimiter({ limit: config.baseMints.perDay, windowMs: DAY_MS, maxKeys: 1 });
+    this.queue = state.queue;
+    this.evmQueue = state.evmQueue;
+    this.deployments = state.deployments;
+    this.deliveries = state.deliveries;
+    this.delivered = state.delivered;
+    this.completions = state.completions;
+    this.exits = state.exits;
+    this.sends = state.sends;
+    this.fees = state.fees;
+    this.fundsPerCaller = state.fundsPerCaller;
+    this.fundsPerOwner = state.fundsPerOwner;
+    this.fundsOverall = state.fundsOverall;
+    this.exitChecksPerCaller = state.exitChecksPerCaller;
+    this.mintsPerCaller = state.mintsPerCaller;
+    this.mintsOverall = state.mintsOverall;
   }
 
   /**
@@ -274,6 +394,11 @@ export class Relayer {
    */
   async relay(body: unknown): Promise<RelayResult> {
     const { signed, func, entry } = this.readRelayRequest(body);
+
+    // The same signed call, sent before with an outcome that was never learned: that is settled first, not sent again.
+    const key = `relay:${createHash("sha256").update(signed.entries[0] ?? "").digest("hex")}`;
+    const earlier = await this.settleSend(key);
+    if (earlier) return { hash: earlier };
 
     const { sequence } = await this.server.getLatestLedger();
     if (isExpired(signed, sequence)) {
@@ -288,7 +413,7 @@ export class Relayer {
 
     const operation = Operation.invokeHostFunction({ func, auth: [entry] });
     try {
-      const hash = await this.send(operation, (simulation) => assertNothingElseAuthorised(simulation, entry));
+      const hash = await this.send(key, operation, (simulation) => assertNothingElseAuthorised(simulation, entry));
       return deployHash ? { hash, deployHash } : { hash };
     } catch (error) {
       if (error instanceof SimulationFailure) {
@@ -320,7 +445,7 @@ export class Relayer {
     const key = `${sourceDomain}:${txHash.toLowerCase()}`;
 
     const known = this.delivered.get(key);
-    if (known) return known;
+    if (known && known.until > Date.now()) return known.result;
     const running = this.deliveries.get(key);
     if (running) return running;
     if (this.deliveries.size >= MAX_IN_FLIGHT) {
@@ -331,11 +456,12 @@ export class Relayer {
     this.deliveries.set(key, delivery);
     const result = await delivery;
     if (result.status === "delivered") {
+      // Kept to save asking again, and only while there is room: nothing rides on it, the chain is asked otherwise.
+      const now = Date.now();
       if (this.delivered.size >= REMEMBERED_DELIVERIES) {
-        const oldest = this.delivered.keys().next();
-        if (!oldest.done) this.delivered.delete(oldest.value);
+        for (const [burn, answer] of this.delivered) if (answer.until <= now) this.delivered.delete(burn);
       }
-      this.delivered.set(key, result);
+      if (this.delivered.size < REMEMBERED_DELIVERIES) this.delivered.set(key, { until: now + DAY_MS, result });
     }
     return result;
   }
@@ -370,11 +496,6 @@ export class Relayer {
       throw new ApiError("unavailable", "The server has no account on Base to submit the mint from");
     }
 
-    const known = this.exits.get(txHash);
-    if (known && known.until > Date.now()) {
-      if (known.refusal) throw known.refusal;
-      if (known.result) return known.result;
-    }
     // One look per exit at a time: requests that arrive together share it, and its answer.
     const running = this.completions.get(txHash);
     if (running) return running;
@@ -382,11 +503,18 @@ export class Relayer {
       throw new ApiError("unavailable", "The relayer is busy; try again in a moment");
     }
 
-    const completion = this.completeOnce(txHash, caller).finally(() => this.completions.delete(txHash));
+    const completion = (async () => {
+      const known = this.exits.get(txHash);
+      if (known && known.until > Date.now()) return this.knownExit(txHash, known);
+      if (known) this.exits.delete(txHash);
+      const result = await this.completeOnce(txHash, caller);
+      if (result.status === "minted" && this.exits.get(txHash)?.kind !== "minted") {
+        this.rememberExit(txHash, { kind: "minted", until: Date.now() + DAY_MS, result });
+      }
+      return result;
+    })().finally(() => this.completions.delete(txHash));
     this.completions.set(txHash, completion);
-    const result = await completion;
-    if (result.status === "minted") this.rememberExit(txHash, { result });
-    return result;
+    return completion;
   }
 
   /**
@@ -411,6 +539,7 @@ export class Relayer {
     const owner = this.readOwner(body);
     const ownerKey = owner.toLowerCase();
 
+    this.assertPredecessorSettled();
     // Asked before anything is counted: an empty faucet costs nobody an attempt.
     await this.assertFaucetFunded(payer.address);
 
@@ -442,7 +571,7 @@ export class Relayer {
     }
 
     try {
-      return await this.queued(this.evmQueue, (signal) => this.burnForDemo(owner, payer.address, signal));
+      return await this.queued(this.evmQueue, (signal) => this.unsettled(this.burnForDemo(owner, payer.address, signal)));
     } catch (error) {
       if (error instanceof ApiError) throw error;
       // The cause stays in the log: a transport error can quote the endpoint it failed to reach.
@@ -643,7 +772,7 @@ export class Relayer {
     const deployment = (async () => {
       if (await isDeployed(owner, network, this.server)) return undefined;
       try {
-        return await this.send(deployOperation(owner, network), assertNoAuthorisation);
+        return await this.send(`deploy:${key}`, deployOperation(owner, network), assertNoAuthorisation);
       } catch (error) {
         if (error instanceof SimulationFailure) {
           throw new ApiError("unavailable", `The account could not be deployed: ${summary(error.diagnostic)}`);
@@ -684,7 +813,7 @@ export class Relayer {
     // Built here from the attested bytes: the caller of the route supplies a hash, never a transaction.
     const operation = deliverOperation({ message, attestation: attestation.attestation, caller: this.address }, network);
     try {
-      const hash = await this.send(operation, (simulation) => assertOnlyCalledByRelayer(simulation, operation));
+      const hash = await this.send(`deliver:${nonce}`, operation, (simulation) => assertOnlyCalledByRelayer(simulation, operation));
       return { status: "delivered", hash, route };
     } catch (error) {
       if (error instanceof SimulationFailure) {
@@ -701,20 +830,127 @@ export class Relayer {
     }
   }
 
-  private rememberExit(txHash: string, answer: { result?: CompleteResult; refusal?: ApiError }, forMs = Infinity): void {
-    this.exits.delete(txHash);
-    if (this.exits.size >= REMEMBERED_EXITS) {
-      const oldest = this.exits.keys().next();
-      if (!oldest.done) this.exits.delete(oldest.value);
-    }
-    this.exits.set(txHash, { ...answer, until: Date.now() + forMs });
+  /** Whether the table of exits can take one more. Entries whose time is up are cleared first; none that stands is dropped. */
+  private exitRoom(txHash: string): boolean {
+    if (this.exits.has(txHash) || this.exits.size < MAX_EXITS) return true;
+    const now = Date.now();
+    for (const [key, exit] of this.exits) if (exit.until <= now) this.exits.delete(key);
+    return this.exits.size < MAX_EXITS;
   }
 
-  /** A refusal that will hold for this exit however often it is asked about, remembered so that it is not worked out again. */
-  private refuseExit(txHash: string, code: "bad_request" | "simulation_failed" | "unavailable", detail: string, forMs = Infinity) {
+  /** Keeps an answer for an exit while there is room. An answer that is not kept is worked out again, nothing more. */
+  private rememberExit(txHash: string, exit: Exit): void {
+    if (this.exitRoom(txHash)) this.exits.set(txHash, exit);
+  }
+
+  /**
+   * A refusal that holds for this exit however often it is asked about,
+   * remembered so that it is not worked out again. With the message, it is
+   * checked against Base now and then: someone else may mint what the
+   * server would not.
+   */
+  private refuseExit(
+    txHash: string,
+    code: "bad_request" | "simulation_failed",
+    detail: string,
+    forMs: number = DAY_MS,
+    message?: Hex,
+  ): ApiError {
     const refusal = new ApiError(code, detail);
-    this.rememberExit(txHash, { refusal }, forMs);
+    const now = Date.now();
+    this.rememberExit(txHash, { kind: "refused", until: now + forMs, refusal, message, checkedAt: now });
     return refusal;
+  }
+
+  /**
+   * The answer for an exit the server already knows about. A mint that was
+   * sent and not seen to land is looked for; a refusal is checked against
+   * Base again from time to time; nothing here ever sends.
+   */
+  private async knownExit(txHash: string, exit: Exit): Promise<CompleteResult> {
+    if (exit.kind === "minted") return exit.result;
+    if (exit.kind === "sending") return this.settleMint(txHash, exit);
+
+    const now = Date.now();
+    if (exit.message && now - exit.checkedAt >= RECHECK_MS) {
+      exit.checkedAt = now;
+      const { publicClient } = this.evmClients();
+      const received = await isReceivedOnEvm(publicClient, exit.message, this.config.network).catch(() => false);
+      if (received) {
+        const result: CompleteResult = { status: "minted" };
+        this.exits.set(txHash, { kind: "minted", until: now + DAY_MS, result });
+        return result;
+      }
+    }
+    throw exit.refusal;
+  }
+
+  /**
+   * What became of a mint that was sent without its outcome being seen.
+   * Base is asked for the transaction and for the message's nonce. Until one
+   * of them says so, the mint counts as still on its way: it is not sent
+   * again.
+   */
+  private async settleMint(txHash: string, exit: Extract<Exit, { kind: "sending" }>): Promise<CompleteResult> {
+    const { network } = this.config;
+    const { chain } = network.evm;
+    const { publicClient } = this.evmClients();
+    const now = Date.now();
+    try {
+      const receipt = exit.hash
+        ? await publicClient.getTransactionReceipt({ hash: exit.hash }).catch(() => undefined)
+        : undefined;
+      if (await isReceivedOnEvm(publicClient, exit.message, network)) {
+        const result: CompleteResult =
+          receipt?.status === "success" && exit.hash ? { status: "minted", hash: exit.hash } : { status: "minted" };
+        this.exits.set(txHash, { kind: "minted", until: now + DAY_MS, result });
+        return result;
+      }
+      if (receipt?.status === "reverted") throw this.failExit(txHash, exit.message);
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+    }
+    throw new ApiError("unavailable", `The mint was sent and ${chain.name} has not confirmed it yet; ask again in a moment`);
+  }
+
+  /** Records a mint that was included and reverted. It is not sent again. */
+  private failExit(txHash: string, message: Hex): ApiError {
+    const refusal = new ApiError(
+      "simulation_failed",
+      `The mint was included on ${this.config.network.evm.chain.name} and reverted; the server will not send it again, submit it from your own wallet`,
+    );
+    const now = Date.now();
+    this.exits.set(txHash, { kind: "failed", until: now + DAY_MS, refusal, message, checkedAt: now });
+    return refusal;
+  }
+
+  /** Counts a transaction on Base as unsettled from now until it has succeeded or failed, however long that takes. */
+  private unsettled<T>(transaction: Promise<T>): Promise<T> {
+    this.state.unsettled += 1;
+    const settle = () => {
+      this.state.unsettled -= 1;
+    };
+    transaction.then(settle, settle);
+    return transaction;
+  }
+
+  /**
+   * Refuses to pay for anything while transactions sent by code this
+   * replaced may still be on their way and cannot be accounted for here.
+   */
+  private assertPredecessorSettled(): void {
+    const { predecessor } = this.state;
+    if (!predecessor) return;
+    let waiting = 1;
+    try {
+      if (typeof predecessor.inFlight === "function") waiting = predecessor.inFlight();
+    } catch {
+      waiting = 1;
+    }
+    if (waiting > 0 && Date.now() < predecessor.until) {
+      throw new ApiError("unavailable", "The relayer was restarted with transactions on their way; try again in a moment");
+    }
+    delete this.state.predecessor;
   }
 
   /**
@@ -831,7 +1067,7 @@ export class Relayer {
 
     const reason = this.unmintable(burn, payer);
     if (reason) {
-      throw this.refuseExit(txHash, "simulation_failed", `The server cannot complete this exit: ${reason}`);
+      throw this.refuseExit(txHash, "simulation_failed", `The server cannot complete this exit: ${reason}`, DAY_MS, message);
     }
     if (burn.expirationBlock !== BigInt(0) && burn.expirationBlock <= block) {
       // Circle can attest an expired exit anew, which makes it a different message: not remembered for long.
@@ -840,6 +1076,7 @@ export class Relayer {
         "simulation_failed",
         `The server cannot complete this exit: its attestation expired at block ${burn.expirationBlock} of ${evm.chain.name}`,
         SHORT_MEMORY_MS,
+        message,
       );
     }
     if (held < baseMints.payerEthFloor) {
@@ -866,10 +1103,17 @@ export class Relayer {
         "simulation_failed",
         `The server cannot complete this exit: the mint would revert on ${evm.chain.name}${reverted ? ` (${reverted})` : ""}`,
         SHORT_MEMORY_MS,
+        message,
       );
     }
     if (gas > MINT_GAS_LIMIT) {
-      throw this.refuseExit(txHash, "simulation_failed", "The server cannot complete this exit: its mint needs more gas than the server pays for");
+      throw this.refuseExit(
+        txHash,
+        "simulation_failed",
+        "The server cannot complete this exit: its mint needs more gas than the server pays for",
+        DAY_MS,
+        message,
+      );
     }
     if (fees.maxFeePerGas > baseMints.maxFeePerGas) {
       throw new ApiError("unavailable", `Gas on ${evm.chain.name} costs more right now than the server pays; try again later`);
@@ -878,56 +1122,69 @@ export class Relayer {
     const gasLimit = padded > MINT_GAS_LIMIT ? MINT_GAS_LIMIT : padded;
 
     // Only the send itself goes through the queue the account's transactions share; looking does not hold it up.
+    const busy = () => new ApiError("unavailable", "The relayer is busy; try again in a moment");
     const attempt = { submitted: false };
     try {
       const sent = await this.evmQueue(async (signal) => {
         assertStillWanted(signal);
+        this.assertPredecessorSettled();
         if (await isReceivedOnEvm(publicClient, message, network)) return { alreadyReceived: true, hash: undefined };
-        // A mint is counted, against the caller and against the day, when it is about to be submitted and not before.
-        this.countMint(caller);
+        // Without room to write the reservation down there is no send: a mint is never on its way unrecorded.
+        if (!this.exitRoom(txHash)) throw busy();
         assertStillWanted(signal);
+        // Counted against the caller and against the day, and reserved for this exit, before it is sent.
+        this.countMint(caller);
+        const reservation: Extract<Exit, { kind: "sending" }> = { kind: "sending", until: Date.now() + DAY_MS, message };
+        this.exits.set(txHash, reservation);
         attempt.submitted = true;
-        return receiveMessageOnEvm({
-          walletClient,
-          publicClient,
-          message,
-          attestation: attestation.attestation,
-          network,
-          gas: gasLimit,
-          maxFeePerGas: fees.maxFeePerGas,
-          maxPriorityFeePerGas: fees.maxPriorityFeePerGas < fees.maxFeePerGas ? fees.maxPriorityFeePerGas : fees.maxFeePerGas,
-          confirmations: MINT_CONFIRMATIONS,
-        });
+
+        const mint = this.unsettled(
+          receiveMessageOnEvm({
+            walletClient,
+            publicClient,
+            message,
+            attestation: attestation.attestation,
+            network,
+            gas: gasLimit,
+            maxFeePerGas: fees.maxFeePerGas,
+            maxPriorityFeePerGas: fees.maxPriorityFeePerGas < fees.maxFeePerGas ? fees.maxPriorityFeePerGas : fees.maxFeePerGas,
+            confirmations: MINT_CONFIRMATIONS,
+            onSubmitted: (hash) => {
+              reservation.hash = hash;
+            },
+          }),
+        );
+        // The reservation is settled by the transaction's own outcome, whenever that comes, and not by whether
+        // anyone is still waiting for it: a known success or a known revert ends it, anything else leaves it standing.
+        mint.then(
+          (done) => {
+            const result: CompleteResult = done.hash ? { status: "minted", hash: done.hash } : { status: "minted" };
+            this.exits.set(txHash, { kind: "minted", until: Date.now() + DAY_MS, result });
+          },
+          (error: unknown) => {
+            if (error instanceof TransactionRevertedError) this.failExit(txHash, message);
+          },
+        );
+        return mint;
       });
       return sent.hash ? { status: "minted", hash: sent.hash } : { status: "minted" };
     } catch (error) {
       if (!attempt.submitted) {
         if (error instanceof ApiError) throw error;
-        if (error instanceof QueueFullError) {
-          throw new ApiError("unavailable", "The relayer is busy; try again in a moment");
-        }
+        if (error instanceof QueueFullError) throw busy();
         if (error instanceof QueueTimeoutError) {
           throw new ApiError("unavailable", "The network took too long to answer; try again in a moment");
         }
         throw unreachable();
       }
-      // Submitted, or on its way. Whatever became of it, the server does not send it again by itself.
-      if (error instanceof QueueTimeoutError) {
-        throw this.refuseExit(
-          txHash,
-          "unavailable",
-          `The mint was sent and ${evm.chain.name} has not confirmed it yet; ask again in a couple of minutes`,
-          UNCONFIRMED_MEMORY_MS,
-        );
+      const now = this.exits.get(txHash);
+      if (now?.kind === "failed") throw now.refusal;
+      // Sent, or possibly sent, with no outcome to show for it: it stays reserved, and is not sent again.
+      if (!(error instanceof QueueTimeoutError)) {
+        // The cause stays in the log: a transport error can quote the endpoint it failed to reach.
+        console.error("Mint on Base unconfirmed:", error instanceof Error ? error.name : "unknown error");
       }
-      // The cause stays in the log: a transport error can quote the endpoint it failed to reach.
-      console.error("Mint on Base failed:", error instanceof Error ? error.name : "unknown error");
-      throw this.refuseExit(
-        txHash,
-        "simulation_failed",
-        `The mint did not go through on ${evm.chain.name} and the server will not send it again; submit it from your own wallet`,
-        HOUR_MS,
-      );
+      throw new ApiError("unavailable", `The mint was sent and ${evm.chain.name} has not confirmed it yet; ask again in a moment`);
     }
   }
 
@@ -1128,24 +1385,86 @@ export class Relayer {
   }
 
   /**
+   * What became of a transaction that was handed to the network under `key`
+   * without its outcome being learned. Returns its hash when it was applied,
+   * and nothing when there is no such transaction or it can no longer be
+   * included. While it may still land, the answer is a refusal: the same
+   * thing is not sent twice.
+   */
+  private async settleSend(key: string): Promise<string | undefined> {
+    const pending = this.sends.get(key);
+    if (!pending) return undefined;
+
+    let status: rpc.Api.GetTransactionStatus;
+    try {
+      ({ status } = await this.server.getTransaction(pending.hash));
+    } catch {
+      throw new ApiError(
+        "unavailable",
+        `Transaction ${pending.hash} is on its way and the network cannot be asked about it; try again in a moment`,
+        { hash: pending.hash },
+      );
+    }
+    if (status === rpc.Api.GetTransactionStatus.SUCCESS) {
+      this.sends.delete(key);
+      return pending.hash;
+    }
+    if (status === rpc.Api.GetTransactionStatus.FAILED) {
+      this.sends.delete(key);
+      throw new ApiError("transaction_failed", `Transaction ${pending.hash} was included and failed`, { hash: pending.hash });
+    }
+    // Not seen. Past its time bound the network no longer takes it; until then it may still land.
+    if (Date.now() > pending.deadline + SEND_DEADLINE_MARGIN_MS) {
+      this.sends.delete(key);
+      return undefined;
+    }
+    throw new ApiError("unavailable", `Transaction ${pending.hash} is on its way; ask again in a moment`, { hash: pending.hash });
+  }
+
+  /** Refuses new sends while the table of transactions on their way is full of ones that may still land. */
+  private assertSendRoom(key: string): void {
+    if (this.sends.has(key) || this.sends.size < MAX_PENDING_SENDS) return;
+    const now = Date.now();
+    for (const [other, send] of this.sends) {
+      if (now > send.deadline + SEND_DEADLINE_MARGIN_MS) this.sends.delete(other);
+    }
+    if (this.sends.size >= MAX_PENDING_SENDS) {
+      throw new ApiError("unavailable", "The relayer is waiting on too many transactions; try again in a moment");
+    }
+  }
+
+  /**
    * Sends one operation in a transaction of the relayer account and waits
    * for it to be applied.
    *
    * Everything from reading the sequence number to the confirmation happens
    * inside the queue, one transaction at a time. The operation is simulated
    * there with the ledger as it is at that moment, `inspect` gets a say on
-   * that simulation, and the fee is checked against the cap and the day's
-   * budget before anything is signed. A transaction refused for a stale
-   * sequence number, which happens when another server instance used the
-   * account in between, is rebuilt and sent once more.
+   * that simulation, and the fee is checked against the cap and set aside
+   * from the day's budget before anything is signed. A transaction refused
+   * for a stale sequence number, which happens when another server instance
+   * used the account in between, is rebuilt and sent once more.
+   *
+   * `key` names what is being sent. The transaction is recorded under it
+   * before it goes out and the record is cleared only by a known outcome:
+   * applied, failed, or refused by the network. When the outcome is not
+   * learned, because the network stopped answering or the wait ran out, the
+   * record stands, and the same key is not sent again until the first
+   * transaction has been seen or can no longer be included.
    */
-  private send(operation: xdr.Operation, inspect: (simulation: Simulated) => void): Promise<string> {
+  private send(key: string, operation: xdr.Operation, inspect: (simulation: Simulated) => void): Promise<string> {
     return this.queued(this.queue, async (signal) => {
+      assertStillWanted(signal);
+      this.assertPredecessorSettled();
+      const earlier = await this.settleSend(key);
+      if (earlier) return earlier;
+
       let staleSequences = 0;
       let busy = 0;
       let setAside = BigInt(0);
       for (;;) {
         assertStillWanted(signal);
+        this.assertSendRoom(key);
         const account = await this.server.getAccount(this.address);
         const tx = this.transaction(account, operation);
 
@@ -1162,18 +1481,37 @@ export class Relayer {
         inspect(simulation);
 
         const ready = rpc.assembleTransaction(tx, simulation).build();
-        setAside = this.setAsideFee(simulation, ready.fee, setAside);
         // The queue may have given up on this transaction while the network was answering.
         assertStillWanted(signal);
+        setAside = this.setAsideFee(simulation, ready.fee, setAside);
         ready.sign(this.config.relayer);
-        const sent = await this.server.sendTransaction(ready);
+        const hash = Buffer.from(ready.hash()).toString("hex");
+        const maxTime = Number(ready.timeBounds?.maxTime ?? 0) * 1000;
+        this.sends.set(key, { hash, deadline: maxTime || Date.now() + TRANSACTION_TIMEOUT_SECONDS * 1000 });
 
-        if (sent.status === "TRY_AGAIN_LATER" && busy < BUSY_RETRIES) {
-          busy += 1;
-          await sleep(BUSY_WAIT_MS);
-          continue;
+        let sent: rpc.Api.SendTransactionResponse;
+        try {
+          sent = await this.server.sendTransaction(ready);
+        } catch {
+          // No answer is not a no: the transaction may have been taken.
+          throw new ApiError(
+            "unavailable",
+            `Transaction ${hash} was sent and the network did not say whether it took it; ask again in a moment`,
+            { hash },
+          );
         }
-        if (sent.status === "ERROR") {
+
+        if (sent.status === "TRY_AGAIN_LATER" || sent.status === "ERROR") {
+          // Not taken: nothing is on its way.
+          this.sends.delete(key);
+          if (sent.status === "TRY_AGAIN_LATER") {
+            if (busy < BUSY_RETRIES) {
+              busy += 1;
+              await sleep(BUSY_WAIT_MS);
+              continue;
+            }
+            throw new ApiError("unavailable", "The network is busy; try again in a moment");
+          }
           const reason = sent.errorResult?.result.type ?? "unknown";
           if (reason === "txBadSeq" && staleSequences === 0) {
             staleSequences += 1;
@@ -1181,22 +1519,26 @@ export class Relayer {
           }
           throw new ApiError("unavailable", `The network did not take the transaction (${reason})`);
         }
-        if (sent.status !== "PENDING" && sent.status !== "DUPLICATE") {
-          throw new ApiError("unavailable", "The network is busy; try again in a moment");
-        }
 
-        const result = await this.server.pollTransaction(sent.hash, {
-          attempts: CONFIRMATION_ATTEMPTS,
-          sleepStrategy: rpc.BasicSleepStrategy,
-        });
-        if (result.status === rpc.Api.GetTransactionStatus.SUCCESS) return sent.hash;
-        if (result.status === rpc.Api.GetTransactionStatus.FAILED) {
-          throw new ApiError("transaction_failed", `Transaction ${sent.hash} was included and failed`, {
-            hash: sent.hash,
-          });
+        let status: rpc.Api.GetTransactionStatus | undefined;
+        try {
+          ({ status } = await this.server.pollTransaction(hash, {
+            attempts: CONFIRMATION_ATTEMPTS,
+            sleepStrategy: rpc.BasicSleepStrategy,
+          }));
+        } catch {
+          status = undefined;
         }
-        throw new ApiError("unavailable", `Transaction ${sent.hash} was sent and has not been confirmed yet`, {
-          hash: sent.hash,
+        if (status === rpc.Api.GetTransactionStatus.SUCCESS) {
+          this.sends.delete(key);
+          return hash;
+        }
+        if (status === rpc.Api.GetTransactionStatus.FAILED) {
+          this.sends.delete(key);
+          throw new ApiError("transaction_failed", `Transaction ${hash} was included and failed`, { hash });
+        }
+        throw new ApiError("unavailable", `Transaction ${hash} was sent and has not been confirmed yet; ask again in a moment`, {
+          hash,
         });
       }
     });
@@ -1265,7 +1607,26 @@ function assertOnlyCalledByRelayer(simulation: Simulated, operation: xdr.Operati
   }
 }
 
-const globalForRelayer = globalThis as typeof globalThis & { pasoRelayer?: Relayer };
+const globalForRelayer = globalThis as typeof globalThis & { pasoRelayer?: Relayer; pasoRelayerState?: unknown };
+
+/**
+ * The state the relayer of this process works with: the one already there
+ * when it is of this code's making, a new one otherwise. A state this code
+ * cannot read is not thrown away unseen. It becomes the predecessor of the
+ * new one, which pays for nothing until the old one's transactions are done.
+ */
+function processState(config: ServerConfig): RelayerState {
+  const existing = globalForRelayer.pasoRelayerState as Partial<RelayerState> | undefined;
+  if (existing && existing.version === STATE_VERSION) return existing as RelayerState;
+
+  const state = createRelayerState(config);
+  if (existing) {
+    const inFlight = typeof existing.inFlight === "function" ? existing.inFlight.bind(existing) : undefined;
+    state.predecessor = { inFlight, until: Date.now() + (inFlight ? HOUR_MS : PREDECESSOR_GRACE_MS) };
+  }
+  globalForRelayer.pasoRelayerState = state;
+  return state;
+}
 
 /**
  * The relayer of this server process, created from the environment on first
@@ -1274,14 +1635,16 @@ const globalForRelayer = globalThis as typeof globalThis & { pasoRelayer?: Relay
  *
  * While developing, an edit replaces this module, and an instance made from
  * the module it replaced would go on running the old code: it is recognised
- * by its class and made anew.
+ * by its class and made anew. Its state is not: the new instance takes over
+ * the counts, the budget and the transactions on their way.
  */
 export function getRelayer(): Relayer {
   const existing = globalForRelayer.pasoRelayer;
   const usable = process.env.NODE_ENV === "production" ? existing !== undefined : existing instanceof Relayer;
   if (existing && usable) return existing;
 
-  const relayer = new Relayer(loadConfig());
+  const config = loadConfig();
+  const relayer = new Relayer(config, processState(config));
   globalForRelayer.pasoRelayer = relayer;
   return relayer;
 }

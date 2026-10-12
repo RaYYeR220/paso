@@ -89,10 +89,19 @@ function limitersFor(route: Route) {
   };
 }
 
-const limiters = Object.fromEntries((Object.keys(LIMITS) as Route[]).map((route) => [route, limitersFor(route)])) as Record<
-  Route,
-  ReturnType<typeof limitersFor>
->;
+type RouteLimiters = Record<Route, ReturnType<typeof limitersFor>>;
+
+const globalForLimits = globalThis as typeof globalThis & { pasoRouteLimiters?: Partial<RouteLimiters> };
+
+/**
+ * The counts live with the process, not with this module: replacing the
+ * module, as a development server does on every edit, does not start them
+ * over. A route this code adds gets its limiters when it is first asked for.
+ */
+function limitersOf(route: Route): ReturnType<typeof limitersFor> {
+  const all = (globalForLimits.pasoRouteLimiters ??= {});
+  return (all[route] ??= limitersFor(route));
+}
 
 /**
  * Counts a request against its caller and against the route as a whole, or
@@ -100,7 +109,7 @@ const limiters = Object.fromEntries((Object.keys(LIMITS) as Route[]).map((route)
  * request uses up nothing; a counted one is never given back.
  */
 export function limit(route: Route, request: Request): void {
-  const { perCaller, overall } = limiters[route];
+  const { perCaller, overall } = limitersOf(route);
   const caller = clientIdentity(request);
   for (const allowance of [perCaller.check(caller), overall.check(EVERYONE)]) {
     if (!allowance.ok) {

@@ -1,7 +1,13 @@
 import { StrKey } from "@stellar/stellar-sdk";
 import type { Hex, PublicClient, WalletClient } from "viem";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { forwardRecipientHookData, fundFromEvm, isReceivedOnEvm, receiveMessageOnEvm } from "../src/evm";
+import {
+  forwardRecipientHookData,
+  fundFromEvm,
+  isReceivedOnEvm,
+  receiveMessageOnEvm,
+  TransactionRevertedError,
+} from "../src/evm";
 import { twinAddress } from "../src/twin";
 import { hex, OWNER, testNetwork } from "./helpers";
 
@@ -283,7 +289,23 @@ describe("receiveMessageOnEvm", () => {
     await expect(receiveMessageOnEvm(refused.args)).rejects.toThrow("insufficient funds for gas");
 
     const reverted = base({ status: "reverted" });
-    await expect(receiveMessageOnEvm(reverted.args)).rejects.toThrow(/mint reverted on Base/);
+    const failure = await receiveMessageOnEvm(reverted.args).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(TransactionRevertedError);
+    expect((failure as TransactionRevertedError).hash).toBe(MINT_HASH);
+    expect((failure as Error).message).toMatch(/mint reverted on Base/);
+  });
+
+  it("reports the hash as soon as the call is sent, before it is confirmed", async () => {
+    const order: string[] = [];
+    const { args, publicClient } = base();
+    publicClient.waitForTransactionReceipt.mockImplementation(async () => {
+      order.push("confirmed");
+      return { status: "success" };
+    });
+
+    await receiveMessageOnEvm({ ...args, onSubmitted: (hash) => order.push(`submitted ${hash}`) });
+
+    expect(order).toEqual([`submitted ${MINT_HASH}`, "confirmed"]);
   });
 
   it("needs a wallet with an account", async () => {
