@@ -9,9 +9,11 @@ import {
   formatEvmAmount,
   fundFromEvm,
   inboundRouteOf,
+  isReceivedOnEvm,
   isDeployed,
   isExpired,
   readContract,
+  receiveMessageOnEvm,
   signedFromRelayRequest,
   simulateSigned,
   SimulationError,
@@ -20,7 +22,7 @@ import {
   type RelayResult,
   type Signed,
 } from "@paso/sdk";
-import { Account, Operation, rpc, TransactionBuilder, xdr } from "@stellar/stellar-sdk";
+import { Account, Operation, rpc, StrKey, TransactionBuilder, xdr } from "@stellar/stellar-sdk";
 import {
   createPublicClient,
   createWalletClient,
@@ -30,6 +32,7 @@ import {
   http,
   isAddress,
   size,
+  toHex,
   type Address,
   type Hex,
 } from "viem";
@@ -103,6 +106,18 @@ export type DeliverResult =
       /** The delivering transaction, when this relayer sent it. Absent when someone else delivered first. */
       hash?: string;
       route: InboundRoute;
+    };
+
+export type CompleteResult =
+  | {
+      status: "pending";
+      /** What Circle's attestation service said: not indexed yet, or waiting for finality. */
+      attestation: "not_found" | "pending";
+    }
+  | {
+      status: "minted";
+      /** The minting transaction on Base, when this server sent it. Absent when the message had been received before. */
+      hash?: Hex;
     };
 
 export interface DeployResult {
@@ -201,6 +216,10 @@ export class Relayer {
   private readonly deployments = new Map<string, Promise<string | undefined>>();
   private readonly deliveries = new Map<string, Promise<DeliverResult>>();
   private readonly delivered = new Map<string, DeliverResult>();
+  private readonly completions = new Map<string, Promise<CompleteResult>>();
+  private readonly completed = new Map<string, CompleteResult>();
+  private readonly mintsPerCaller: Limiter;
+  private readonly mintsOverall: Limiter;
   /** Fees of the relayer account over the last day, counted when a transaction is signed. */
   private readonly fees: Budget;
   private readonly fundsPerCaller: Limiter;
@@ -215,6 +234,8 @@ export class Relayer {
     this.fundsPerCaller = createLimiter({ limit: config.demoFund.perIpPerHour, windowMs: HOUR_MS });
     this.fundsPerOwner = createLimiter({ limit: config.demoFund.perOwnerPerDay, windowMs: DAY_MS });
     this.fundsOverall = createLimiter({ limit: config.demoFund.perDay, windowMs: DAY_MS, maxKeys: 1 });
+    this.mintsPerCaller = createLimiter({ limit: config.baseMints.perCallerPerHour, windowMs: HOUR_MS });
+    this.mintsOverall = createLimiter({ limit: config.baseMints.perDay, windowMs: DAY_MS, maxKeys: 1 });
   }
 
   /**
@@ -289,6 +310,53 @@ export class Relayer {
         if (!oldest.done) this.delivered.delete(oldest.value);
       }
       this.delivered.set(key, result);
+    }
+    return result;
+  }
+
+  /**
+   * Finishes a transfer back to Base: looks the exit up at Circle's
+   * attestation service, once, and when it is attested has the server's
+   * account on Base hand the message to Circle's MessageTransmitter, which
+   * mints the USDC to the recipient the message names.
+   *
+   * The server pays the gas and decides nothing else. The call is built from
+   * what Circle returned for the transaction, never from bytes a caller
+   * sent, and only for an exit made through the hub, from Stellar to Base. A
+   * message that has been received already counts as minted. How many mints
+   * the server pays for is limited per caller and per day; an attempt counts
+   * once it starts, whatever becomes of it.
+   */
+  async complete(body: unknown, caller: string): Promise<CompleteResult> {
+    const txHash = this.readExit(body);
+    const { baseMints, payer } = this.config;
+    if (!baseMints.enabled) {
+      throw new ApiError(
+        "not_found",
+        "This server does not pay for mints on Base on this network; submit the mint from your own wallet",
+      );
+    }
+    if (!payer) {
+      throw new ApiError("unavailable", "The server has no account on Base to submit the mint from");
+    }
+
+    const known = this.completed.get(txHash);
+    if (known) return known;
+    const running = this.completions.get(txHash);
+    if (running) return running;
+    if (this.completions.size >= MAX_IN_FLIGHT) {
+      throw new ApiError("unavailable", "The relayer is busy; try again in a moment");
+    }
+
+    const completion = this.completeOnce(txHash, caller).finally(() => this.completions.delete(txHash));
+    this.completions.set(txHash, completion);
+    const result = await completion;
+    if (result.status === "minted") {
+      if (this.completed.size >= REMEMBERED_DELIVERIES) {
+        const oldest = this.completed.keys().next();
+        if (!oldest.done) this.completed.delete(oldest.value);
+      }
+      this.completed.set(txHash, result);
     }
     return result;
   }
@@ -484,6 +552,19 @@ export class Relayer {
     return { sourceDomain: domain, txHash: txHash as Hex };
   }
 
+  /** The Stellar transaction of an exit: 64 hex digits, the form Circle indexes it under. */
+  private readExit(body: unknown): string {
+    if (!isRecord(body)) {
+      throw new ApiError("bad_request", "Expected a JSON object with network and txHash");
+    }
+    this.assertNetwork(body.network, true);
+    const { txHash } = body;
+    if (typeof txHash !== "string" || !/^[0-9a-fA-F]{64}$/.test(txHash)) {
+      throw new ApiError("bad_request", "txHash must be the Stellar transaction of the exit (64 hex digits, no 0x)");
+    }
+    return txHash.toLowerCase();
+  }
+
   /**
    * Checks, without submitting, that the account accepts the signature for
    * this call and that the call needs that authorisation and no other.
@@ -548,12 +629,7 @@ export class Relayer {
 
   private async deliverOnce(sourceDomain: number, txHash: Hex): Promise<DeliverResult> {
     const { network } = this.config;
-    // Circle's service gets a bounded time to answer; no answer in time is "ask again", like any other outage.
-    const patience = new AbortController();
-    const timer = setTimeout(() => patience.abort(), IRIS_TIMEOUT_MS);
-    const { status, attestation } = await fetchAttestation(sourceDomain, txHash, network, { signal: patience.signal })
-      .catch(() => ({ status: { state: "unreachable" as const }, attestation: undefined }))
-      .finally(() => clearTimeout(timer));
+    const { status, attestation } = await this.lookUp(sourceDomain, txHash);
     if (!attestation) {
       if (status.state === "pending" && status.delayReason) {
         return { status: "pending", attestation: "pending", delayReason: status.delayReason };
@@ -595,6 +671,99 @@ export class Relayer {
       }
       throw error;
     }
+  }
+
+  private async completeOnce(txHash: string, caller: string): Promise<CompleteResult> {
+    const { network, baseMints } = this.config;
+    const { stellar, evm } = network;
+    const { status, attestation } = await this.lookUp(stellar.cctpDomain, txHash);
+    if (!attestation) {
+      return { status: "pending", attestation: status.state === "not_found" ? "not_found" : "pending" };
+    }
+
+    const { message } = attestation;
+    if (size(message) > MAX_MESSAGE_BYTES || size(attestation.attestation) > MAX_ATTESTATION_BYTES) {
+      throw new ApiError("bad_request", "That transaction carries a message too large to be a USDC transfer");
+    }
+    let burn: ReturnType<typeof decodeBurnMessage>;
+    try {
+      burn = decodeBurnMessage(message);
+    } catch {
+      throw new ApiError("bad_request", "That transaction does not carry a USDC transfer");
+    }
+    if (burn.sourceDomain !== stellar.cctpDomain || burn.destinationDomain !== evm.cctpDomain) {
+      throw new ApiError(
+        "bad_request",
+        `That transfer goes from CCTP domain ${burn.sourceDomain} to ${burn.destinationDomain}, not from Stellar to ${evm.chain.name}`,
+      );
+    }
+    if (!stellar.hub || burn.messageSender !== toHex(StrKey.decodeContract(stellar.hub))) {
+      throw new ApiError("bad_request", "That transfer was not sent through the hub; the server completes exits from Paso accounts only");
+    }
+
+    const { publicClient, walletClient } = this.evmClients();
+    if (!walletClient) {
+      throw new ApiError("unavailable", "The server has no account on Base to submit the mint from");
+    }
+    const payer = walletClient.account.address;
+    let received: boolean;
+    let gas: bigint;
+    try {
+      [received, gas] = await Promise.all([
+        isReceivedOnEvm(publicClient, message, network),
+        publicClient.getBalance({ address: payer }),
+      ]);
+    } catch {
+      throw new ApiError("unavailable", `The server could not reach ${evm.chain.name}; try again later`);
+    }
+    if (received) return { status: "minted" };
+    if (gas < baseMints.payerEthFloor) {
+      throw new ApiError("unavailable", `The server is out of gas on ${evm.chain.name}; submit the mint from your own wallet`);
+    }
+
+    // Nothing has been counted so far; from here on the attempt counts, whatever becomes of it.
+    const perCaller = this.mintsPerCaller.check(caller);
+    if (!perCaller.ok) {
+      throw new ApiError("rate_limited", "This address has had the server pay for too many mints; try again later", {
+        retryAfterSeconds: perCaller.retryAfterSeconds,
+      });
+    }
+    const overall = this.mintsOverall.check(EVERYONE);
+    if (!overall.ok) {
+      throw new ApiError("unavailable", "The server has paid for all the mints it pays for in a day; try again later", {
+        retryAfterSeconds: overall.retryAfterSeconds,
+      });
+    }
+    const counted = [this.mintsPerCaller.take(caller), this.mintsOverall.take(EVERYONE)];
+    if (!counted.every((allowance) => allowance.ok)) {
+      throw new ApiError("unavailable", "The server cannot pay for a mint right now; try again later");
+    }
+
+    try {
+      // The same queue as the faucet's burns: one account on Base, one transaction at a time.
+      const { hash } = await this.queued(this.evmQueue, (signal) => {
+        assertStillWanted(signal);
+        return receiveMessageOnEvm({ walletClient, publicClient, message, attestation: attestation.attestation, network });
+      });
+      return hash ? { status: "minted", hash } : { status: "minted" };
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      // The cause stays in the log: a transport error can quote the endpoint it failed to reach.
+      console.error("Mint on Base failed:", error instanceof Error ? error.name : "unknown error");
+      throw new ApiError("unavailable", `The server could not submit the mint on ${evm.chain.name}; try again later`);
+    }
+  }
+
+  /**
+   * Asks Circle's attestation service about a burn, once, and gives it a
+   * bounded time to answer. No answer in time reads as an outage: ask again.
+   */
+  private async lookUp(sourceDomain: number, txHash: string) {
+    const patience = new AbortController();
+    const timer = setTimeout(() => patience.abort(), IRIS_TIMEOUT_MS);
+    return fetchAttestation(sourceDomain, txHash, this.config.network, { signal: patience.signal })
+      .catch(() => ({ status: { state: "unreachable" as const }, attestation: undefined }))
+      .finally(() => clearTimeout(timer));
   }
 
   private async isNonceUsed(nonce: Hex): Promise<boolean> {
@@ -871,9 +1040,19 @@ const globalForRelayer = globalThis as typeof globalThis & { pasoRelayer?: Relay
 
 /**
  * The relayer of this server process, created from the environment on first
- * use. One instance per process keeps one queue per account.
+ * use. One instance per process keeps one queue per account and one set of
+ * counts.
+ *
+ * While developing, an edit replaces this module, and an instance made from
+ * the module it replaced would go on running the old code: it is recognised
+ * by its class and made anew.
  */
 export function getRelayer(): Relayer {
-  globalForRelayer.pasoRelayer ??= new Relayer(loadConfig());
-  return globalForRelayer.pasoRelayer;
+  const existing = globalForRelayer.pasoRelayer;
+  const usable = process.env.NODE_ENV === "production" ? existing !== undefined : existing instanceof Relayer;
+  if (existing && usable) return existing;
+
+  const relayer = new Relayer(loadConfig());
+  globalForRelayer.pasoRelayer = relayer;
+  return relayer;
 }

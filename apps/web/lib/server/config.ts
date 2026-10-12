@@ -27,6 +27,12 @@ export const DEFAULT_DEMO_FUND_PER_DAY = 50;
 /** The faucet stops while a payout would leave its payer with less USDC than this, in 6-decimal units (2 USDC). */
 export const DEFAULT_DEMO_FUND_PAYER_FLOOR = BigInt(2_000_000);
 
+/** Mints on Base the server pays the gas for: per caller in an hour, and in any 24 hours whoever asks. */
+export const DEFAULT_BASE_MINTS_PER_CALLER_PER_HOUR = 10;
+export const DEFAULT_BASE_MINTS_PER_DAY = 100;
+/** The server stops paying for mints while its account on Base holds less than this, in wei (0.0001 ETH). */
+export const DEFAULT_BASE_MINT_PAYER_ETH_FLOOR = BigInt(100_000_000_000_000);
+
 export interface ServerConfig {
   network: NetworkConfig;
   /** Pays the fee of every transaction the server sends on Stellar. It never authorises anything else. */
@@ -46,6 +52,15 @@ export interface ServerConfig {
     perDay: number;
     /** USDC the payer keeps, in 6-decimal units: no payout would take it below this. */
     payerFloor: bigint;
+  };
+  /** Completing a transfer back to Base: the server's account there submits the mint and pays its gas. */
+  baseMints: {
+    /** On testnet always. On mainnet only when asked for by name, on top of running on mainnet at all. */
+    enabled: boolean;
+    perCallerPerHour: number;
+    perDay: number;
+    /** ETH the account keeps, in wei: below this the server stops paying for mints. */
+    payerEthFloor: bigint;
   };
 }
 
@@ -115,6 +130,13 @@ export function loadConfig(env: Env = process.env): ServerConfig {
       perOwnerPerDay: positiveInteger(env, "DEMO_FUND_PER_OWNER_PER_DAY", DEFAULT_DEMO_FUND_PER_OWNER_PER_DAY),
       perDay: positiveInteger(env, "DEMO_FUND_PER_DAY", DEFAULT_DEMO_FUND_PER_DAY),
       payerFloor: amount(env, "DEMO_FUND_PAYER_FLOOR", DEFAULT_DEMO_FUND_PAYER_FLOOR, "USDC units (6 decimals)"),
+    },
+    baseMints: {
+      // With real funds a user's own wallet can submit the mint; the server pays only if told to.
+      enabled: name === "testnet" || env.PAY_BASE_MINTS_ON_MAINNET?.trim() === "true",
+      perCallerPerHour: positiveInteger(env, "BASE_MINTS_PER_CALLER_PER_HOUR", DEFAULT_BASE_MINTS_PER_CALLER_PER_HOUR),
+      perDay: positiveInteger(env, "BASE_MINTS_PER_DAY", DEFAULT_BASE_MINTS_PER_DAY),
+      payerEthFloor: amount(env, "BASE_MINT_PAYER_ETH_FLOOR", DEFAULT_BASE_MINT_PAYER_ETH_FLOOR, "wei"),
     },
   };
 }

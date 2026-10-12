@@ -10,7 +10,7 @@ import {
   type PublicClient,
   type WalletClient,
 } from "viem";
-import { FAST_FINALITY, fetchBurnFee, maxFeeFor } from "./iris";
+import { decodeBurnMessage, FAST_FINALITY, fetchBurnFee, maxFeeFor } from "./iris";
 import { resolveNetwork, type Network } from "./networks";
 import { twinAddress, twinContractId } from "./twin";
 
@@ -88,6 +88,13 @@ export const messageTransmitterAbi = [
       { name: "attestation", type: "bytes" },
     ],
     outputs: [{ name: "", type: "bool" }],
+  },
+  {
+    type: "function",
+    name: "usedNonces",
+    stateMutability: "view",
+    inputs: [{ name: "nonce", type: "bytes32" }],
+    outputs: [{ name: "", type: "uint256" }],
   },
 ] as const;
 
@@ -237,4 +244,78 @@ export async function fundFromEvm(args: FundFromEvmArgs): Promise<FundFromEvmRes
   await confirmed(publicClient, burnTxHash, "burn");
 
   return { burnTxHash, approveTxHash, route, twin, maxFee };
+}
+
+/**
+ * Whether Circle's MessageTransmitter on Base has taken a message already.
+ * A message is received once: its nonce is marked as used when it is.
+ */
+export async function isReceivedOnEvm(
+  publicClient: Pick<EvmReader, "readContract">,
+  message: Hex,
+  network: Network,
+): Promise<boolean> {
+  const used = await publicClient.readContract({
+    address: resolveNetwork(network).evm.messageTransmitter,
+    abi: messageTransmitterAbi,
+    functionName: "usedNonces",
+    args: [decodeBurnMessage(message).nonce],
+  });
+  return used !== 0n;
+}
+
+export interface ReceiveOnEvmArgs {
+  /** Pays the gas. Must have its account set and be connected to Base. */
+  walletClient: WalletClient;
+  publicClient: EvmReader;
+  /** The attested message and its attestation, as Circle's Iris service returned them. */
+  message: Hex;
+  attestation: Hex;
+  network: Network;
+}
+
+export interface ReceiveOnEvmResult {
+  /** The transaction that minted the USDC. Absent when the message had been received before. */
+  hash?: Hex;
+  alreadyReceived: boolean;
+}
+
+/**
+ * Completes a transfer from Stellar on Base: hands the attested message to
+ * Circle's MessageTransmitter, which mints the USDC to the recipient the
+ * message names. Anyone may do this; the caller only pays the gas.
+ *
+ * A message is received once. If someone else got there first, before the
+ * call or while it was on its way, this resolves with `alreadyReceived`
+ * instead of failing: the USDC is where it belongs either way.
+ */
+export async function receiveMessageOnEvm(args: ReceiveOnEvmArgs): Promise<ReceiveOnEvmResult> {
+  const { walletClient, publicClient, message, attestation } = args;
+  const config = resolveNetwork(args.network);
+  const account = walletClient.account;
+  if (!account) {
+    throw new Error("The wallet client has no account to pay from");
+  }
+  if (await isReceivedOnEvm(publicClient, message, config)) {
+    return { alreadyReceived: true };
+  }
+
+  try {
+    const hash = await walletClient.writeContract({
+      address: config.evm.messageTransmitter,
+      abi: messageTransmitterAbi,
+      functionName: "receiveMessage",
+      args: [message, attestation],
+      chain: config.evm.chain,
+      account,
+    });
+    await confirmed(publicClient, hash, "mint");
+    return { hash, alreadyReceived: false };
+  } catch (error) {
+    // A call that lost the race reverts with "Nonce already used". The chain is asked rather than the error read.
+    if (await isReceivedOnEvm(publicClient, message, config).catch(() => false)) {
+      return { alreadyReceived: true };
+    }
+    throw error;
+  }
 }

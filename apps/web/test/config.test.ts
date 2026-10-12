@@ -18,6 +18,12 @@ describe("loadConfig", () => {
     expect(config.maxResourceFee).toBe(BigInt(5_000_000));
     expect(config.maxDailyFees).toBe(BigInt(500_000_000));
     expect(config.demoFund).toEqual({ perIpPerHour: 5, perOwnerPerDay: 2, perDay: 50, payerFloor: BigInt(2_000_000) });
+    expect(config.baseMints).toEqual({
+      enabled: true,
+      perCallerPerHour: 10,
+      perDay: 100,
+      payerEthFloor: BigInt(100_000_000_000_000),
+    });
   });
 
   it("reads the payer, the endpoints, the fee cap and the faucet limits", () => {
@@ -72,6 +78,18 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ ...base, PASO_NETWORK: "mainnet", PASO_ALLOW_MAINNET: "1" })).toThrow(ConfigError);
     expect(loadConfig({ ...base, PASO_NETWORK: "mainnet", PASO_ALLOW_MAINNET: "true" }).network.name).toBe("mainnet");
     expect(loadConfig({ ...base, PASO_ALLOW_MAINNET: "true" }).network.name).toBe("testnet");
+  });
+
+  it("pays for mints on Base on testnet, and on mainnet only when told to", () => {
+    const mainnet = { ...base, PASO_NETWORK: "mainnet", PASO_ALLOW_MAINNET: "true" };
+
+    expect(loadConfig(mainnet).baseMints.enabled).toBe(false);
+    expect(loadConfig({ ...mainnet, PAY_BASE_MINTS_ON_MAINNET: "1" }).baseMints.enabled).toBe(false);
+    expect(loadConfig({ ...mainnet, PAY_BASE_MINTS_ON_MAINNET: "true" }).baseMints.enabled).toBe(true);
+    expect(
+      loadConfig({ ...base, BASE_MINTS_PER_CALLER_PER_HOUR: "3", BASE_MINTS_PER_DAY: "9", BASE_MINT_PAYER_ETH_FLOOR: "5" }).baseMints,
+    ).toEqual({ enabled: true, perCallerPerHour: 3, perDay: 9, payerEthFloor: BigInt(5) });
+    expect(() => loadConfig({ ...base, BASE_MINT_PAYER_ETH_FLOOR: "0.1" })).toThrow(/whole number of wei/);
   });
 
   it("refuses an unknown network and malformed numbers", () => {

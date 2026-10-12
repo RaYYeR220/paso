@@ -170,6 +170,7 @@ const DESTINATION_CALLER_START = 108;
 const BODY_START = 148;
 const MINT_RECIPIENT_START = BODY_START + 36;
 const AMOUNT_START = BODY_START + 68;
+const MESSAGE_SENDER_START = BODY_START + 100;
 const MAX_FEE_START = BODY_START + 132;
 const FEE_EXECUTED_START = BODY_START + 164;
 const HOOK_DATA_START = BODY_START + 228;
@@ -182,6 +183,8 @@ export interface BurnMessage {
   mintRecipient: Hex;
   /** Amount burned, in 6-decimal units whatever the chains involved. */
   amount: bigint;
+  /** Who asked for the burn on the source chain. For an exit from a Paso account that is the hub's contract id. */
+  messageSender: Hex;
   maxFee: bigint;
   /** Fee Circle kept, in 6-decimal units; the recipient is minted `amount - feeExecuted`. */
   feeExecuted: bigint;
@@ -201,6 +204,7 @@ export function decodeBurnMessage(message: Hex): BurnMessage {
     destinationCaller: word(DESTINATION_CALLER_START),
     mintRecipient: word(MINT_RECIPIENT_START),
     amount: hexToBigInt(word(AMOUNT_START)),
+    messageSender: word(MESSAGE_SENDER_START),
     maxFee: hexToBigInt(word(MAX_FEE_START)),
     feeExecuted: hexToBigInt(word(FEE_EXECUTED_START)),
     hookData: size(message) > HOOK_DATA_START ? slice(message, HOOK_DATA_START) : "0x",

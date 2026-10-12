@@ -72,6 +72,7 @@ const LIMITS = {
   relay: { perCaller: 30, overall: 300 },
   deploy: { perCaller: 10, overall: 60 },
   deliver: { perCaller: 120, overall: 1_200 },
+  complete: { perCaller: 60, overall: 600 },
   fund: { perCaller: 10, overall: 60 },
   health: { perCaller: 60, overall: 600 },
 } as const;

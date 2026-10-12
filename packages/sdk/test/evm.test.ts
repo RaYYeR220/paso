@@ -1,7 +1,7 @@
 import { StrKey } from "@stellar/stellar-sdk";
 import type { Hex, PublicClient, WalletClient } from "viem";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { forwardRecipientHookData, fundFromEvm } from "../src/evm";
+import { forwardRecipientHookData, fundFromEvm, isReceivedOnEvm, receiveMessageOnEvm } from "../src/evm";
 import { twinAddress } from "../src/twin";
 import { hex, OWNER, testNetwork } from "./helpers";
 
@@ -172,5 +172,96 @@ describe("fundFromEvm", () => {
     await expect(
       fundFromEvm({ ...base, amount: 100n, maxFee: 100n, walletClient, publicClient, route: "direct" }),
     ).rejects.toThrow(/fee.*less than the amount/);
+  });
+});
+
+describe("receiveMessageOnEvm", () => {
+  const MINT_HASH = `0x${"c3".repeat(32)}` as Hex;
+  const NONCE = `0x${"07".repeat(32)}`;
+  const ATTESTATION = `0x${"ee".repeat(130)}` as Hex;
+  /** A CCTP message from Stellar to Base: a 148-byte header carrying the nonce, then a burn message body. */
+  const MESSAGE = `0x${"00000001"}${"0000001b"}${"00000006"}${NONCE.slice(2)}${"11".repeat(104)}${"22".repeat(228)}` as Hex;
+
+  /** Base as seen through `usedNonces`: each read answers with the next entry of `used`, the last one from then on. */
+  function base({ used = [0n], write, status = "success" }: { used?: bigint[]; write?: () => Promise<Hex>; status?: string } = {}) {
+    const reads = [...used];
+    const publicClient = {
+      readContract: vi.fn(async (_request: { functionName: string; args: readonly unknown[]; address: string }) =>
+        reads.length > 1 ? reads.shift()! : reads[0]!,
+      ),
+      waitForTransactionReceipt: vi.fn(async (_request: { hash: Hex }) => ({ status })),
+    };
+    const walletClient = {
+      account: { address: PAYER, type: "json-rpc" },
+      writeContract: vi.fn(async (_request: Write) => (write ? write() : MINT_HASH)),
+    };
+    const args = {
+      walletClient: walletClient as unknown as WalletClient,
+      publicClient: publicClient as unknown as PublicClient,
+      message: MESSAGE,
+      attestation: ATTESTATION,
+      network: testNetwork,
+    };
+    return { args, publicClient, walletClient };
+  }
+
+  it("hands exactly the attested bytes to the message transmitter and waits for the mint", async () => {
+    const { args, publicClient, walletClient } = base();
+
+    expect(await receiveMessageOnEvm(args)).toEqual({ hash: MINT_HASH, alreadyReceived: false });
+
+    expect(walletClient.writeContract).toHaveBeenCalledTimes(1);
+    const request = walletClient.writeContract.mock.calls[0]![0];
+    expect(request.address).toBe(testNetwork.evm.messageTransmitter);
+    expect(request.functionName).toBe("receiveMessage");
+    expect(request.args).toEqual([MESSAGE, ATTESTATION]);
+    expect(request.chain.id).toBe(testNetwork.evm.chain.id);
+    expect(request.account.address).toBe(PAYER);
+    expect(publicClient.waitForTransactionReceipt).toHaveBeenCalledWith({ hash: MINT_HASH });
+  });
+
+  it("asks the chain for the message's nonce before spending anything", async () => {
+    const { args, publicClient, walletClient } = base({ used: [1n] });
+
+    expect(await receiveMessageOnEvm(args)).toEqual({ alreadyReceived: true });
+
+    const read = publicClient.readContract.mock.calls[0]![0];
+    expect(read.address).toBe(testNetwork.evm.messageTransmitter);
+    expect(read.functionName).toBe("usedNonces");
+    expect(read.args).toEqual([NONCE]);
+    expect(walletClient.writeContract).not.toHaveBeenCalled();
+    expect(await isReceivedOnEvm(args.publicClient, MESSAGE, testNetwork)).toBe(true);
+  });
+
+  it("counts a call that lost the race as received, not as a failure", async () => {
+    const lost = base({
+      used: [0n, 1n],
+      write: async () => {
+        throw new Error("execution reverted: Nonce already used");
+      },
+    });
+    expect(await receiveMessageOnEvm(lost.args)).toEqual({ alreadyReceived: true });
+
+    const revertedOnChain = base({ used: [0n, 1n], status: "reverted" });
+    expect(await receiveMessageOnEvm(revertedOnChain.args)).toEqual({ alreadyReceived: true });
+  });
+
+  it("fails when the call fails and the message is still unreceived", async () => {
+    const refused = base({
+      write: async () => {
+        throw new Error("insufficient funds for gas");
+      },
+    });
+    await expect(receiveMessageOnEvm(refused.args)).rejects.toThrow("insufficient funds for gas");
+
+    const reverted = base({ status: "reverted" });
+    await expect(receiveMessageOnEvm(reverted.args)).rejects.toThrow(/mint reverted on Base/);
+  });
+
+  it("needs a wallet with an account", async () => {
+    const { args } = base();
+    const walletClient = { writeContract: vi.fn() } as unknown as WalletClient;
+
+    await expect(receiveMessageOnEvm({ ...args, walletClient })).rejects.toThrow(/no account/);
   });
 });

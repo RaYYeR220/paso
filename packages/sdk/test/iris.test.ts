@@ -216,6 +216,7 @@ describe("decodeBurnMessage", () => {
       destinationCaller: `0x${"22".repeat(32)}`,
       mintRecipient: `0x${Buffer.from(Address.fromString(testNetwork.stellar.forwarder).toBuffer()).toString("hex")}`,
       amount: 1_000_000n,
+      messageSender: `0x${"00".repeat(12)}70997970c51812dc3a010c7d01b50e0d17dc79c8`,
       maxFee: 156n,
       feeExecuted: 130n,
       hookData,
