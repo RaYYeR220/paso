@@ -7,13 +7,21 @@
 #
 # Before anything is sent, every step is simulated and the fees are printed in
 # XLM. Code that is on chain already is not uploaded again, so a run that
-# stopped half way can be repeated without paying twice.
+# stopped half way can be repeated without paying twice. Once mainnet has a
+# hub on record the script reads it back from the chain, prints what it found
+# and sends nothing.
 #
 #   PASO_DEPLOYER          stellar-cli identity that pays and deploys. Defaults to
 #                          paso-deployer on testnet and paso-mainnet on mainnet.
 #   PASO_CONFIRM_MAINNET   Mainnet only: the printed total in whole XLM, rounded
 #                          up. Without it the script stops after printing the
-#                          plan, and it never spends more than this.
+#                          plan.
+#
+# On mainnet the confirmed number is a limit on everything the run sends: both
+# uploads and the hub deployment are counted against it, each right before it
+# is sent, at its simulated fee. A step whose fee is unknown, a plan that could
+# not be worked out, a limit that is missing or not a number: each of these
+# stops the script before the next thing is sent.
 #
 # Mainnet takes only the build that runs on testnet: the account code has to
 # hash to the value in deployments/testnet.json and the hub code to the code of
@@ -41,6 +49,12 @@ DEPLOYMENT="deployments/$NETWORK.json"
 WASM_DIR=target/wasm32v1-none/release
 STROOPS_PER_XLM=10000000
 
+die() {
+  echo >&2
+  echo "$*" >&2
+  exit 1
+}
+
 field() {
   node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))[process.argv[2]])' \
     "$DEPLOYMENT" "$1"
@@ -50,15 +64,8 @@ RPC_URL="$(field rpcUrl)"
 NETWORK_PASSPHRASE="$(field networkPassphrase)"
 USDC="$(field usdc)"
 TOKEN_MESSENGER="$(field tokenMessenger)"
-RECORDED_HUB="$(field hub)"
 
 network=(--rpc-url "$RPC_URL" --network-passphrase "$NETWORK_PASSPHRASE")
-
-if [[ "$NETWORK" == mainnet && -n "$RECORDED_HUB" ]]; then
-  echo "$DEPLOYMENT already names the hub $RECORDED_HUB." >&2
-  echo "A second hub would give every owner a different address, so there is nothing to deploy." >&2
-  exit 1
-fi
 
 DEPLOYER="$(stellar keys public-key "$SOURCE")"
 
@@ -69,7 +76,10 @@ stellar contract build
 PLAN="$(mktemp)"
 trap 'rm -f "$PLAN"' EXIT
 
+# Works the plan out afresh. A plan that fails leaves an empty file behind,
+# never the figures of an earlier one.
 plan() {
+  : > "$PLAN"
   pnpm exec tsx scripts/deploy-plan.ts "$NETWORK" "$DEPLOYER" "$PLAN"
 }
 
@@ -77,33 +87,73 @@ planned() {
   sed -n "s/^$1=//p" "$PLAN"
 }
 
-plan
+# A figure of the plan in stroops. Anything but a whole number stops the script.
+stroops() {
+  local value
+  value="$(planned "$1")"
+  [[ "$value" =~ ^[0-9]{1,15}$ ]] || die "The plan has no usable $1 (\"$value\"). Nothing more is sent."
+  printf '%s' "$value"
+}
+
+# The limit on what a mainnet run may send, in stroops. Empty until confirmed.
+LIMIT=""
+SENT=0
+
+# Stands right before every command that spends, with the simulated fee of
+# that command. On anything but testnet it stops the script unless the limit
+# was confirmed, is a number, and covers what was sent so far plus this step.
+authorise() {
+  local what="$1" fee="$2"
+  [[ "$fee" =~ ^[0-9]{1,15}$ ]] || die "The fee of $what is not known. Nothing more is sent."
+  if [[ "$NETWORK" != testnet ]]; then
+    [[ "${PASO_CONFIRM_MAINNET:-}" =~ ^[1-9][0-9]{0,5}$ ]] ||
+      die "PASO_CONFIRM_MAINNET is not set to a whole number of XLM. Nothing more is sent."
+    [[ "$LIMIT" =~ ^[1-9][0-9]{0,14}$ ]] || die "No spending limit was confirmed. Nothing more is sent."
+    ((SENT + fee <= LIMIT)) ||
+      die "$what would take the run past the $PASO_CONFIRM_MAINNET XLM that were confirmed. Nothing more is sent."
+  fi
+  SENT=$((SENT + fee))
+}
+
+plan || die "The plan could not be worked out. Nothing was sent."
+
+if [[ "$(planned SETTLED)" == yes ]]; then
+  echo
+  echo "Paso is deployed on $NETWORK and matches $DEPLOYMENT. Nothing was sent."
+  exit 0
+fi
+[[ "$(planned SETTLED)" == no ]] || die "The plan does not say whether $NETWORK has a hub already. Nothing was sent."
+
 ACCOUNT_WASM_HASH="$(planned ACCOUNT_WASM_HASH)"
 HUB_WASM_HASH="$(planned HUB_WASM_HASH)"
-UPLOADS=$(($(planned TOTAL) - $(planned HUB_FEE)))
+[[ "$ACCOUNT_WASM_HASH" =~ ^[0-9a-f]{64}$ && "$HUB_WASM_HASH" =~ ^[0-9a-f]{64}$ ]] ||
+  die "The plan names no contract code. Nothing was sent."
+ACCOUNT_UPLOAD_FEE="$(stroops ACCOUNT_UPLOAD_FEE)"
+HUB_UPLOAD_FEE="$(stroops HUB_UPLOAD_FEE)"
+HUB_FEE="$(stroops HUB_FEE)"
+TOTAL="$(stroops TOTAL)"
+((ACCOUNT_UPLOAD_FEE + HUB_UPLOAD_FEE + HUB_FEE == TOTAL)) || die "The plan does not add up. Nothing was sent."
 
-LIMIT=""
-if [[ "$NETWORK" == mainnet ]]; then
-  CONFIRM="$(planned TOTAL_XLM_ROUNDED_UP)"
+if [[ "$NETWORK" != testnet ]]; then
+  CONFIRM="$(stroops TOTAL_XLM_ROUNDED_UP)"
+  ((CONFIRM >= 1 && CONFIRM * STROOPS_PER_XLM >= TOTAL)) || die "The plan's total in XLM is not usable. Nothing was sent."
   if [[ "${PASO_CONFIRM_MAINNET:-}" != "$CONFIRM" ]]; then
     echo
     echo "Nothing was sent. This spends real XLM: to go ahead, run"
     echo
-    echo "    PASO_CONFIRM_MAINNET=$CONFIRM scripts/deploy.sh mainnet"
+    echo "    PASO_CONFIRM_MAINNET=$CONFIRM scripts/deploy.sh $NETWORK"
     exit 3
   fi
   LIMIT=$((CONFIRM * STROOPS_PER_XLM))
 fi
 
-if [[ "$(planned FUNDED)" != yes ]]; then
-  echo
-  echo "Nothing was sent: $DEPLOYER ($SOURCE) does not hold enough XLM for the plan above." >&2
-  exit 1
-fi
+[[ "$(planned FUNDED)" == yes ]] ||
+  die "Nothing was sent: $DEPLOYER ($SOURCE) does not hold enough XLM for the plan above."
 
 upload() {
-  local name="$1" expected="$2" uploaded
+  local name="$1" expected="$2" fee="$3" uploaded
   echo "Uploading the $name code as $SOURCE"
+  authorise "Uploading the $name code" "$fee"
   uploaded="$(
     stellar contract upload \
       --wasm "$WASM_DIR/paso_$name.wasm" \
@@ -111,45 +161,39 @@ upload() {
       --source-account "$SOURCE" \
       "${network[@]}"
   )"
-  if [[ "$uploaded" != "$expected" ]]; then
-    echo "The network stored $uploaded, not the $expected that was built." >&2
-    exit 1
-  fi
+  [[ "$uploaded" == "$expected" ]] || die "The network stored $uploaded, not the $expected that was built."
 }
 
 echo
-if [[ "$(planned ACCOUNT_ON_CHAIN)" == yes ]]; then
-  echo "The account code is on chain already"
-else
-  upload account "$ACCOUNT_WASM_HASH"
-fi
-if [[ "$(planned HUB_ON_CHAIN)" == yes ]]; then
-  echo "The hub code is on chain already"
-else
-  upload hub "$HUB_WASM_HASH"
-fi
+case "$(planned ACCOUNT_ON_CHAIN)" in
+  yes) echo "The account code is on chain already" ;;
+  no) upload account "$ACCOUNT_WASM_HASH" "$ACCOUNT_UPLOAD_FEE" ;;
+  *) die "The plan does not say whether the account code is on chain. Nothing was sent." ;;
+esac
+case "$(planned HUB_ON_CHAIN)" in
+  yes) echo "The hub code is on chain already" ;;
+  no) upload hub "$HUB_WASM_HASH" "$HUB_UPLOAD_FEE" ;;
+  *) die "The plan does not say whether the hub code is on chain. Nothing more is sent." ;;
+esac
 
 # With its code on chain the hub deployment can be simulated exactly. The
-# endpoint can take a few ledgers to show code that was just uploaded.
+# endpoint can take a few ledgers to show code that was just uploaded, or to
+# simulate against it.
 for _ in 1 2 3 4 5 6; do
-  plan
-  if [[ "$(planned HUB_ON_CHAIN)" == yes && "$(planned ACCOUNT_ON_CHAIN)" == yes ]]; then
+  if plan && [[ "$(planned HUB_ON_CHAIN)" == yes && "$(planned ACCOUNT_ON_CHAIN)" == yes ]]; then
     break
   fi
   sleep 5
 done
-if [[ "$(planned HUB_ON_CHAIN)" != yes || "$(planned ACCOUNT_ON_CHAIN)" != yes ]]; then
-  echo "The uploaded code is not visible on chain yet. Run the script again: nothing is uploaded twice." >&2
-  exit 1
-fi
-if [[ -n "$LIMIT" ]] && ((UPLOADS + $(planned HUB_FEE) > LIMIT)); then
-  echo "Deploying the hub would take the run past the $PASO_CONFIRM_MAINNET XLM that were confirmed." >&2
-  echo "Nothing more was sent. Run the script again to see the new total and confirm it." >&2
-  exit 1
-fi
+[[ "$(planned HUB_ON_CHAIN)" == yes && "$(planned ACCOUNT_ON_CHAIN)" == yes ]] ||
+  die "The hub deployment could not be planned against the uploaded code. Run the script again: nothing is uploaded twice."
+[[ "$(planned ACCOUNT_WASM_HASH)" == "$ACCOUNT_WASM_HASH" && "$(planned HUB_WASM_HASH)" == "$HUB_WASM_HASH" ]] ||
+  die "The contract code changed while the script ran. Nothing more is sent."
+HUB_FEE="$(stroops HUB_FEE)"
 
 echo
 echo "Deploying the hub"
+authorise "Deploying the hub" "$HUB_FEE"
 HUB="$(
   stellar contract deploy \
     --wasm-hash "$HUB_WASM_HASH" \

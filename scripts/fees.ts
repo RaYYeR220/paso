@@ -33,9 +33,10 @@ export async function simulatedFee(
   networkPassphrase: string,
   source: string,
   operation: xdr.Operation,
+  bid: bigint = INCLUSION_FEE,
 ): Promise<bigint> {
   const tx = new TransactionBuilder(new Account(source, "0"), {
-    fee: INCLUSION_FEE.toString(),
+    fee: bid.toString(),
     networkPassphrase,
   })
     .addOperation(operation)
@@ -43,7 +44,35 @@ export async function simulatedFee(
     .build();
   const simulation = await server.simulateTransaction(tx);
   if (rpc.Api.isSimulationError(simulation)) {
-    throw new Error(simulation.error);
+    throw new Error(describe(simulation.error));
   }
-  return BigInt(simulation.minResourceFee) + INCLUSION_FEE;
+  if (rpc.Api.isSimulationRestore(simulation)) {
+    throw new Error("ledger entries this transaction needs are archived and have to be restored first");
+  }
+  const fee = BigInt(simulation.minResourceFee);
+  if (fee <= 0n) {
+    throw new Error(`the simulation returned no resource fee (${describe(simulation.minResourceFee)})`);
+  }
+  return fee + bid;
+}
+
+/**
+ * The text of whatever was thrown or returned as an error. An RPC endpoint
+ * rejects with plain objects as often as with `Error`s, and printing those
+ * as they are says nothing.
+ */
+export function describe(error: unknown): string {
+  if (error instanceof Error) return error.message || error.name;
+  if (typeof error === "string") return error;
+  if (typeof error === "object" && error !== null) {
+    const { message, error: inner, code } = error as { message?: unknown; error?: unknown; code?: unknown };
+    if (typeof message === "string" && message !== "") return code === undefined ? message : `${message} (code ${String(code)})`;
+    if (inner !== undefined) return describe(inner);
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return Object.prototype.toString.call(error);
+    }
+  }
+  return String(error);
 }

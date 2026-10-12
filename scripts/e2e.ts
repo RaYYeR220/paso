@@ -5,6 +5,7 @@
  *   pnpm e2e [--relayer <url>] [--fund demo|burn] [--to <address>]
  *   pnpm e2e --network mainnet [--burn 1] [--transfer 0.1] [--exit 0.5] [--to <address>]
  *   pnpm e2e --network mainnet --dry-run [--owner <0x…>] [--source <G…>]
+ *   pnpm e2e [--resume-burn <base tx>] [--skip-fund] [--skip-transfer] [--resume-exit <stellar tx>] [--skip-exit]
  *
  * `--stellar-only` needs no USDC. It takes a fresh Ethereum key, makes the
  * first call from its Stellar account (which deploys the account), and then
@@ -28,6 +29,19 @@
  * no faucet and no relayer. Before anything is sent the run reads Circle's
  * contracts on both chains, prints what each account needs, and stops if
  * either is short. Each Stellar transaction prints its simulated fee first.
+ *
+ * A run that stops half way is picked up where it stopped, and says how when
+ * it stops: `--resume-burn <tx>` starts from a burn on Base that exists and
+ * delivers it unless it has been delivered; `--skip-fund` starts from the
+ * USDC the account holds, with no burn and no delivery; `--skip-transfer`
+ * leaves the transfer out; `--resume-exit <tx>` starts from an exit on
+ * Stellar that exists and mints on Base unless that has been done;
+ * `--skip-exit` leaves the way back out. What Circle's contracts have taken
+ * once they are not offered again.
+ *
+ * Stellar transactions are sent with a bid above the minimum on mainnet,
+ * watched until they are applied or can no longer be, and sent again with a
+ * higher bid when no ledger took them.
  *
  * `--dry-run` does every read and every simulation of a run, prints what the
  * run would send and what that would cost, and sends nothing. It signs
@@ -58,8 +72,10 @@ import {
   StrKey,
   TransactionBuilder,
   xdr,
+  type Transaction,
 } from "@stellar/stellar-sdk";
 import {
+  concat,
   createPublicClient,
   createWalletClient,
   encodeAbiParameters,
@@ -67,11 +83,15 @@ import {
   formatEther,
   formatGwei,
   getAddress,
+  hexToBytes,
+  hexToString,
   http,
   isAddress,
   keccak256,
   numberToHex,
   pad,
+  size,
+  slice,
   toHex,
   zeroHash,
   type Abi,
@@ -86,9 +106,7 @@ import {
   buildOperation,
   decodeBurnMessage,
   deliverOperation,
-  deliverWith,
   deployOperation,
-  ensureDeployed,
   erc20Abi,
   evmAddressUrl,
   evmTxUrl,
@@ -114,7 +132,6 @@ import {
   SimulationError,
   stellarAddressUrl,
   stellarTxUrl,
-  submitWith,
   toStellarUnits,
   twinAddress,
   usdcBalance,
@@ -128,12 +145,24 @@ import {
   type NetworkName,
   type Signed,
 } from "../packages/sdk/src/index";
-import { formatXlm, MINIMUM_BALANCE, simulatedFee, STROOPS_PER_XLM, xlmBalance } from "./fees";
+import { describe, formatXlm, MINIMUM_BALANCE, simulatedFee, STROOPS_PER_XLM, xlmBalance } from "./fees";
 
 const HONEST_AMOUNT = 1n;
 const TAMPERED_AMOUNT = parseStellarAmount("1000000");
 const ATTESTATION_TIMEOUT_MS = 20 * 60 * 1000;
 const POLL_MS = 2000;
+/**
+ * What a Stellar transaction bids to get into a ledger, in stroops, on top of
+ * its resource fee. The network charges the going rate, never more than the
+ * bid. When mainnet ledgers are full, a transaction bidding the 100-stroop
+ * minimum is dropped without a trace, so a mainnet run bids 0.01 XLM and
+ * doubles the bid each time it has to send a transaction again.
+ */
+const INCLUSION_BID: Record<NetworkName, bigint> = { testnet: 100n, mainnet: 100_000n };
+/** How long a submitted transaction can still be applied. After that it is dead and can be sent again. */
+const VALIDITY_SECONDS = 60;
+/** How many times a transaction is sent before the run gives up on it. */
+const SUBMISSIONS = 3;
 /** How long the approval of the first call stays usable, in ledgers. */
 const APPROVAL_LEDGERS = 1000;
 /**
@@ -147,6 +176,9 @@ const STELLAR_FEE_ALLOWANCE = 1n * STROOPS_PER_XLM;
  * back. It cannot be simulated before Circle has attested the exit.
  */
 const MINT_GAS_ALLOWANCE = 300_000n;
+/** The size of a CCTP burn message without hook data, and of the two signatures that attest it. */
+const BURN_MESSAGE_BYTES = 376;
+const ATTESTATION_BYTES = 130;
 /** Storage slots of Circle's FiatToken, the USDC contract on Base: balances, then allowances. */
 const USDC_BALANCES_SLOT = 9n;
 const USDC_ALLOWANCES_SLOT = 10n;
@@ -173,6 +205,17 @@ interface Options {
   /** The two addresses of a dry run, when no key names them. */
   owner?: Address;
   source?: string;
+  /** A burn on Base that has happened already: the run picks up at its attestation. */
+  resumeBurn?: Hex;
+  /** An exit on Stellar that has happened already: the run picks up at its attestation. */
+  resumeExit?: string;
+  /** The account holds its USDC already: no burn on Base and no delivery. */
+  skipFund: boolean;
+  skipTransfer: boolean;
+  /** No exit, and so no mint on Base either. */
+  skipExit: boolean;
+  /** The arguments that say what the run is, not where in it to start: the command that continues a run repeats them. */
+  kept: string[];
 }
 
 interface Run {
@@ -192,6 +235,7 @@ function usage(message?: string): never {
   console.error(
     "Usage: pnpm e2e [--network testnet|mainnet] [--dry-run] [--stellar-only] [--relayer <url>] [--fund demo|burn]\n" +
       "                [--burn <usdc>] [--transfer <usdc>] [--exit <usdc>] [--to <G…|C…|0x…>]\n" +
+      "                [--resume-burn <base tx>] [--skip-fund] [--skip-transfer] [--resume-exit <stellar tx>] [--skip-exit]\n" +
       "                [--owner <0x…>] [--source <G…>]   (dry run only)",
   );
   process.exit(2);
@@ -206,11 +250,22 @@ function parseArgs(argv: string[]): Options {
     burn: parseEvmAmount("1"),
     transfer: parseStellarAmount("0.1"),
     exit: parseStellarAmount("0.5"),
+    skipFund: false,
+    skipTransfer: false,
+    skipExit: false,
+    kept: [],
   };
+  const stages = ["--resume-burn", "--skip-fund", "--skip-transfer", "--resume-exit", "--skip-exit"];
   let fund: string | undefined;
   for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i];
+    const arg = argv[i]!;
+    const start = i;
     const value = () => argv[(i += 1)] ?? usage(`${arg} needs a value`);
+    const hash = (prefixed: boolean): string => {
+      const text = value();
+      const pattern = prefixed ? /^0x[0-9a-fA-F]{64}$/ : /^[0-9a-fA-F]{64}$/;
+      return pattern.test(text) ? text.toLowerCase() : usage(`${arg} takes a transaction hash, not ${text}`);
+    };
     const amount = (parse: (text: string) => bigint): bigint => {
       const text = value();
       try {
@@ -241,8 +296,23 @@ function parseArgs(argv: string[]): Options {
       const source = value();
       if (!StrKey.isValidEd25519PublicKey(source)) usage(`--source takes a Stellar account (G…), not ${source}`);
       options.source = source;
-    } else usage(`Unknown argument ${arg}`);
+    } else if (arg === "--resume-burn") options.resumeBurn = hash(true) as Hex;
+    else if (arg === "--resume-exit") options.resumeExit = hash(false);
+    else if (arg === "--skip-fund") options.skipFund = true;
+    else if (arg === "--skip-transfer") options.skipTransfer = true;
+    else if (arg === "--skip-exit") options.skipExit = true;
+    else usage(`Unknown argument ${arg}`);
+    if (!stages.includes(arg)) options.kept.push(...argv.slice(start, i + 1));
   }
+  // An exit that exists has the funding and the transfer behind it.
+  if (options.resumeExit) {
+    if (options.skipExit) usage("--resume-exit finishes an exit; --skip-exit leaves it out. Pick one");
+    options.skipFund = options.resumeBurn === undefined;
+    options.skipTransfer = true;
+  }
+  if (options.resumeBurn && options.skipFund) usage("--resume-burn delivers a burn; --skip-fund leaves it out. Pick one");
+  const staged = options.resumeBurn || options.resumeExit || options.skipFund || options.skipTransfer || options.skipExit;
+  if (staged && options.stellarOnly) usage("--stellar-only has no burn, transfer or exit to skip or resume");
   if (fund !== undefined && fund !== "demo" && fund !== "burn") usage("--fund takes demo or burn");
   options.fund = (fund as Options["fund"] | undefined) ?? (options.relayerUrl ? "demo" : "burn");
   if (options.fund === "demo" && !options.relayerUrl) usage("--fund demo needs --relayer, whose faucet it uses");
@@ -307,30 +377,119 @@ function requireSource(run: Run): Keypair {
   return run.source;
 }
 
+/** How to pick the run up again, should it stop after the step that has just finished. */
+let continuation: string | undefined;
+
+function reached(run: Run, ...flags: string[]): void {
+  continuation = ["pnpm e2e", ...run.options.kept, ...flags].join(" ");
+}
+
+type Applied = rpc.Api.GetSuccessfulTransactionResponse | rpc.Api.GetFailedTransactionResponse;
+
+/**
+ * Sends a transaction from the fee payer and waits until the network has
+ * applied it, whether it succeeded or failed there.
+ *
+ * `build` makes the transaction for the payer's current sequence number and
+ * the given bid. A transaction no ledger took before its time bound passed
+ * can never be applied, so it is built again with twice the bid and sent
+ * again. Both carry the same sequence number, so at most one of them is ever
+ * applied; and every call sent here is either harmless to repeat or guarded
+ * by a nonce that can be used once.
+ */
+async function sendAndWait(
+  run: Run,
+  what: string,
+  build: (account: Account, bid: bigint) => Promise<Transaction>,
+): Promise<Applied> {
+  const source = requireSource(run);
+  let bid = INCLUSION_BID[run.config.name];
+  for (let attempt = 1; ; attempt += 1) {
+    const tx = await build(await run.server.getAccount(source.publicKey()), bid);
+    tx.sign(source);
+    const hash = toHex(tx.hash()).slice(2);
+    const expires = Number(tx.timeBounds?.maxTime ?? 0);
+
+    let sent = await run.server.sendTransaction(tx);
+    // A busy node asks to be offered the same transaction again.
+    while (sent.status === "TRY_AGAIN_LATER" && Date.now() / 1000 < expires) {
+      await sleep(POLL_MS);
+      sent = await run.server.sendTransaction(tx);
+    }
+    if (sent.status === "ERROR") {
+      const reason = sent.errorResult?.result.type ?? "no reason given";
+      // Someone else sent from the payer's account in the meantime: the same transaction is built on the new sequence number.
+      if (reason === "txBadSeq" && attempt < SUBMISSIONS) {
+        line("again", `the fee payer's sequence number moved under ${hash}; building the transaction again`);
+        continue;
+      }
+      throw new Error(`The network did not take the transaction ${what}: ${reason} (${hash})`);
+    }
+
+    // Until a ledger closes after the time bound, the transaction can still be applied.
+    for (;;) {
+      const result = await run.server.getTransaction(hash).catch((error: unknown) => {
+        if (Date.now() / 1000 > expires + 2 * VALIDITY_SECONDS) throw error;
+        return undefined;
+      });
+      if (result && result.status !== rpc.Api.GetTransactionStatus.NOT_FOUND) return result;
+      if (result && result.latestLedgerCloseTime > expires) break;
+      await sleep(POLL_MS);
+    }
+
+    if (attempt === SUBMISSIONS) {
+      throw new Error(
+        `The transaction ${what} was sent ${SUBMISSIONS} times and no ledger took it before it expired (last: ${hash}). ` +
+          "Nothing was charged for it; the network is busy, try again later",
+      );
+    }
+    bid *= 2n;
+    line("expired", `${hash} was not applied before its time ran out, and never will be`);
+    line("", `sending it again, bidding ${formatXlm(bid)} to be included (attempt ${attempt + 1} of ${SUBMISSIONS})`);
+  }
+}
+
+/**
+ * Sends one operation from the fee payer: simulates it, prints the most it
+ * can cost, submits it and waits for it to succeed. Returns the transaction.
+ */
+async function execute(run: Run, what: string, operation: xdr.Operation): Promise<string> {
+  const applied = await sendAndWait(run, what, async (account, bid) => {
+    const tx = new TransactionBuilder(account, {
+      fee: bid.toString(),
+      networkPassphrase: run.config.stellar.networkPassphrase,
+    })
+      .addOperation(operation)
+      .setTimeout(VALIDITY_SECONDS)
+      .build();
+    const simulation = await run.server.simulateTransaction(tx);
+    if (rpc.Api.isSimulationError(simulation)) {
+      throw new SimulationError(simulation.error);
+    }
+    if (rpc.Api.isSimulationRestore(simulation)) {
+      throw new SimulationError("ledger entries this call needs are archived and have to be restored first");
+    }
+    line("fee", `${formatXlm(BigInt(simulation.minResourceFee) + bid)} at most ${what}, simulated`);
+    return rpc.assembleTransaction(tx, simulation).build();
+  });
+  if (applied.status !== rpc.Api.GetTransactionStatus.SUCCESS) {
+    throw new Error(`The transaction ${what} failed on chain: ${applied.txHash}`);
+  }
+  return applied.txHash;
+}
+
 /** Sends a signed call: through the relayer when there is one, from the source account otherwise. */
 async function submit(run: Run, signed: Signed): Promise<{ hash: string; deployHash?: string }> {
   if (run.relayerUrl) {
     return relay(signed, `${run.relayerUrl}/api/relay`);
   }
-  const source = requireSource(run);
-  if (!(await isDeployed(signed.owner, run.config, run.server))) {
-    await quote(run, "to deploy the account", deployOperation(signed.owner, run.config));
-  }
-  const deployed = await ensureDeployed(signed.owner, source, run.config, run.server);
-  await quote(run, "for the call", signedOperation(signed));
-  const { hash } = await submitWith(signed, source, { network: run.config, server: run.server });
-  return deployed ? { hash, deployHash: deployed.hash } : { hash };
-}
-
-/** Prints what the fee payer would be charged for an operation, before it is sent. */
-async function quote(run: Run, what: string, operation: xdr.Operation): Promise<void> {
-  const fee = await simulatedFee(
-    run.server,
-    run.config.stellar.networkPassphrase,
-    requireSource(run).publicKey(),
-    operation,
-  );
-  line("fee", `${formatXlm(fee)} at most ${what}, simulated`);
+  // hub.deploy does nothing for an account that exists, so sending it twice is harmless.
+  const deployHash = (await isDeployed(signed.owner, run.config, run.server))
+    ? undefined
+    : await execute(run, "to deploy the account", deployOperation(signed.owner, run.config));
+  // The signed entry carries a nonce the account accepts once.
+  const hash = await execute(run, "for the call", signedOperation(signed));
+  return deployHash ? { hash, deployHash } : { hash };
 }
 
 /** The first call of an account: it lets the hub move `amount` of the account's USDC. */
@@ -468,45 +627,36 @@ function signedOperation(signed: Signed): xdr.Operation {
  * more work, so its simulation supplies them, with headroom.
  */
 async function submitRefused(run: Run, honest: Signed, tampered: Signed): Promise<rpc.Api.GetFailedTransactionResponse> {
-  const source = requireSource(run);
   const { networkPassphrase } = run.config.stellar;
-  const account = await run.server.getAccount(source.publicKey());
-  const build = (operation: xdr.Operation, fee: string, data?: xdr.SorobanTransactionData) => {
-    const builder = new TransactionBuilder(new Account(account.accountId(), account.sequenceNumber()), {
-      fee,
-      networkPassphrase,
-    })
-      .addOperation(operation)
-      .setTimeout(120);
-    return (data ? builder.setSorobanData(data) : builder).build();
-  };
+  const result = await sendAndWait(run, "that is meant to fail", async (account, bid) => {
+    const build = (operation: xdr.Operation, fee: bigint, data?: xdr.SorobanTransactionData) => {
+      const builder = new TransactionBuilder(new Account(account.accountId(), account.sequenceNumber()), {
+        fee: fee.toString(),
+        networkPassphrase,
+      })
+        .addOperation(operation)
+        .setTimeout(VALIDITY_SECONDS);
+      return (data ? builder.setSorobanData(data) : builder).build();
+    };
 
-  const simulation = await run.server.simulateTransaction(build(signedOperation(honest), "1000"));
-  if (!rpc.Api.isSimulationSuccess(simulation)) {
-    throw new Error("The honest call did not simulate, so there is no footprint to submit the changed one with");
-  }
-  const measured = simulation.transactionData.build();
-  const { instructions, diskReadBytes, writeBytes } = measured.resources;
-  const resourceFee = BigInt(simulation.minResourceFee) * 2n;
-  const data = new SorobanDataBuilder(measured)
-    .setResources(Math.ceil(instructions * 1.25), diskReadBytes, writeBytes)
-    .setResourceFee(resourceFee.toString())
-    .build();
+    const simulation = await run.server.simulateTransaction(build(signedOperation(honest), bid));
+    if (!rpc.Api.isSimulationSuccess(simulation)) {
+      throw new Error("The honest call did not simulate, so there is no footprint to submit the changed one with");
+    }
+    const measured = simulation.transactionData.build();
+    const { instructions, diskReadBytes, writeBytes } = measured.resources;
+    const resourceFee = BigInt(simulation.minResourceFee) * 2n;
+    const data = new SorobanDataBuilder(measured)
+      .setResources(Math.ceil(instructions * 1.25), diskReadBytes, writeBytes)
+      .setResourceFee(resourceFee.toString())
+      .build();
 
-  const fee = resourceFee + 1000n;
-  line("fee", `${formatXlm(fee)} at most for a transaction sent to fail, twice what the honest call simulates at`);
-  const tx = build(signedOperation(tampered), fee.toString(), data);
-  tx.sign(source);
-  const sent = await run.server.sendTransaction(tx);
-  if (sent.status !== "PENDING") {
-    throw new Error(`The network did not take the transaction (${sent.status} ${sent.errorResult?.result.type ?? ""})`);
-  }
-  const result = await run.server.pollTransaction(sent.hash, { attempts: 60, sleepStrategy: rpc.BasicSleepStrategy });
+    const fee = resourceFee + bid;
+    line("fee", `${formatXlm(fee)} at most for a transaction sent to fail, twice what the honest call simulates at`);
+    return build(signedOperation(tampered), fee, data);
+  });
   if (result.status === rpc.Api.GetTransactionStatus.SUCCESS) {
-    throw new Error(`Transaction ${sent.hash} succeeded: the account accepted a call that was never signed`);
-  }
-  if (result.status !== rpc.Api.GetTransactionStatus.FAILED) {
-    throw new Error(`Transaction ${sent.hash} was sent and its result is not known yet`);
+    throw new Error(`Transaction ${result.txHash} succeeded: the account accepted a call that was never signed`);
   }
   return result;
 }
@@ -674,10 +824,10 @@ async function deliver(run: Run, burnTxHash: Hex, attestation: Attestation): Pro
       await sleep(POLL_MS);
     }
   } else {
-    const source = requireSource(run);
-    const delivery = { message: attestation.message, attestation: attestation.attestation, caller: source.publicKey() };
-    await quote(run, "for the delivery", deliverOperation(delivery, run.config));
-    ({ hash } = await deliverWith(attestation, source, run.config, run.server));
+    const caller = requireSource(run).publicKey();
+    const delivery = { message: attestation.message, attestation: attestation.attestation, caller };
+    // Circle's contracts take a message once: its nonce is the guard.
+    hash = await execute(run, "for the delivery", deliverOperation(delivery, run.config));
   }
 
   if (hash) {
@@ -705,6 +855,40 @@ function recipient(config: NetworkConfig, to: string | undefined): { address: st
   return usage(`--to must be a Stellar address (G… or C…) or an Ethereum address (0x…), not ${to}`);
 }
 
+const usedNoncesAbi = [
+  {
+    type: "function",
+    name: "usedNonces",
+    stateMutability: "view",
+    inputs: [{ name: "nonce", type: "bytes32" }],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+] as const;
+
+/**
+ * The Stellar address an attested burn pays: the one named in the hook data
+ * when the USDC goes through Circle's forwarder, the mint recipient itself
+ * otherwise.
+ */
+function stellarRecipient(message: Hex, config: NetworkConfig): string {
+  const burn = decodeBurnMessage(message);
+  return inboundRouteOf(message, config) === "forwarder"
+    ? hexToString(slice(burn.hookData, 32))
+    : StrKey.encodeContract(Buffer.from(hexToBytes(burn.mintRecipient)));
+}
+
+/** Whether Circle's message transmitter on Stellar has taken a message: it takes each one once. */
+async function takenOnStellar(run: Run, nonce: Hex): Promise<boolean> {
+  const used = await readContract(
+    run.config.stellar.messageTransmitter,
+    "is_nonce_used",
+    [xdr.ScVal.scvBytes(hexToBytes(nonce))],
+    run.config,
+    run.server,
+  );
+  return renderArg(used) === "true";
+}
+
 /**
  * Whoever pays on Base when it is not the owner: for the burn when there is
  * no faucet, and for the mint that ends the way back. On mainnet the owner
@@ -718,70 +902,132 @@ function basePayer(config: NetworkConfig): PrivateKeyAccount | undefined {
 
 /** Base → the account → another account → back to Base. */
 async function journey(run: Run, options: Options): Promise<void> {
-  const payer = basePayer(run.config) ?? run.owner;
-  const before = await usdcBalance(run.account, run.config, run.server);
+  const { config, server, account } = run;
+  const { chain } = config.evm;
+  const payer = basePayer(config) ?? run.owner;
+  const context = { owner: run.owner.address, network: config, server };
+  const before = await usdcBalance(account, config, server);
 
-  const burnTxHash = await fund(run, options, payer);
-  const inbound = await attested(run, run.config.evm.cctpDomain, burnTxHash);
-  const burn = decodeBurnMessage(inbound.message);
-  line("fee", `${formatEvmAmount(burn.feeExecuted)} USDC kept by Circle`);
+  if (options.skipFund) {
+    heading("The USDC is in the account already");
+    line("skipped", `the burn on ${chain.name} and the delivery on Stellar${options.resumeExit ? "" : "  (--skip-fund)"}`);
+    line("balance", `${formatStellarAmount(before)} USDC in ${account}`);
+    const needed =
+      (options.skipTransfer ? 0n : options.transfer) + (options.skipExit || options.resumeExit ? 0n : options.exit);
+    if (before < needed) {
+      throw new Error(
+        `The account holds ${formatStellarAmount(before)} USDC and the steps that are left take ` +
+          `${formatStellarAmount(needed)}. Run without --skip-fund to burn on ${chain.name} first`,
+      );
+    }
+  } else {
+    let burnTxHash: Hex;
+    if (options.resumeBurn) {
+      burnTxHash = options.resumeBurn;
+      heading(`A burn on ${chain.name} that has happened already`);
+      line("resumed", `${burnTxHash}  (--resume-burn)`);
+      line("", evmTxUrl(burnTxHash, config));
+    } else {
+      burnTxHash = await fund(run, options, payer);
+    }
+    reached(run, "--resume-burn", burnTxHash);
 
-  heading("The USDC is delivered on Stellar");
-  await deliver(run, burnTxHash, inbound);
-  const balance = await usdcBalance(run.account, run.config, run.server);
-  line("balance", `${formatStellarAmount(balance)} USDC in ${run.account} (was ${formatStellarAmount(before)})`);
-  line("deployed", (await isDeployed(run.owner.address, run.config, run.server)) ? "yes" : "not yet: it holds USDC all the same");
-  if (balance - before <= 0n) {
-    throw new Error("The account's balance did not grow");
+    const inbound = await attested(run, config.evm.cctpDomain, burnTxHash);
+    const burn = decodeBurnMessage(inbound.message);
+    line("fee", `${formatEvmAmount(burn.feeExecuted)} USDC kept by Circle`);
+    const destination = stellarRecipient(inbound.message, config);
+    if (destination !== account) {
+      throw new Error(`That burn pays ${destination}, which is not ${account}, the account of ${run.owner.address}`);
+    }
+
+    heading("The USDC is delivered on Stellar");
+    const delivered = await takenOnStellar(run, inbound.nonce);
+    if (delivered) line("delivered", "already: Circle's message transmitter on Stellar has taken this message");
+    else await deliver(run, burnTxHash, inbound);
+    reached(run, "--skip-fund");
+    const balance = await usdcBalance(account, config, server);
+    line("balance", `${formatStellarAmount(balance)} USDC in ${account} (was ${formatStellarAmount(before)})`);
+    line("deployed", (await isDeployed(run.owner.address, config, server)) ? "yes" : "not yet: it holds USDC all the same");
+    if (!delivered && balance - before <= 0n) {
+      throw new Error("The account's balance did not grow");
+    }
   }
 
-  const { address: to, note } = recipient(run.config, options.to);
-  heading(`${formatStellarAmount(options.transfer)} USDC to another Stellar address`);
-  line("to", `${to}  (${note})`);
-  const transfer = await sign(
-    await prepare(
-      { kind: "transfer", to, amount: options.transfer },
-      { owner: run.owner.address, network: run.config, server: run.server },
-    ),
-    run.owner,
-  );
-  showCalls("wallet", transfer.calls);
-  const sent = await submit(run, transfer);
-  if (sent.deployHash) {
-    line("deployed", sent.deployHash);
-    line("", stellarTxUrl(sent.deployHash, run.config));
+  if (options.skipTransfer) {
+    heading("The transfer to another Stellar address");
+    line("skipped", options.resumeExit ? "it came before the exit that is resumed" : "(--skip-transfer)");
+  } else {
+    const { address: to, note } = recipient(config, options.to);
+    heading(`${formatStellarAmount(options.transfer)} USDC to another Stellar address`);
+    line("to", `${to}  (${note})`);
+    const transfer = await sign(await prepare({ kind: "transfer", to, amount: options.transfer }, context), run.owner);
+    showCalls("wallet", transfer.calls);
+    const sent = await submit(run, transfer);
+    if (sent.deployHash) {
+      line("deployed", sent.deployHash);
+      line("", stellarTxUrl(sent.deployHash, config));
+    }
+    line("executed", sent.hash);
+    line("", stellarTxUrl(sent.hash, config));
+    line("received", `${formatStellarAmount(await usdcBalance(to, config, server))} USDC in ${to}`);
   }
-  line("executed", sent.hash);
-  line("", stellarTxUrl(sent.hash, run.config));
-  line("received", `${formatStellarAmount(await usdcBalance(to, run.config, run.server))} USDC in ${to}`);
+  reached(run, "--skip-fund", "--skip-transfer");
 
-  heading(`${formatStellarAmount(options.exit)} USDC back to ${run.config.evm.chain.name}`);
-  const exit = await sign(
-    await prepare(
-      { kind: "exit", amount: options.exit, recipient: run.owner.address },
-      { owner: run.owner.address, network: run.config, server: run.server },
-    ),
-    run.owner,
-  );
-  showCalls("wallet", exit.calls);
-  const left = await submit(run, exit);
-  line("executed", left.hash);
-  line("", stellarTxUrl(left.hash, run.config));
-  line("balance", `${formatStellarAmount(await usdcBalance(run.account, run.config, run.server))} USDC left in the account`);
+  if (options.skipExit) {
+    heading(`The way back to ${chain.name}`);
+    line("skipped", `the exit and the mint on ${chain.name}  (--skip-exit)`);
+    return;
+  }
+
+  let exitTxHash: string;
+  if (options.resumeExit) {
+    exitTxHash = options.resumeExit;
+    heading("An exit that has happened already");
+    line("resumed", `${exitTxHash}  (--resume-exit)`);
+    line("", stellarTxUrl(exitTxHash, config));
+  } else {
+    heading(`${formatStellarAmount(options.exit)} USDC back to ${chain.name}`);
+    const exit = await sign(
+      await prepare({ kind: "exit", amount: options.exit, recipient: run.owner.address }, context),
+      run.owner,
+    );
+    showCalls("wallet", exit.calls);
+    const left = await submit(run, exit);
+    if (left.deployHash) {
+      line("deployed", left.deployHash);
+      line("", stellarTxUrl(left.deployHash, config));
+    }
+    exitTxHash = left.hash;
+    line("executed", exitTxHash);
+    line("", stellarTxUrl(exitTxHash, config));
+    line("balance", `${formatStellarAmount(await usdcBalance(account, config, server))} USDC left in the account`);
+  }
+  reached(run, "--resume-exit", exitTxHash);
 
   // Circle indexes a burn made on Stellar under the bare transaction hash.
-  const outbound = await attested(run, run.config.stellar.cctpDomain, left.hash);
+  const outbound = await attested(run, config.stellar.cctpDomain, exitTxHash);
   const message = decodeBurnMessage(outbound.message);
   line("message", `${formatEvmAmount(message.amount)} USDC for 0x${message.mintRecipient.slice(-40)} on CCTP domain ${message.destinationDomain}`);
 
   const clients = evmClients(run, payer);
+  const used = await clients.publicClient.readContract({
+    address: config.evm.messageTransmitter,
+    abi: usedNoncesAbi,
+    functionName: "usedNonces",
+    args: [outbound.nonce],
+  });
+  if (used !== 0n) {
+    line("minted", `already: Circle's message transmitter on ${chain.name} has taken this message`);
+    reached(run, "--skip-fund", "--skip-transfer", "--skip-exit");
+    return;
+  }
   const gas = await clients.publicClient.getBalance({ address: payer.address });
   if (gas === 0n) {
-    line("mint", `attested and ready: anyone can call receiveMessage on ${run.config.evm.messageTransmitter}`);
+    line("mint", `attested and ready: anyone can call receiveMessage on ${config.evm.messageTransmitter}`);
     return;
   }
   const mint = {
-    address: run.config.evm.messageTransmitter,
+    address: config.evm.messageTransmitter,
     abi: messageTransmitterAbi,
     functionName: "receiveMessage",
     args: [outbound.message, outbound.attestation],
@@ -792,10 +1038,11 @@ async function journey(run: Run, options: Options): Promise<void> {
   const mintTxHash = await clients.walletClient.writeContract(mint);
   const receipt = await clients.publicClient.waitForTransactionReceipt({ hash: mintTxHash });
   if (receipt.status !== "success") {
-    throw new Error(`The mint on ${run.config.evm.chain.name} reverted: ${mintTxHash}`);
+    throw new Error(`The mint on ${chain.name} reverted: ${mintTxHash}`);
   }
   line("minted", mintTxHash);
-  line("", evmTxUrl(mintTxHash, run.config));
+  line("", evmTxUrl(mintTxHash, config));
+  reached(run, "--skip-fund", "--skip-transfer", "--skip-exit");
 }
 
 /** Stops the run when a chain does not say what the configuration says. */
@@ -955,7 +1202,7 @@ async function planBase(
   waiting: string[],
 ): Promise<bigint> {
   const { owner, payer } = parties;
-  const { chain, usdc, tokenMessenger } = config.evm;
+  const { chain, usdc, tokenMessenger, messageTransmitter } = config.evm;
   const amount = options.burn;
   const [eth, held, allowance] = await Promise.all([
     base.getBalance({ address: payer }),
@@ -965,58 +1212,78 @@ async function planBase(
   line("payer", `${payer}${payer === owner ? ", the owner," : ""} holds ${formatEther(eth)} ETH and ${formatEvmAmount(held)} USDC`);
   line("", evmAddressUrl(payer, config));
 
-  const hasHub = config.stellar.hub !== "";
-  const planned = hasHub ? config : { ...config, stellar: { ...config.stellar, hub: PLACEHOLDER_HUB } };
-  const { calls, maxFee } = await burnCalls(planned, base, parties, amount);
-  const asIfFunded = held < amount || allowance < amount;
-
-  let gas = MINT_GAS_ALLOWANCE;
+  let gas = 0n;
   let dataFee = 0n;
-  for (const call of calls) {
-    const isBurn = call.address === tokenMessenger;
-    const label = isBurn ? "burn" : "approve";
-    const what = `${isBurn ? "TokenMessenger" : "USDC"}.${call.functionName}`;
-    try {
-      const callGas = await base.estimateContractGas({
-        ...call,
-        account: payer,
-        stateOverride: isBurn && asIfFunded ? fundedForBurn(config, payer, amount) : undefined,
-      });
-      const callDataFee = await base.estimateL1Fee({
-        account: payer,
-        to: call.address,
-        data: encodeFunctionData(call),
-        gas: callGas,
-      });
-      gas += callGas;
-      // The mint that ends the journey posts about as much data as the burn.
-      dataFee += isBurn ? callDataFee * 2n : callDataFee;
-      line(label, `${what}  ${callGas} gas, simulated`);
-    } catch (error) {
-      const reason = (error instanceof Error ? error.message : String(error)).split("\n", 1)[0]!;
-      line(label, `${what}  does not simulate: ${reason}`);
-      waiting.push(`the ${label} on ${chain.name} does not simulate: ${reason}`);
+  let arriving = 0n;
+  if (options.skipFund || options.resumeBurn) {
+    line("burn", options.resumeBurn ? `nothing to send: ${options.resumeBurn} is resumed` : "nothing to send  (--skip-fund)");
+  } else {
+    const hasHub = config.stellar.hub !== "";
+    const planned = hasHub ? config : { ...config, stellar: { ...config.stellar, hub: PLACEHOLDER_HUB } };
+    const { calls, maxFee } = await burnCalls(planned, base, parties, amount);
+    const asIfFunded = held < amount || allowance < amount;
+    arriving = toStellarUnits(amount - maxFee);
+    for (const call of calls) {
+      const isBurn = call.address === tokenMessenger;
+      const label = isBurn ? "burn" : "approve";
+      const what = `${isBurn ? "TokenMessenger" : "USDC"}.${call.functionName}`;
+      try {
+        const callGas = await base.estimateContractGas({
+          ...call,
+          account: payer,
+          stateOverride: isBurn && asIfFunded ? fundedForBurn(config, payer, amount) : undefined,
+        });
+        gas += callGas;
+        dataFee += await base.estimateL1Fee({ account: payer, to: call.address, data: encodeFunctionData(call), gas: callGas });
+        line(label, `${what}  ${callGas} gas, simulated`);
+      } catch (error) {
+        const reason = describe(error).split("\n", 1)[0]!;
+        line(label, `${what}  does not simulate: ${reason}`);
+        waiting.push(`the ${label} on ${chain.name} does not simulate: ${reason}`);
+      }
+      if (isBurn) {
+        line("", `${formatEvmAmount(amount)} USDC to Stellar by fast transfer, fee cap ${formatEvmAmount(maxFee)} USDC`);
+        if (asIfFunded) line("", "simulated as if the payer already held the USDC and had approved it");
+        if (!hasHub) line("", "simulated towards a placeholder: the account address follows from the hub");
+      }
     }
-    if (isBurn) {
-      line("", `${formatEvmAmount(amount)} USDC to Stellar by fast transfer, fee cap ${formatEvmAmount(maxFee)} USDC`);
-      if (asIfFunded) line("", "simulated as if the payer already held the USDC and had approved it");
-      if (!hasHub) line("", "simulated towards a placeholder: the account address follows from the hub");
+    if (held < amount) {
+      waiting.push(`${payer} holds ${formatEvmAmount(held)} USDC on ${chain.name} and needs ${formatEvmAmount(amount)}`);
     }
   }
-  line("mint", `MessageTransmitter.receiveMessage  ${MINT_GAS_ALLOWANCE} gas allowed`);
-  line("", "not simulated: it needs Circle's attestation of the exit");
+
+  if (options.skipExit) {
+    line("mint", "nothing to send  (--skip-exit)");
+  } else {
+    // The message does not exist yet: the data it posts is priced with bytes of its size that compress as badly.
+    const data = encodeFunctionData({
+      abi: messageTransmitterAbi,
+      functionName: "receiveMessage",
+      args: [incompressible(BURN_MESSAGE_BYTES), incompressible(ATTESTATION_BYTES)],
+    });
+    gas += MINT_GAS_ALLOWANCE;
+    dataFee += await base.estimateL1Fee({ account: payer, to: messageTransmitter, data, gas: MINT_GAS_ALLOWANCE });
+    line("mint", `MessageTransmitter.receiveMessage  ${MINT_GAS_ALLOWANCE} gas allowed`);
+    line("", "not simulated: it needs Circle's attestation of the exit");
+  }
 
   const { maxFeePerGas } = await base.estimateFeesPerGas();
   const needsEth = 2n * (gas * maxFeePerGas + dataFee);
   line("gas", `${formatGwei(maxFeePerGas)} gwei at most, and ${formatEther(dataFee)} ETH for the data posted to Ethereum`);
-  line("needs", `${formatEvmAmount(amount)} USDC and ${formatEther(needsEth)} ETH, twice what these transactions come to`);
-  if (held < amount) {
-    waiting.push(`${payer} holds ${formatEvmAmount(held)} USDC on ${chain.name} and needs ${formatEvmAmount(amount)}`);
-  }
+  line("needs", `${formatEther(needsEth)} ETH, twice what these transactions come to${arriving > 0n ? `, and ${formatEvmAmount(amount)} USDC` : ""}`);
   if (eth < needsEth) {
     waiting.push(`${payer} holds ${formatEther(eth)} ETH on ${chain.name} and needs ${formatEther(needsEth)}`);
   }
-  return toStellarUnits(amount - maxFee);
+  return arriving;
+}
+
+/** Bytes that do not compress, as many as asked for. */
+function incompressible(length: number): Hex {
+  let bytes: Hex = "0x";
+  for (let word = keccak256("0x"); size(bytes) < length; word = keccak256(word)) {
+    bytes = concat([bytes, word]);
+  }
+  return slice(bytes, 0, length);
 }
 
 /** What the fee payer sends on Stellar and what it has to hold for it. */
@@ -1041,7 +1308,7 @@ async function planStellar(
     const context = { owner, network: config };
     let simulated = 0n;
     const estimate = async (label: string, what: string, operation: xdr.Operation): Promise<void> => {
-      const fee = await simulatedFee(server, stellar.networkPassphrase, source, operation);
+      const fee = await simulatedFee(server, stellar.networkPassphrase, source, operation, INCLUSION_BID[config.name]);
       simulated += fee;
       line(label, `${what}  ${formatXlm(fee)} at most, simulated`);
     };
@@ -1050,22 +1317,34 @@ async function planStellar(
     else await estimate("deploy", "hub.deploy", deployOperation(owner, config));
 
     if (!options.stellarOnly) {
-      line("deliver", "CctpForwarder.mint_and_forward  not simulated: it needs Circle's attestation of the burn");
+      if (options.skipFund) line("deliver", "nothing to send  (--skip-fund)");
+      else line("deliver", "CctpForwarder.mint_and_forward  not simulated: it needs Circle's attestation of the burn");
+
+      const transfers = !options.skipTransfer;
+      const exits = !options.skipExit && !options.resumeExit;
       const held = await usdcBalance(account, config, server);
-      const leaving = options.transfer + options.exit;
-      if (held < leaving) {
-        line("transfer", `USDC.transfer  not simulated: the account holds ${formatStellarAmount(held)} USDC until the delivery`);
-        line("exit", "hub.exit  not simulated, for the same reason");
-      } else {
-        const { address: to } = recipient(config, options.to);
+      const leaving = (transfers ? options.transfer : 0n) + (exits ? options.exit : 0n);
+      line("account", `${account} holds ${formatStellarAmount(held)} USDC`);
+      const unfunded = `not simulated: the account holds ${formatStellarAmount(held)} USDC until the delivery`;
+      if (!transfers) line("transfer", "nothing to send");
+      else if (held < leaving) line("transfer", `USDC.transfer  ${unfunded}`);
+      else {
+        const { address: to, note } = recipient(config, options.to);
         const transfer: Action = { kind: "transfer", to, amount: options.transfer };
-        const exit: Action = { kind: "exit", amount: options.exit, recipient: owner };
-        await estimate("transfer", "USDC.transfer", await buildOperation(transfer, context));
-        await estimate("exit", "hub.exit", await buildOperation(exit, context));
+        await estimate("transfer", `USDC.transfer of ${formatStellarAmount(options.transfer)} USDC`, await buildOperation(transfer, context));
+        line("", `to ${to}  (${note})`);
       }
-      if (held + arriving < leaving) {
+      if (!exits) line("exit", "nothing to send");
+      else if (held < leaving) line("exit", `hub.exit  ${unfunded}`);
+      else {
+        const exit: Action = { kind: "exit", amount: options.exit, recipient: owner };
+        await estimate("exit", `hub.exit of ${formatStellarAmount(options.exit)} USDC`, await buildOperation(exit, context));
+        line("", `to ${owner} on ${config.evm.chain.name}`);
+      }
+      // What a resumed burn delivers is known once Circle's attestation has been read, which the run does.
+      if (!options.resumeBurn && held + arriving < leaving) {
         waiting.push(
-          `the account would hold ${formatStellarAmount(held + arriving)} USDC after the delivery, less than the ` +
+          `the account would hold ${formatStellarAmount(held + arriving)} USDC, less than the ` +
             `${formatStellarAmount(leaving)} the transfer and the exit take: burn more or send less`,
         );
       }
@@ -1232,7 +1511,10 @@ async function main(): Promise<void> {
 main().then(
   () => process.exit(0),
   (error: unknown) => {
-    console.error(`\n${error instanceof Error ? error.message : String(error)}`);
+    console.error(`\n${describe(error)}`);
+    if (continuation) {
+      console.error(`\nEverything printed above has happened and stands. To continue from there:\n\n    ${continuation}`);
+    }
     process.exit(1);
   },
 );
