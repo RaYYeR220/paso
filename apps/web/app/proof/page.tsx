@@ -1,79 +1,173 @@
-"use client";
+import type { Metadata } from "next";
+import { AccountPair, AppShell, ExternalLink, TopBar } from "@/components/app";
+import { NETWORK_LABEL, REFUSAL_ON_CHAIN, SITE_LINKS } from "@/components/app/site";
+import { LiveStatus } from "./LiveStatus";
 
-import { NETWORK, baseAddress, stellarAddress, useHealth } from "@/lib/client";
+export const metadata: Metadata = {
+  title: "Proof",
+  description: "Every claim Paso makes, with the transaction or the command that backs it.",
+};
 
-/** What is deployed and what the server runs on, each with a link to check it. */
+const LINKS = SITE_LINKS.filter((link) => link.href !== "/proof");
+
+const OWNER = "0x7880DA9a52Af491f76421869d4e28DC0A4D1767C";
+const ACCOUNT = "CCI3UVOB35NEJCTKPCLSPJVT745BNT2QNACV3QP46CRYTVD3QCOH2VME";
+const HUB = "CBNSNERNVI7NW7JWDLOFJQJYMJC67EMVZLQONBBPWR4HLQMP53QGFOBO";
+const ACCOUNT_CODE_HASH = "2ee1ac08ca6407667db15bcffe75c8cbb4e41d95b2d047541b5dad133cfe75ee";
+
+const BASESCAN = "https://sepolia.basescan.org/tx/";
+const EXPERT = "https://stellar.expert/explorer/testnet/";
+const REPO = "https://github.com/RaYYeR220/paso";
+
+const RUN: readonly { text: string; chain: "Base Sepolia" | "Stellar"; href: string }[] = [
+  {
+    text: "1 USDC burned on Base Sepolia",
+    chain: "Base Sepolia",
+    href: `${BASESCAN}0x43c00d27bf35c2288c160e6e1bfad424a206dc0e0b2d0ae901e7b20a88879b9e`,
+  },
+  {
+    text: "Attested by Circle in 7 seconds, delivered on Stellar: 0.99987 USDC in the account",
+    chain: "Stellar",
+    href: `${EXPERT}tx/f7c95418993326f42b05c8a682e9dc3a9a7e18d0ad267b168eba09b1a40d23f1`,
+  },
+  {
+    text: "0.1 USDC sent to the Stellar account of another Ethereum address that had never been deployed",
+    chain: "Stellar",
+    href: `${EXPERT}tx/dc3db1dd76496889c53a0007d3017e6b0d8019848c4ebbe555f9899b76eadf63`,
+  },
+  {
+    text: "0.5 USDC sent back to Base with one signature",
+    chain: "Stellar",
+    href: `${EXPERT}tx/6cae28f1ea0f3d8020cfda61f75cfb6b8b13914fe859569d20c9e935a2e79a2f`,
+  },
+  {
+    text: "Minted on Base Sepolia 9 seconds later",
+    chain: "Base Sepolia",
+    href: `${BASESCAN}0xd81b8b7e8f762910712494e3fba1b29144f2cef41a27081c44adb820ee5b137d`,
+  },
+];
+
+const TESTS: readonly { text: string; command?: string }[] = [
+  { text: "Account contract 29, hub 15", command: "pnpm test:contracts" },
+  { text: "SDK 181 offline", command: "pnpm test:sdk" },
+  { text: "Relayer 87 offline, 108 against testnet", command: "pnpm test:web" },
+  { text: "11 signing vectors checked by both the Rust and the TypeScript suites." },
+];
+
+/** Every claim, each with the transaction or the command that backs it. */
 export default function ProofPage() {
-  const health = useHealth();
-  const { report } = health;
-  const { hub, accountWasmHash, usdc, forwarder, tokenMessenger, messageTransmitter } = NETWORK.stellar;
-  const contracts: [string, string][] = [
-    ["Hub", report?.hub || hub],
-    ["USDC", usdc],
-    ["Circle forwarder", forwarder],
-    ["Circle TokenMessenger", tokenMessenger],
-    ["Circle MessageTransmitter", messageTransmitter],
-  ];
-
   return (
-    <main style={{ padding: 16 }}>
-      <h1>Paso</h1>
-      <h2>Proof</h2>
+    <AppShell>
+      <TopBar network={NETWORK_LABEL} links={LINKS} />
+      <AccountPair evmAddress={OWNER} stellarAddress={ACCOUNT} showBalance={false} />
+      <main className="doc">
+        <div className="doc-lead">
+          <h1>Proof</h1>
+          <p>Every claim Paso makes, with the transaction or the command that backs it.</p>
+          <p className="doc-meta">Testnet: Stellar testnet and Base Sepolia.</p>
+          <LiveStatus />
+        </div>
 
-      <h3>Contracts on Stellar {NETWORK.name}</h3>
-      <ul>
-        {contracts.map(([name, address]) =>
-          address ? (
-            <li key={name}>
-              {name}:{" "}
-              <a href={stellarAddress(address)} target="_blank" rel="noreferrer">
-                <code>{address}</code>
-              </a>
-            </li>
-          ) : null,
-        )}
-        <li>
-          Account contract (wasm hash): <code>{accountWasmHash || "not deployed"}</code>
-        </li>
-      </ul>
+        <div className="doc-body">
+          <section aria-labelledby="run">
+            <h2 id="run">One run, start to finish</h2>
+            <p className="doc-meta">
+              2026-10-12, owner <span className="hash">{OWNER}</span>
+            </p>
+            <ol className="stations">
+              {RUN.map((station) => (
+                <li key={station.href}>
+                  <span>{station.text}</span>
+                  <ExternalLink href={station.href}>{station.chain}</ExternalLink>
+                </li>
+              ))}
+            </ol>
+            <p className="doc-sum">
+              From the burn on Base to the mint back on Base: 32 seconds. The owner&rsquo;s account paid no Stellar fee.
+            </p>
+          </section>
 
-      <h3>Server</h3>
-      {health.status === "loading" || health.status === "idle" ? <p role="status">Loading…</p> : null}
-      {health.error ? <p role="alert">The server did not answer: {health.error}</p> : null}
-      {report ? (
-        <ul>
-          <li>
-            Healthy: <code>{String(report.ok)}</code>
-          </li>
-          <li>
-            Network: <code>{report.network}</code>
-          </li>
-          <li>
-            Latest ledger: <code>{report.latestLedger ?? "unknown"}</code>
-          </li>
-          <li>
-            Relayer (pays fees, nothing else):{" "}
-            <a href={stellarAddress(report.relayer.address)} target="_blank" rel="noreferrer">
-              <code>{report.relayer.address}</code>
-            </a>{" "}
-            · {report.relayer.xlm ?? "unknown"} XLM
-          </li>
-          <li>
-            Most a relayed call may cost: <code>{report.maxResourceFee}</code> stroops
-          </li>
-          {report.payer ? (
-            <li>
-              Faucet payer on {report.payer.chain}:{" "}
-              <a href={baseAddress(report.payer.address)} target="_blank" rel="noreferrer">
-                <code>{report.payer.address}</code>
-              </a>{" "}
-              · {report.payer.usdc ?? "unknown"} USDC · {report.payer.eth ?? "unknown"} ETH · faucet {health.faucet}
-            </li>
-          ) : (
-            <li>Faucet: switched off</li>
-          )}
-        </ul>
-      ) : null}
-    </main>
+          <section aria-labelledby="refusal">
+            <h2 id="refusal">The refusal</h2>
+            <ul className="claims">
+              <li data-mark="refused">
+                <span>
+                  Signed for amount 1, submitted with amount 10000000000000: FAILED on chain, account answered
+                  Error(Contract, #2) BadSignature
+                </span>
+                <ExternalLink href={REFUSAL_ON_CHAIN}>Stellar</ExternalLink>
+              </li>
+              <li data-mark="match">
+                <span>The honest twin of that call, accepted</span>
+                <ExternalLink href={`${EXPERT}tx/b8a81489a2b20babc3ceadf6c9b22ba15965c725a6594b3413de6c4aadc91ac5`}>
+                  Stellar
+                </ExternalLink>
+              </li>
+            </ul>
+          </section>
+
+          <section aria-labelledby="contracts">
+            <h2 id="contracts">Contracts</h2>
+            <p className="doc-meta">Stellar testnet</p>
+            <dl className="facts">
+              <div>
+                <dt>Hub</dt>
+                <dd className="hash">
+                  <ExternalLink href={`${EXPERT}contract/${HUB}`}>{HUB}</ExternalLink>
+                </dd>
+              </div>
+              <div>
+                <dt>Example account</dt>
+                <dd className="hash">
+                  <ExternalLink href={`${EXPERT}contract/${ACCOUNT}`}>{ACCOUNT}</ExternalLink>
+                </dd>
+              </div>
+              <div>
+                <dt>Account code hash</dt>
+                <dd className="hash">{ACCOUNT_CODE_HASH}</dd>
+              </div>
+            </dl>
+            <p>Account code 7,837 bytes; hub 4,156 bytes. No admin key, no upgrade path.</p>
+          </section>
+
+          <section aria-labelledby="tests">
+            <h2 id="tests">Tests</h2>
+            <ul className="claims">
+              {TESTS.map((test) => (
+                <li key={test.text}>
+                  <span>{test.text}</span>
+                  {test.command ? <code>{test.command}</code> : null}
+                </li>
+              ))}
+            </ul>
+          </section>
+
+          <section aria-labelledby="check">
+            <h2 id="check">Check it yourself</h2>
+            <p>
+              <code>pnpm verify 43a92797a315f742ef121ec607e9d2ca23b68e10eb6d2ce931f5e7f7f0ad6d90</code>
+            </p>
+            <p>
+              Rebuilds the signed message from the transaction, recovers the signer and checks it is the account&rsquo;s
+              owner.
+            </p>
+            <p className="doc-links">
+              <ExternalLink href={`${REPO}/blob/main/docs/VERIFY.md`}>Guide</ExternalLink>
+              <ExternalLink href={`${REPO}/blob/main/docs/CLAIMS.md`}>Every claim and its status</ExternalLink>
+              <ExternalLink href={REPO}>Source</ExternalLink>
+            </p>
+          </section>
+
+          <section aria-labelledby="limits">
+            <h2 id="limits">Limits</h2>
+            <p>
+              No key rotation or recovery. Regular wallets only, not smart-contract wallets. Vectors, maps and structs in
+              arguments are bound by hash rather than shown as text. The relayer can decline to relay; it cannot move
+              funds, and anyone can submit instead. Unaudited.
+            </p>
+          </section>
+        </div>
+      </main>
+    </AppShell>
   );
 }

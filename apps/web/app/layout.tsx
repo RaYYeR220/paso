@@ -13,9 +13,19 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
+function siteUrl(): URL {
+  try {
+    return new URL(process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3000");
+  } catch {
+    return new URL("http://localhost:3000");
+  }
+}
+
 export const metadata: Metadata = {
-  title: "Paso",
+  metadataBase: siteUrl(),
+  title: { default: "Paso", template: "%s · Paso" },
   description: "Your Ethereum wallet is already a Stellar account.",
+  icons: { icon: "/paso-mark.svg" },
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
