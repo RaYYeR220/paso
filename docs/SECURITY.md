@@ -1,6 +1,6 @@
 # Security
 
-Paso is unaudited and runs on testnet only. This document says what the contracts guarantee, what each party can and cannot do, and what is out of scope.
+Paso is unaudited. The contracts are deployed on Stellar mainnet and on testnet; the web app and the relayer are set up for testnet only. This document says what the contracts guarantee, what each party can and cannot do, and what is out of scope.
 
 ## What is protected
 
@@ -32,7 +32,7 @@ The contract has three functions: `__constructor(owner)`, `owner()` and `__check
 | Only contract calls are authorised | A contract creation in the tree returns `UnsupportedContext`. | `rejects_create_contract_context` |
 | There is no other way in | No admin, no upgrade function, no way to change the owner. | The contract's source |
 
-The on-chain demonstration is a transaction that changed one argument after signing and was submitted on purpose: [`ded23530…`](https://stellar.expert/explorer/testnet/tx/ded23530dfc8d114a1350522e45b257170ed775738b0e85887f0e6667d52b181). It failed with `Error(Contract, #2)`.
+The on-chain demonstration is a transaction that changed one argument after signing and was submitted on purpose. On mainnet: [`eb945398…`](https://stellar.expert/explorer/public/tx/eb94539839cba10012c01cea9453410d740d89194c2e99c4b33958aec144b6a3). On testnet: [`ded23530…`](https://stellar.expert/explorer/testnet/tx/ded23530dfc8d114a1350522e45b257170ed775738b0e85887f0e6667d52b181). Both failed with `Error(Contract, #2)`.
 
 The format is specified in [ENCODING.md](ENCODING.md).
 
@@ -87,12 +87,14 @@ Relayer tests for this rule, in [`apps/web/test/relay.test.ts`](../apps/web/test
 
 ### Its other transactions
 
-The relayer builds two kinds of transaction itself. Callers supply no entry for them.
+The relayer builds three kinds of transaction itself. Callers supply no entry for them.
 
 - **Deploying an account.** The call is `hub.deploy(owner)`. If the simulation asks for any authorisation, the transaction is not sent.
 - **Delivering a CCTP message.** The caller supplies a burn transaction hash. The relayer fetches the message and the attestation from Circle and builds the call from those bytes. Circle's MessageTransmitter asks its caller to authorise the call when it is called directly; that one authorisation, for exactly the call being made with nothing nested under it, is the only authorisation the relayer account ever gives. Anything more is refused.
 
-The fee cap and the daily budget apply to these too.
+- **Finishing an exit on Base.** The caller supplies the hash of an exit on Stellar. Once Circle has attested it, the server's account on Base submits Circle's `receiveMessage` and pays the gas. Circle's contract decides who receives the USDC: the recipient named in the signed exit. The server completes only exits made through the hub from Stellar to Base, simulates the mint first and sends nothing that does not simulate. Mints are limited per caller and per day, stop below an ETH floor and above a gas price cap, and are off on mainnet unless `PAY_BASE_MINTS_ON_MAINNET=true`. Anyone else can submit the same mint from any wallet.
+
+The fee cap and the daily budget apply to the two Stellar kinds.
 
 ### Limits on use
 
@@ -131,11 +133,11 @@ USDC moves between Base and Stellar through Circle's contracts and Circle's atte
 ## Known limits and non-goals
 
 - Unaudited.
-- Testnet only. Nothing is deployed on mainnet.
+- Mainnet covers the contracts and one scripted run. The web app and the relayer have run on testnet only.
 - No key rotation, no recovery, no guardians, no spending limits, no session keys.
 - No upgrade path. A bug in the account code cannot be patched in place.
 - Externally owned accounts only. ERC-1271 smart-contract wallets cannot sign.
-- Browser wallets are untested. The signatures in the linked transactions were made by scripts through viem's EIP-712 signer.
+- Wallet extensions are untested. The signatures in the linked transactions were made by scripts, or by the web app's demo key in the browser, through viem's EIP-712 signer.
 - Nested arguments are bound by hash and are not readable.
 - The message shows raw integers and addresses, carries no types, and does not show the signature's expiry.
 - A signature whose `r` is not a valid curve point aborts in the host instead of returning a typed error. The transaction still fails.
@@ -145,4 +147,4 @@ USDC moves between Base and Stellar through Circle's contracts and Circle's atte
 
 ## Reporting an issue
 
-Open an issue at <https://github.com/RaYYeR220/paso/issues>. The project runs on testnet and holds no real funds, so reports are handled in the open.
+Open an issue at <https://github.com/RaYYeR220/paso/issues>. There is no private channel and no bounty. The contracts on mainnet are unaudited and cannot be paused or upgraded; do not keep in an account more than you can afford to lose.

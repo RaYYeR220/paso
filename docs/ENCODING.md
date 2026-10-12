@@ -144,7 +144,7 @@ The preimage contains:
 - the root invocation with all its sub-invocations,
 - and, for the address-bound credential encoding, the address of the account.
 
-The preimage type follows the credential type of the entry. In `@stellar/stellar-sdk` the legacy encoding is `sorobanCredentialsAddress` and its preimage is `envelopeTypeSorobanAuthorization`; the address-bound encoding is `sorobanCredentialsAddressV2` and its preimage is `envelopeTypeSorobanAuthorizationWithAddress`. Simulation decides which one an entry gets. The linked testnet transactions all use the address-bound encoding.
+The preimage type follows the credential type of the entry. In `@stellar/stellar-sdk` the legacy encoding is `sorobanCredentialsAddress` and its preimage is `envelopeTypeSorobanAuthorization`; the address-bound encoding is `sorobanCredentialsAddressV2` and its preimage is `envelopeTypeSorobanAuthorizationWithAddress`. Simulation decides which one an entry gets. The linked transactions, on testnet and on mainnet, all use the address-bound encoding.
 
 To build it:
 
@@ -320,6 +320,8 @@ The exit in transaction [`6cae28f1…`](https://stellar.expert/explorer/testnet/
 | Recovered signer | `0x7880DA9a52Af491f76421869d4e28DC0A4D1767C` |
 
 `pnpm verify 6cae28f1ea0f3d8020cfda61f75cfb6b8b13914fe859569d20c9e935a2e79a2f` prints these values from chain data.
+
+The same exit on mainnet is [`fccc2318…`](https://stellar.expert/explorer/public/tx/fccc2318b8322cc020fd0d6c0a84f05dea45a36725ae9ba24f36a6a7287d76c6). It is signed under the mainnet salt, names the mainnet hub and USDC contracts, and is checked with `pnpm verify fccc2318b8322cc020fd0d6c0a84f05dea45a36725ae9ba24f36a6a7287d76c6 --network mainnet`.
 
 ## 15. Checklist for a signer
 
