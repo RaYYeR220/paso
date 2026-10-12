@@ -1,10 +1,13 @@
 import {
   entryTypedData,
   prepare,
-  relay,
+  RelayError,
+  relayRequest,
   sign,
   withArgument,
   type NetworkConfig,
+  type RelayErrorCode,
+  type RelayResult,
   type Signed,
   type TypedDataSigner,
 } from "@paso/sdk";
@@ -19,6 +22,8 @@ import {
   IDLE_ACTION,
   isActionBusy,
   reviewOf,
+  UNCONFIRMED,
+  UNCONFIRMED_MESSAGE,
   type ActionEvent,
   type ActionRequest,
   type ActionState,
@@ -53,7 +58,8 @@ export interface ActionDeps {
   now?: () => number;
   prepare?: typeof prepare;
   sign?: typeof sign;
-  relay?: typeof relay;
+  /** One request to the relayer for a signed call. Defaults to `postRelay`. */
+  relay?: (signed: Signed, relayUrl: string) => Promise<RelayResult>;
   withArgument?: typeof withArgument;
   /**
    * A prepared call older than this is prepared again instead of signed. A
@@ -61,8 +67,70 @@ export interface ActionDeps {
    * wallet for one that cannot be used any more wastes a prompt.
    */
   staleAfterMs?: number;
-  /** How long to wait before the one second attempt at a relayer that was unavailable. */
+  /** How long to wait before asking a relayer again that gave no answer. The wait doubles from there, up to a few seconds. */
   retryDelayMs?: number;
+  /**
+   * How long after a call was prepared the relayer is still asked about it.
+   * A signature lasts about ten minutes; past that, plus the time it takes
+   * the network to say so, no answer can change what happened.
+   */
+  giveUpAfterMs?: number;
+}
+
+/** What a relayer's answer says beyond its code, when it says it. */
+export interface RelayFacts {
+  /**
+   * `false`: the relayer decided before handing anything to the network, and
+   * has checked that the call has not run. `true`: a transaction went out.
+   * Absent: the relayer makes no claim, and neither may the screen.
+   */
+  sent?: boolean;
+  retryAfterSeconds?: number;
+}
+
+/**
+ * One request to the relayer for a signed call.
+ *
+ * The body is made from the signed call alone, so asking again sends the
+ * same bytes and the relayer recognises the call. A refusal is thrown as a
+ * `RelayError` that also carries the relayer's `RelayFacts`.
+ */
+export async function postRelay(signed: Signed, relayUrl: string, fetcher: typeof fetch = fetch): Promise<RelayResult> {
+  const response = await fetcher(relayUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(relayRequest(signed)),
+  });
+
+  const text = await response.text();
+  let body: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (typeof parsed === "object" && parsed !== null) body = parsed as Record<string, unknown>;
+  } catch {
+    body = {};
+  }
+  if (response.ok && typeof body.hash === "string") {
+    return typeof body.deployHash === "string" ? { hash: body.hash, deployHash: body.deployHash } : { hash: body.hash };
+  }
+
+  const code = typeof body.error === "string" ? (body.error as RelayErrorCode) : "relay_failed";
+  const detail = typeof body.detail === "string" ? body.detail : typeof body.error === "string" ? undefined : text.slice(0, 300);
+  const retryAfter = Number(response.headers.get("retry-after"));
+  const facts: RelayFacts = {
+    ...(typeof body.sent === "boolean" ? { sent: body.sent } : {}),
+    ...(Number.isFinite(retryAfter) && retryAfter > 0 ? { retryAfterSeconds: retryAfter } : {}),
+  };
+  throw Object.assign(new RelayError(code, response.status, detail), facts);
+}
+
+function factsOf(error: unknown): RelayFacts {
+  if (typeof error !== "object" || error === null) return {};
+  const { sent, retryAfterSeconds } = error as { sent?: unknown; retryAfterSeconds?: unknown };
+  return {
+    ...(typeof sent === "boolean" ? { sent } : {}),
+    ...(typeof retryAfterSeconds === "number" && retryAfterSeconds > 0 ? { retryAfterSeconds } : {}),
+  };
 }
 
 export interface ActionController {
@@ -81,7 +149,15 @@ export interface ActionController {
 
 const DEFAULT_STALE_AFTER_MS = 9 * 60_000;
 const DEFAULT_RETRY_DELAY_MS = 1_500;
+const MAX_RETRY_DELAY_MS = 8_000;
+const DEFAULT_GIVE_UP_AFTER_MS = 11 * 60_000;
 const REFUSALS: readonly string[] = ["bad_signature", "simulation_failed", "bad_request"];
+/**
+ * Answers that judge nothing: the relayer could not be reached, could not
+ * reach Stellar, has a transaction on its way, or answered something
+ * unreadable. The same signed call is offered again.
+ */
+const NOT_AN_ANSWER: readonly string[] = ["unavailable", "network", "relay_failed", "rate_limited"];
 
 /** The message the account contract rebuilds from an authorisation entry: its account, its calls, its payload. */
 export function messageOfEntry(entry: string, network: NetworkConfig): SignedMessage {
@@ -125,10 +201,11 @@ export function createActionController(owner: Address, deps: ActionDeps): Action
   const now = deps.now ?? Date.now;
   const prepareCall = deps.prepare ?? prepare;
   const signCall = deps.sign ?? sign;
-  const relayCall = deps.relay ?? relay;
+  const relayCall = deps.relay ?? postRelay;
   const alter = deps.withArgument ?? withArgument;
   const staleAfterMs = deps.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
   const retryDelayMs = deps.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
+  const giveUpAfterMs = deps.giveUpAfterMs ?? DEFAULT_GIVE_UP_AFTER_MS;
 
   const store = createStore<ActionState>(IDLE_ACTION);
   /** Set from the first synchronous line of an operation to its last: two clicks cannot both get in. */
@@ -220,24 +297,52 @@ export function createActionController(owner: Address, deps: ActionDeps): Action
       at: now(),
     });
 
-    /**
-     * Hands the signed call to the relayer. A relayer that could not reach
-     * Stellar has judged nothing, so the same call is offered once more; a
-     * refusal is an answer and is never asked about twice.
-     */
-    const relayPatiently = async () => {
-      try {
-        return await relayCall(submitted, relayUrl);
-      } catch (error) {
-        if (describeFailure(error).code !== "unavailable" || !current()) throw error;
-        dispatch({ type: "RELAY_RETRY" });
-        await new Promise<void>((resolve) => setTimeout(resolve, retryDelayMs));
-        return relayCall(submitted, relayUrl);
-      }
-    };
+    /** The call may have run without anyone here having seen it: nothing is claimed either way. */
+    const unconfirmed = (detail?: string): ActionEvent => ({
+      type: "RELAY_FAILED",
+      error: { kind: "error", code: UNCONFIRMED, message: UNCONFIRMED_MESSAGE, retryable: false, ...(detail ? { detail } : {}) },
+    });
 
-    try {
-      const { hash, deployHash } = await relayPatiently();
+    /**
+     * Offers the signed call to the relayer until it gives an answer about
+     * the call, or until no answer could change anything any more.
+     *
+     * It is always the same signed call, byte for byte, so the relayer
+     * recognises it and reports what became of the first request instead of
+     * judging a second one. Whether an earlier request may have reached the
+     * network without its answer reaching this screen is kept track of: from
+     * then on only the relayer's own word, `sent: false`, can establish that
+     * nothing moved.
+     */
+    let uncertain = false;
+    let delay = retryDelayMs;
+    const giveUpAt = review.preparedAt + giveUpAfterMs;
+    let result: RelayResult | undefined;
+    let failure: unknown;
+    for (;;) {
+      try {
+        result = await relayCall(submitted, relayUrl);
+        break;
+      } catch (error) {
+        failure = error;
+        const { code } = describeFailure(error);
+        if (!NOT_AN_ANSWER.includes(code)) break;
+
+        const facts = factsOf(error);
+        // A request the relayer turned away for being one too many was not looked at; any other may have got through.
+        if (code !== "rate_limited" && facts.sent !== false) uncertain = true;
+        if (!current()) return;
+        const wait = facts.retryAfterSeconds === undefined ? delay : facts.retryAfterSeconds * 1000;
+        if (now() + wait >= giveUpAt) break;
+        dispatch({ type: "RELAY_RETRY" });
+        await new Promise<void>((resolve) => setTimeout(resolve, wait));
+        if (!current()) return;
+        delay = Math.min(Math.max(delay, 1) * 2, MAX_RETRY_DELAY_MS);
+      }
+    }
+
+    if (result) {
+      const { hash, deployHash } = result;
       // On record even when the screen has moved on: the call did happen.
       record(review, {
         kind: review.request.kind === "transfer" ? "send" : review.request.kind === "exit" ? "exit" : "call",
@@ -245,28 +350,42 @@ export function createActionController(owner: Address, deps: ActionDeps): Action
         stellarTxHash: hash,
       });
       if (current()) dispatch({ type: "RELAYED", hash, ...(deployHash ? { deployHash } : {}), at: now() });
-    } catch (error) {
-      const problem = describeFailure(error);
-      if (REFUSALS.includes(problem.code)) {
-        const reason = relayMessage(problem.code, problem.detail);
-        record(review, { kind: "refused", status: "refused", note: refusalSummary(problem.code) });
-        if (current()) {
-          dispatch({
-            type: "REFUSED",
-            code: problem.code as RefusalCode,
-            detail: problem.detail ?? problem.message,
-            reason,
-            // The relayer turns a call down before it submits anything: there is no transaction to point at.
-            txHash: null,
-          });
-        }
-      } else if (!current()) {
+      return;
+    }
+
+    const problem = describeFailure(failure);
+    const { sent } = factsOf(failure);
+    if (REFUSALS.includes(problem.code)) {
+      // "Refused, nothing moved" is the relayer's claim to make, and it makes it by saying the call was not sent.
+      if (sent !== false) {
+        if (current()) dispatch(unconfirmed(problem.detail));
         return;
-      } else if (problem.code === "expired") {
-        dispatch({ type: "EXPIRED", detail: problem.detail ?? problem.message });
-      } else {
-        dispatch({ type: "RELAY_FAILED", error: problem });
       }
+      const reason = relayMessage(problem.code, problem.detail);
+      record(review, { kind: "refused", status: "refused", note: refusalSummary(problem.code) });
+      if (current()) {
+        dispatch({
+          type: "REFUSED",
+          code: problem.code as RefusalCode,
+          detail: problem.detail ?? problem.message,
+          reason,
+          // The relayer turns a call down before it submits anything: there is no transaction to point at.
+          txHash: null,
+        });
+      }
+      return;
+    }
+    if (!current()) return;
+    if (problem.code === "transaction_failed") {
+      // Sent, included and not applied: a known outcome, and nothing moved.
+      dispatch({ type: "RELAY_FAILED", error: problem });
+    } else if (uncertain && sent !== false) {
+      // Out of time, or told the signature has expired, after a request that may have gone through.
+      dispatch(unconfirmed(problem.detail));
+    } else if (problem.code === "expired") {
+      dispatch({ type: "EXPIRED", detail: problem.detail ?? problem.message });
+    } else {
+      dispatch({ type: "RELAY_FAILED", error: problem });
     }
   }
 

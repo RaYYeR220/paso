@@ -6,13 +6,14 @@ import type { SignOptions } from "./action/controller";
 import {
   IDLE_ACTION,
   isActionBusy,
+  isUnconfirmed,
   panelsOf,
   type ActionRequest,
   type ActionState,
 } from "./action/machine";
 import type { Panels } from "./action/panels";
 import { contractName } from "./config";
-import { stellarTx } from "./explorer";
+import { stellarAddress, stellarTx } from "./explorer";
 import { actionFor, refreshAccount } from "./registry";
 import { useSigner } from "./signer";
 import { createStore, noSubscription } from "./store";
@@ -42,8 +43,17 @@ export interface ActionFlow {
    * (`unsigned`, `checking`, `match`, `refused`).
    */
   panels: Panels;
-  /** True while a relayer that was unavailable is being asked a second time. Still sending: nothing has been judged. */
+  /** True while a relayer that gave no answer about the call is being asked again. Still sending: nothing has been judged. */
   retrying: boolean;
+  /**
+   * True when a signed call was handed over and its outcome was never
+   * learned. It may have run: this is not a refusal and not a match. The
+   * state is `failed` with the sentence to show in `state.error.message`,
+   * and `accountLink` is where to look.
+   */
+  unconfirmed: boolean;
+  /** The account on the Stellar explorer, while `unconfirmed`: its activity says what happened. */
+  accountLink: string | null;
   /** The demo control "Change the amount after signing". */
   tamper: boolean;
   setTamper(on: boolean): void;
@@ -110,6 +120,9 @@ export function useAction(): ActionFlow {
       attemptedCalls: submitted ? state.attemptedCalls : null,
       panels: panelsOf(state, contractName),
       retrying: state.phase === "relaying" && state.retrying === true,
+      unconfirmed: isUnconfirmed(state),
+      accountLink:
+        isUnconfirmed(state) && state.phase === "failed" && state.review ? stellarAddress(state.review.prepared.account) : null,
       tamper,
       setTamper: tamperChoice.set,
       link: state.phase === "done" ? stellarTx(state.hash) : null,

@@ -55,6 +55,20 @@ export interface Submission {
   tampered: boolean;
 }
 
+/**
+ * The code of a failure that is not one: a signed call was handed to the
+ * relayer and nobody here saw what became of it. It may have run. The flow
+ * ends in `failed` at the relay stage with this code, and the screen says
+ * neither that the call was refused nor that it matched.
+ */
+export const UNCONFIRMED = "unconfirmed";
+export const UNCONFIRMED_MESSAGE = "We could not confirm this call. Check the activity list before trying again.";
+
+/** True when a signed call ended without anyone here learning its outcome. */
+export function isUnconfirmed(state: ActionState): boolean {
+  return state.phase === "failed" && state.stage === "relay" && state.error.code === UNCONFIRMED;
+}
+
 /** Relayer codes that mean: the call was looked at and turned down. Nothing moved. */
 export type RefusalCode = "bad_signature" | "simulation_failed" | "bad_request";
 
@@ -72,7 +86,7 @@ export type ActionState =
       phase: "relaying";
       /** When the signed call was sent to the relayer, in milliseconds. */
       since: number;
-      /** True once the relayer could not reach Stellar and the same signed call is being offered a second time. */
+      /** True once the relayer gave no answer about the call and the same signed call is being offered again. */
       retrying?: true;
     } & Review &
       Submission)
@@ -107,7 +121,7 @@ export type ActionEvent =
   | { type: "REFUSED"; code: RefusalCode; detail: string; reason: string; txHash: string | null }
   | { type: "EXPIRED"; detail: string }
   | { type: "RELAY_FAILED"; error: ProblemError }
-  /** The relayer was unavailable: the same signed call goes out once more. */
+  /** The relayer gave no answer about the call: the same signed call goes out again. */
   | { type: "RELAY_RETRY" }
   /** Back from the review to the form. */
   | { type: "BACK" }
