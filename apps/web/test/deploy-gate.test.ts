@@ -49,9 +49,12 @@ const simulated = (auth: xdr.SorobanAuthorizationEntry[]) => ({
 });
 
 /** A USDC approval from the account of `owner`, prepared without the network and signed by `signer`. */
-async function approval(owner: PrivateKeyAccount, signer: PrivateKeyAccount = owner, validForLedgers = 120): Promise<Signed> {
+/** With `preparedAgo`, a call prepared that many ledgers back: one whose single ledger of validity has passed. */
+async function approval(owner: PrivateKeyAccount, signer: PrivateKeyAccount = owner, validForLedgers = 120, preparedAgo = 0): Promise<Signed> {
   const account = twinAddress(owner.address, "testnet");
-  const server = { simulateTransaction: async (tx: never) => simulated([recorded(account, invocation(tx).call)]) } as unknown as rpc.Server;
+  const server = {
+    simulateTransaction: async (tx: never) => ({ ...simulated([recorded(account, invocation(tx).call)]), latestLedger: LATEST - preparedAgo }),
+  } as unknown as rpc.Server;
   const prepared = await prepare(
     {
       kind: "invoke",
@@ -194,7 +197,7 @@ describe("the first call from an account that does not exist yet", () => {
     const { relayer, server } = undeployed();
     const owner = freshOwner();
 
-    for (const stale of [await approval(owner, owner, -3), await approval(owner, freshOwner(), -3)]) {
+    for (const stale of [await approval(owner, owner, 1, 4), await approval(owner, freshOwner(), 1, 4)]) {
       expect(await refusalOf(relayer, relayRequest(stale))).toMatchObject({ code: "expired", status: 409 });
     }
     expect(server.sendTransaction).not.toHaveBeenCalled();

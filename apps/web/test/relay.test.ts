@@ -38,8 +38,10 @@ function sourceAccountEntry(call: xdr.InvokeContractArgs): string {
 }
 
 describe.skipIf(!live || !ownerKey)("POST /api/relay, for an account that exists", () => {
-  const owner = privateKeyToAccount(ownerKey!);
-  const relayer = live ? getRelayer() : (undefined as unknown as Relayer);
+  // The body of a skipped suite still runs: without the key and the network there is no owner and no relayer to make.
+  const runnable = live && ownerKey !== undefined;
+  const owner = runnable ? privateKeyToAccount(ownerKey) : (undefined as unknown as ReturnType<typeof privateKeyToAccount>);
+  const relayer = runnable ? getRelayer() : (undefined as unknown as Relayer);
   let signed: Signed;
   let request: RelayRequest;
 
@@ -63,7 +65,11 @@ describe.skipIf(!live || !ownerKey)("POST /api/relay, for an account that exists
   });
 
   it("answers expired once the signature's last ledger has passed, without simulating", async () => {
-    const stale = await signedApprove(owner, 1, { validForLedgers: -2 });
+    // Good for one ledger: a few seconds on, the network has passed it.
+    const stale = await signedApprove(owner, 1, { validForLedgers: 1 });
+    while ((await server.getLatestLedger()).sequence < stale.validUntilLedger) {
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+    }
     const { status, body } = await relay(relayRequest(stale));
 
     expect(status).toBe(409);
@@ -195,7 +201,9 @@ describe.skipIf(!live || !ownerKey)("POST /api/relay, for an account that exists
   });
 
   it("refuses a request for another network, a missing signature and anything that is not JSON", async () => {
-    expect((await relay({ ...request, network: "mainnet" })).body.error).toBe("bad_request");
+    expect(await new Relayer(loadConfig()).relay({ ...request, network: "mainnet" }).catch((error: unknown) => error)).toMatchObject({
+      code: "bad_request",
+    });
     expect((await relay({ ...request, network: undefined })).body.error).toBe("bad_request");
     expect((await relay({ ...request, auth: [...request.auth, ...request.auth, ...request.auth] })).status).toBe(400);
     expect((await relay({ ...request, auth: [] })).body.detail).toMatch(/does not need/);
@@ -285,7 +293,9 @@ describe.skipIf(!live)("POST /api/deploy", () => {
 
   it("refuses anything that is not an Ethereum address, and other networks", async () => {
     expect((await deploy({ network: "testnet", owner: "GABC" })).status).toBe(400);
-    expect((await deploy({ network: "mainnet", owner: "0x000000000000000000000000000000000000dEaD" })).status).toBe(400);
+    await expect(
+      new Relayer(loadConfig()).deploy({ network: "mainnet", owner: "0x000000000000000000000000000000000000dEaD" }),
+    ).rejects.toMatchObject({ code: "bad_request" });
     expect((await deploy([])).status).toBe(400);
   });
 });

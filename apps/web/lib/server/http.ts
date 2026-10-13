@@ -1,3 +1,5 @@
+import type { NetworkName } from "@paso/sdk";
+import { defaultNetwork } from "./config";
 import { ApiError, ConfigError } from "./errors";
 import { clientIdentity, createLimiter } from "./ratelimit";
 
@@ -67,6 +69,9 @@ export async function readJson(request: Request): Promise<unknown> {
  * the route takes from everyone together. The second number does not depend
  * on telling callers apart, so it holds when that cannot be done. Both are
  * kept in memory and start over when the server restarts or is redeployed.
+ *
+ * Each network has counts of its own for every route: requests for one never
+ * use up what is allowed for the other.
  */
 const LIMITS = {
   relay: { perCaller: 30, overall: 300 },
@@ -89,7 +94,7 @@ function limitersFor(route: Route) {
   };
 }
 
-type RouteLimiters = Record<Route, ReturnType<typeof limitersFor>>;
+type RouteLimiters = Record<string, ReturnType<typeof limitersFor>>;
 
 const globalForLimits = globalThis as typeof globalThis & { pasoRouteLimiters?: Partial<RouteLimiters> };
 
@@ -98,18 +103,19 @@ const globalForLimits = globalThis as typeof globalThis & { pasoRouteLimiters?: 
  * module, as a development server does on every edit, does not start them
  * over. A route this code adds gets its limiters when it is first asked for.
  */
-function limitersOf(route: Route): ReturnType<typeof limitersFor> {
+function limitersOf(route: Route, network?: NetworkName): ReturnType<typeof limitersFor> {
   const all = (globalForLimits.pasoRouteLimiters ??= {});
-  return (all[route] ??= limitersFor(route));
+  return (all[network ? `${network}:${route}` : route] ??= limitersFor(route));
 }
 
 /**
  * Counts a request against its caller and against the route as a whole, or
  * refuses it. Both are looked at before either is counted, so a refused
- * request uses up nothing; a counted one is never given back.
+ * request uses up nothing; a counted one is never given back. A request for
+ * a network is counted with that network's requests only.
  */
-export function limit(route: Route, request: Request): void {
-  const { perCaller, overall } = limitersOf(route);
+export function limit(route: Route, request: Request, network?: NetworkName): void {
+  const { perCaller, overall } = limitersOf(route, network);
   const caller = clientIdentity(request);
   for (const allowance of [perCaller.check(caller), overall.check(EVERYONE)]) {
     if (!allowance.ok) {
@@ -125,6 +131,30 @@ export function limit(route: Route, request: Request): void {
       retryAfterSeconds: refused.retryAfterSeconds,
     });
   }
+}
+
+/**
+ * Lets a request for a route in: reads its body, finds the network it is
+ * for, and counts it there. A request that names no network, or names
+ * something else, or cannot be read at all, is taken to mean the default
+ * network and counted with it, so no flood of nonsense can use up what is
+ * allowed for a network it never named. The body is read first only to
+ * learn the network; a request is counted before anything is done with it.
+ */
+export async function admit(route: Route, request: Request): Promise<{ body: unknown; network: NetworkName }> {
+  let body: unknown;
+  let unreadable: ApiError | undefined;
+  try {
+    body = await readJson(request);
+  } catch (error) {
+    if (!(error instanceof ApiError)) throw error;
+    unreadable = error;
+  }
+  const named = typeof body === "object" && body !== null ? (body as { network?: unknown }).network : undefined;
+  const network = named === "testnet" || named === "mainnet" ? named : defaultNetwork();
+  limit(route, request, network);
+  if (unreadable) throw unreadable;
+  return { body, network };
 }
 
 /** One line, bounded, printable: a detail never carries a stack, a multi-line dump or control characters. */

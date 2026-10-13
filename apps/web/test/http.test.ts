@@ -7,11 +7,12 @@ vi.mock("next/server", () => ({ connection: async () => undefined }));
 
 type Handler = (request: Request) => Promise<Response>;
 
-const shared = globalThis as { pasoRelayer?: unknown; pasoRelayerState?: unknown; pasoRouteLimiters?: unknown };
+const shared = globalThis as { pasoRelayers?: unknown; pasoRelayerStates?: unknown; pasoRelayerState?: unknown; pasoRouteLimiters?: unknown };
 
 /** What a server process keeps between requests. Forgetting it is what a restart does. */
 function restart(): void {
-  delete shared.pasoRelayer;
+  delete shared.pasoRelayers;
+  delete shared.pasoRelayerStates;
   delete shared.pasoRelayerState;
   delete shared.pasoRouteLimiters;
 }
@@ -82,13 +83,14 @@ describe("who a request is counted against", () => {
   });
 
   it("applies to the faucet and to the health check as well", async () => {
+    vi.stubEnv("DEMO_PAYER_PRIVATE_KEY", generatePrivateKey());
     const fund = await fundRoute();
     expect(await statuses(fund, 10, () => post("/api/demo/fund", { owner: "nobody" }))).toEqual(new Array(10).fill(400));
     expect((await fund(post("/api/demo/fund", { owner: "nobody" }))).status).toBe(429);
 
     const health = await healthRoute();
     const { getRelayer } = await import("@/lib/server/relayer");
-    const read = vi.spyOn(getRelayer(), "health").mockResolvedValue({ ok: true } as never);
+    const read = vi.spyOn(getRelayer("testnet"), "health").mockResolvedValue({ ok: true } as never);
     const ask = () => new Request("http://localhost/api/health");
 
     expect(await statuses(health, 60, ask)).toEqual(new Array(60).fill(200));
@@ -127,7 +129,13 @@ describe("replacing the relayer's code while the process runs", () => {
     funded(first);
     await first.demoFund({ owner: randomOwner() }, "caller");
     first.state.fees.spend(BigInt(1_234));
-    first.state.sends.set("deploy:0xabc", { hash: "ab".repeat(32), deadline: Date.now() + 60_000 });
+    first.state.sends.set("deploy:0xabc", {
+      hash: "ab".repeat(32),
+      deadline: Date.now() + 60_000,
+      submissions: 1,
+      bid: BigInt(1_000),
+      setAside: BigInt(1_100),
+    });
     expect(await load()).toBe(first);
 
     // The module is loaded afresh, as on an edit: a new class, so a new relayer.
@@ -264,15 +272,31 @@ describe("what an answer may reveal", () => {
     expect(logged).toHaveBeenCalledWith("Configuration:", "RELAYER_SECRET is not set");
   });
 
-  it("refuses to run on mainnet unless that was asked for in so many words", async () => {
+  it("does not work on mainnet unless that was set up in so many words, whatever the default network is", async () => {
     vi.stubEnv("PASO_NETWORK", "mainnet");
-    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const deploy = await deployRoute();
+    const declined = { error: "unavailable", detail: "This server is not serving mainnet right now", reason: "not_serving" };
+
+    for (const body of [{ network: "mainnet", owner: "0x000000000000000000000000000000000000dEaD" }, { owner: "0x000000000000000000000000000000000000dEaD" }]) {
+      const response = await deploy(post("/api/deploy", body));
+      expect(response.status).toBe(503);
+      expect(await response.json()).toEqual(declined);
+    }
+  });
+
+  it("says the server is not configured when mainnet was switched on with settings it cannot use", async () => {
+    vi.stubEnv("PASO_ALLOW_MAINNET", "true");
+    vi.stubEnv("RELAYER_SECRET_MAINNET", process.env.RELAYER_SECRET!);
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const deploy = await deployRoute();
 
     const response = await deploy(post("/api/deploy", { network: "mainnet", owner: "0x000000000000000000000000000000000000dEaD" }));
+    const text = await response.text();
 
     expect(response.status).toBe(503);
-    expect(await response.json()).toEqual({ error: "unavailable", detail: "The server is not configured" });
+    expect(JSON.parse(text)).toEqual({ error: "unavailable", detail: "The server is not configured" });
+    expect(text).not.toContain("RELAYER_SECRET");
+    expect(logged).toHaveBeenCalledWith("Configuration:", expect.stringContaining("an account of its own"));
   });
 
   it("keeps the text of an unexpected error to the log", async () => {

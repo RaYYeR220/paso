@@ -13,6 +13,17 @@ const STATUS: Record<ApiErrorCode, number> = {
   unavailable: 503,
 };
 
+/**
+ * Why the server is not paying for something right now, though nothing is
+ * wrong with what was asked.
+ *
+ * - `not_serving`: this server does not work on the network the request names.
+ * - `daily_budget`: the relayer has spent what it spends on fees in a day.
+ * - `hourly_limit`: the relayer has paid for as many of these as it does in an hour.
+ * - `low_balance`: the relayer's account is down to what it keeps in reserve.
+ */
+export type DeclineReason = "not_serving" | "daily_budget" | "hourly_limit" | "low_balance";
+
 /** A refusal with a reason the caller can act on. It becomes the JSON body of a non-2xx response. */
 export class ApiError extends Error {
   readonly status: number;
@@ -22,14 +33,20 @@ export class ApiError extends Error {
     readonly detail: string,
     /**
      * Extra fields for the response body: a transaction hash, the network's
-     * own diagnostics, a retry delay, and `sent`.
+     * own diagnostics, a retry delay, `sent` and `reason`.
      *
-     * `sent: false` is a statement about a relayed call: the server decided
-     * this before handing anything to the network, and has checked that the
-     * call has not run. `sent: true` says a transaction did go out. When the
-     * field is absent the server makes no claim either way.
+     * `sent: false` is a statement about what was asked for: nothing that
+     * was handed to the network for it can still be applied. Either the
+     * server decided before sending anything and has checked that the call
+     * has not run, or the transaction it sent is past its time bound by the
+     * network's own clock. `sent: true` says a transaction went out and may
+     * yet land. When the field is absent the server makes no claim either
+     * way.
+     *
+     * `reason` names why the server is declining for now, where a client
+     * has something particular to say about it.
      */
-    readonly extra: { hash?: string; diagnostic?: string; retryAfterSeconds?: number; sent?: boolean } = {},
+    readonly extra: { hash?: string; diagnostic?: string; retryAfterSeconds?: number; sent?: boolean; reason?: DeclineReason } = {},
   ) {
     super(detail);
     this.name = "ApiError";

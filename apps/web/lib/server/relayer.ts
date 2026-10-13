@@ -14,6 +14,7 @@ import {
   messageTransmitterAbi,
   isDeployed,
   isExpired,
+  MAX_VALIDITY_LEDGERS,
   readContract,
   receiveMessageOnEvm,
   recoverEntrySigner,
@@ -25,6 +26,7 @@ import {
   type Attestation,
   type BurnMessage,
   type InboundRoute,
+  type NetworkName,
   type RelayResult,
   type Signed,
 } from "@paso/sdk";
@@ -47,15 +49,30 @@ import {
   type Address,
   type Hex,
 } from "viem";
-import { loadConfig, type ServerConfig } from "./config";
-import { ApiError } from "./errors";
+import { defaultNetwork, loadConfig, networkNames, serves, type ServerConfig, type SpendKind } from "./config";
+import { ApiError, ConfigError } from "./errors";
 import { createQueue, QueueFullError, QueueTimeoutError, type Queue } from "./queue";
-import { createBudget, createLimiter, type Budget, type Limiter } from "./ratelimit";
+import { createBudget, createLimiter, SHARED_IDENTITY, type Budget, type Limiter } from "./ratelimit";
 
-/** What the network offers above the resource fee to be included in a ledger, in stroops. */
-const INCLUSION_FEE = "1000";
-const TRANSACTION_TIMEOUT_SECONDS = 60;
+/**
+ * How long a transaction of the relayer account can still be applied after
+ * it is built. Short enough that one request waits out the whole of it and
+ * learns what became of the transaction; long enough for several ledgers.
+ */
+const TRANSACTION_TIMEOUT_SECONDS = 30;
+/**
+ * How often a sent transaction is asked about, a second apart. That reaches
+ * past its time bound, to the ledger that closes after it: the one that says
+ * for certain a transaction not yet applied never will be.
+ */
 const CONFIRMATION_ATTEMPTS = 30;
+/**
+ * How many transactions are sent for one thing before it is left alone for
+ * a while. Each one after the first bids twice the last to be included, and
+ * goes out only once the one before it can no longer be applied.
+ */
+const MAX_SUBMISSIONS = 3;
+const RESEND_PAUSE_MS = 5 * 60 * 1000;
 const BUSY_RETRIES = 3;
 const BUSY_WAIT_MS = 2000;
 
@@ -93,7 +110,7 @@ const MAX_ATTESTATION_BYTES = 2_048;
 const MAX_DIAGNOSTIC_CHARS = 4_000;
 const REMEMBERED_DELIVERIES = 1_000;
 /** Changes whenever the shape of `RelayerState` does, so that state left by older code is never mistaken for this. */
-export const STATE_VERSION = 2;
+export const STATE_VERSION = 3;
 
 /**
  * Bounds on a mint the server pays for on Base. It is sent only after the
@@ -168,6 +185,17 @@ export type CompleteResult =
       status: "minted";
       /** The minting transaction on Base, when this server sent it. Absent when the message had been received before. */
       hash?: Hex;
+    }
+  | {
+      /**
+       * Attested, checked, and left to the caller: this server does not pay
+       * for mints on Base here. Any wallet can hand these two to Circle's
+       * MessageTransmitter there; the USDC goes to the recipient the message
+       * names.
+       */
+      status: "attested";
+      message: Hex;
+      attestation: Hex;
     };
 
 export interface DeployResult {
@@ -250,12 +278,63 @@ class SimulationFailure extends Error {
 
 type Simulated = rpc.Api.SimulateTransactionSuccessResponse;
 
-/** A Stellar transaction that was handed to the network and whose outcome has not been learned. */
-interface PendingSend {
+/**
+ * A Stellar transaction that was handed to the network and has not been seen
+ * to be applied or to fail.
+ */
+export interface PendingSend {
   hash: string;
   /** When the network stops accepting it, in milliseconds since the epoch. */
   deadline: number;
+  /** How many transactions have been sent for the same thing, this one included. */
+  submissions: number;
+  /** What this one bids to be included, in stroops. */
+  bid: bigint;
+  /** What has been set aside from the day's budget for it, in stroops. */
+  setAside: bigint;
+  /**
+   * Set once a ledger has closed after the deadline without the transaction:
+   * it can never be applied. The next one sent for the same thing bids twice
+   * as much.
+   */
+  expired?: true;
+  /** After the last transaction allowed has expired too: nothing more is sent for it until this time. */
+  pausedUntil?: number;
 }
+
+type Fate = "applied" | "failed" | "expired" | "unknown";
+
+/**
+ * What one look at a transaction says about it. A transaction that is in no
+ * ledger is dead only when the network's own clock, the close time of its
+ * latest ledger, is past the transaction's time bound. Short of that it may
+ * still land, whatever the clock on this machine says.
+ */
+function fateOf(seen: { status: unknown; latestLedgerCloseTime?: unknown }, deadline: number): Fate {
+  if (seen.status === rpc.Api.GetTransactionStatus.SUCCESS) return "applied";
+  if (seen.status === rpc.Api.GetTransactionStatus.FAILED) return "failed";
+  const closed = Number(seen.latestLedgerCloseTime);
+  return Number.isFinite(closed) && closed * 1000 > deadline ? "expired" : "unknown";
+}
+
+/** The refusal for a transaction the network left out: sent again on the next request, or, after the last one, not for a while. */
+function leftOut(pending: PendingSend): ApiError {
+  if (pending.pausedUntil !== undefined) {
+    return new ApiError(
+      "unavailable",
+      `The network left it out ${pending.submissions} times, each with a higher bid, and charged nothing; it is not sent again for a few minutes`,
+      { sent: false, retryAfterSeconds: Math.max(1, Math.ceil((pending.pausedUntil - Date.now()) / 1000)) },
+    );
+  }
+  return new ApiError(
+    "unavailable",
+    `Transaction ${pending.hash} was not included before its time ran out, and never will be; ask again and it is sent with a higher bid`,
+    { hash: pending.hash, sent: false, retryAfterSeconds: 1 },
+  );
+}
+
+/** What the relayer account pays for, in the words of a refusal. */
+const SPEND_WORDS: Record<SpendKind, string> = { relay: "calls", deploy: "account deployments", deliver: "deliveries" };
 
 /**
  * What the server knows about an exit, by its Stellar transaction.
@@ -263,17 +342,21 @@ interface PendingSend {
  * `sending` is a reservation: it is written before the mint is sent and
  * stays until the outcome is known, so a mint that may still land is never
  * sent twice. `failed` is a mint that was included and reverted, and is not
- * tried again. The other two are answers kept to save asking again.
+ * tried again. `attested` is an exit that was checked and handed back for a
+ * wallet to mint. The other two are answers kept to save asking again.
  */
 type Exit =
   | { kind: "minted"; until: number; result: CompleteResult }
+  | { kind: "attested"; until: number; message: Hex; attestation: Hex; checkedAt: number }
   | { kind: "refused"; until: number; refusal: ApiError; message?: Hex; checkedAt: number }
   | { kind: "sending"; until: number; message: Hex; hash?: Hex }
   | { kind: "failed"; until: number; refusal: ApiError; message: Hex; checkedAt: number };
 
 /**
- * Everything the relayer keeps between requests: the queues its two accounts
- * send through, what it has spent and counted, and what it has in flight.
+ * Everything the relayer of one network keeps between requests: the queues
+ * its two accounts send through, what it has spent and counted, and what it
+ * has in flight. Each network has a state of its own, so nothing that
+ * happens on one, a flood least of all, uses up what the other may do.
  *
  * It is kept apart from the code that uses it, so that replacing the code,
  * as a development server does on every edit, leaves the guards standing:
@@ -285,6 +368,8 @@ export interface RelayerState {
   readonly evmQueue: Queue;
   /** Fees of the relayer account over the last day, set aside before a transaction is signed. */
   readonly fees: Budget;
+  /** Transactions paid for in the last hour, by kind: for each caller, and for everyone together. */
+  readonly spending: Record<SpendKind, { perCaller: Limiter; overall: Limiter }>;
   readonly fundsPerCaller: Limiter;
   readonly fundsPerOwner: Limiter;
   readonly fundsOverall: Limiter;
@@ -314,11 +399,16 @@ export interface RelayerState {
 }
 
 export function createRelayerState(config: ServerConfig): RelayerState {
+  const spending = (kind: SpendKind) => ({
+    perCaller: createLimiter({ limit: config.spend[kind].perCallerPerHour, windowMs: HOUR_MS }),
+    overall: createLimiter({ limit: config.spend[kind].perHour, windowMs: HOUR_MS, maxKeys: 1 }),
+  });
   const state: RelayerState = {
     version: STATE_VERSION,
     queue: createQueue({ maxPending: MAX_QUEUED_TRANSACTIONS, timeoutMs: SEND_TIMEOUT_MS }),
     evmQueue: createQueue({ maxPending: MAX_QUEUED_BURNS, timeoutMs: BURN_TIMEOUT_MS }),
     fees: createBudget({ limit: config.maxDailyFees, windowMs: DAY_MS }),
+    spending: { relay: spending("relay"), deploy: spending("deploy"), deliver: spending("deliver") },
     fundsPerCaller: createLimiter({ limit: config.demoFund.perIpPerHour, windowMs: HOUR_MS }),
     fundsPerOwner: createLimiter({ limit: config.demoFund.perOwnerPerDay, windowMs: DAY_MS }),
     fundsOverall: createLimiter({ limit: config.demoFund.perDay, windowMs: DAY_MS, maxKeys: 1 }),
@@ -337,7 +427,7 @@ export function createRelayerState(config: ServerConfig): RelayerState {
     inFlight() {
       const now = Date.now();
       let waiting = state.queue.pending() + state.evmQueue.pending() + state.unsettled;
-      for (const send of state.sends.values()) if (send.deadline + SEND_DEADLINE_MARGIN_MS > now) waiting += 1;
+      for (const send of state.sends.values()) if (!send.expired && send.deadline + SEND_DEADLINE_MARGIN_MS > now) waiting += 1;
       for (const exit of state.exits.values()) if (exit.kind === "sending" && exit.until > now) waiting += 1;
       return waiting;
     },
@@ -346,12 +436,14 @@ export function createRelayerState(config: ServerConfig): RelayerState {
 }
 
 /**
- * The fee-paying side of Paso.
+ * The fee-paying side of Paso, on one network.
  *
  * It wraps calls signed by account owners in its own transactions, deploys
  * accounts, delivers attested CCTP messages and, on testnet, runs a small
  * USDC faucet. Its Stellar account pays fees and does nothing else: no
  * request can make it authorise a call, and it cannot change a signed one.
+ * A server that works on two networks has two of these, each with its own
+ * account, its own settings and its own state.
  */
 export class Relayer {
   readonly address: string;
@@ -370,6 +462,7 @@ export class Relayer {
   private readonly mintsPerCaller: Limiter;
   private readonly mintsOverall: Limiter;
   private readonly fees: Budget;
+  private readonly spending: RelayerState["spending"];
   private readonly fundsPerCaller: Limiter;
   private readonly fundsPerOwner: Limiter;
   private readonly fundsOverall: Limiter;
@@ -397,6 +490,7 @@ export class Relayer {
     this.relaying = state.relaying;
     this.relays = state.relays;
     this.fees = state.fees;
+    this.spending = state.spending;
     this.fundsPerCaller = state.fundsPerCaller;
     this.fundsPerOwner = state.fundsPerOwner;
     this.fundsOverall = state.fundsOverall;
@@ -422,8 +516,11 @@ export class Relayer {
    * anything was sent they get that refusal. Nothing is simulated again for
    * a call that is on its way or has run, because a call that has run always
    * simulates as refused: its nonce is spent.
+   *
+   * `caller` is who the request comes from, as far as that can be told. The
+   * transactions paid for are counted against it.
    */
-  async relay(body: unknown): Promise<RelayResult> {
+  async relay(body: unknown, caller: string = SHARED_IDENTITY): Promise<RelayResult> {
     let request: ReturnType<Relayer["readRelayRequest"]>;
     try {
       request = this.readRelayRequest(body);
@@ -445,7 +542,7 @@ export class Relayer {
       throw new ApiError("unavailable", "The relayer is busy; try again in a moment");
     }
 
-    const attempt = this.relayOnce(key, signed, func, entry).finally(() => this.relaying.delete(key));
+    const attempt = this.relayOnce(key, signed, func, entry, caller).finally(() => this.relaying.delete(key));
     this.relaying.set(key, attempt);
     return attempt;
   }
@@ -455,10 +552,11 @@ export class Relayer {
     signed: Signed,
     func: xdr.HostFunction,
     entry: xdr.SorobanAuthorizationEntry,
+    caller: string,
   ): Promise<RelayResult> {
     // The same call, handed to the network before with an outcome that was never learned: that is settled first.
     const earlier = await this.settleSend(key);
-    if (earlier) return this.rememberRelayed(key, { hash: earlier });
+    if (earlier && "hash" in earlier) return this.rememberRelayed(key, { hash: earlier.hash });
 
     let deployHash: string | undefined;
     try {
@@ -469,12 +567,21 @@ export class Relayer {
           `The signature was valid up to ledger ${signed.validUntilLedger} and the network is at ${sequence}; prepare and sign again`,
         );
       }
+      // A signature stays usable by whoever holds it until its last ledger, whether or not its first transaction
+      // went through. One made to last longer than the SDK allows is not passed on.
+      const ahead = signed.validUntilLedger - sequence;
+      if (ahead > MAX_VALIDITY_LEDGERS) {
+        throw new ApiError(
+          "bad_request",
+          `The signature is valid for ${ahead} ledgers from now; the relayer passes on signatures valid for at most ${MAX_VALIDITY_LEDGERS}, about ten minutes`,
+        );
+      }
       // An account that exists judges the signature itself, in the simulation below, at no cost. One that does
       // not exist cannot, and creating it costs the relayer a transaction: nothing is spent on that until the
       // signature has been checked here to be the owner's, the way the account will check it.
       if (!(await isDeployed(signed.owner, this.config.network, this.server))) {
         await this.assertSignedByOwner(signed, entry);
-        deployHash = await this.ensureDeployed(signed.owner);
+        deployHash = await this.ensureDeployed(signed.owner, caller);
       }
       await this.assertAccepted(signed, func, entry);
     } catch (error) {
@@ -484,7 +591,7 @@ export class Relayer {
     const operation = Operation.invokeHostFunction({ func, auth: [entry] });
     let hash: string;
     try {
-      hash = await this.send(key, operation, (simulation) => assertNothingElseAuthorised(simulation, entry));
+      hash = await this.send(key, { kind: "relay", caller }, operation, (simulation) => assertNothingElseAuthorised(simulation, entry));
     } catch (error) {
       if (error instanceof SimulationFailure) {
         return this.answerBeforeSending(key, func, entry, refusal(error.diagnostic, isExpired(signed, error.latestLedger)));
@@ -633,10 +740,10 @@ export class Relayer {
   }
 
   /** Deploys the account of an Ethereum address. Doing it twice changes nothing. */
-  async deploy(body: unknown): Promise<DeployResult> {
+  async deploy(body: unknown, caller: string = SHARED_IDENTITY): Promise<DeployResult> {
     const owner = this.readOwner(body);
     const address = twinAddress(owner, this.config.network);
-    const hash = await this.ensureDeployed(owner);
+    const hash = await this.ensureDeployed(owner, caller);
     return hash ? { address, hash, alreadyDeployed: false } : { address, alreadyDeployed: true };
   }
 
@@ -649,7 +756,7 @@ export class Relayer {
    * is delivered. A message someone else already delivered counts as
    * delivered.
    */
-  async deliver(body: unknown): Promise<DeliverResult> {
+  async deliver(body: unknown, caller: string = SHARED_IDENTITY): Promise<DeliverResult> {
     const { sourceDomain, txHash } = this.readBurn(body);
     const key = `${sourceDomain}:${txHash.toLowerCase()}`;
 
@@ -661,7 +768,7 @@ export class Relayer {
       throw new ApiError("unavailable", "The relayer is busy; try again in a moment");
     }
 
-    const delivery = this.deliverOnce(sourceDomain, txHash).finally(() => this.deliveries.delete(key));
+    const delivery = this.deliverOnce(sourceDomain, txHash, caller).finally(() => this.deliveries.delete(key));
     this.deliveries.set(key, delivery);
     const result = await delivery;
     if (result.status === "delivered") {
@@ -687,23 +794,19 @@ export class Relayer {
    * Nothing is sent that has not just been simulated successfully, and a
    * mint that fails is never sent a second time.
    *
-   * An exit has one of three answers. `pending`: ask again. `minted`. Or a
-   * refusal that says why this server cannot complete it; that answer is
-   * final, or at least lasting, and like `minted` it is remembered, so asking
-   * again costs neither the networks nor anyone's allowance.
+   * Where the server does not pay for mints, which is mainnet unless it was
+   * told otherwise by name, the exit is looked up and checked in just the
+   * same way and then handed back: the answer is `attested`, with the
+   * message and its attestation, for the owner's own wallet to submit.
+   *
+   * An exit has one of four answers. `pending`: ask again. `minted`.
+   * `attested`: checked, and the caller's to mint. Or a refusal that says
+   * why it cannot be completed; that answer is final, or at least lasting,
+   * and like `minted` it is remembered, so asking again costs neither the
+   * networks nor anyone's allowance.
    */
   async complete(body: unknown, caller: string): Promise<CompleteResult> {
     const txHash = this.readExit(body);
-    const { baseMints, payer } = this.config;
-    if (!baseMints.enabled) {
-      throw new ApiError(
-        "not_found",
-        "This server does not pay for mints on Base on this network; submit the mint from your own wallet",
-      );
-    }
-    if (!payer) {
-      throw new ApiError("unavailable", "The server has no account on Base to submit the mint from");
-    }
 
     // One look per exit at a time: requests that arrive together share it, and its answer.
     const running = this.completions.get(txHash);
@@ -790,10 +893,11 @@ export class Relayer {
   }
 
   /**
-   * What the server runs on and what its accounts hold. Addresses and
-   * balances only, all of them public on their chains. The answer is kept
-   * for a few seconds, so asking often does not turn into as many requests
-   * to the networks.
+   * What the relayer works on, what its accounts hold, what it has left to
+   * spend and where its caps are. Addresses, balances and limits only: all
+   * of it is public on the chains or in the source. The answer is kept for
+   * a few seconds, so asking often does not turn into as many requests to
+   * the networks.
    */
   health(): ReturnType<Relayer["readHealth"]> {
     const now = Date.now();
@@ -804,7 +908,7 @@ export class Relayer {
   }
 
   private async readHealth() {
-    const { network, payer, maxResourceFee } = this.config;
+    const { network, payer, maxResourceFee, maxDailyFees, minBalance, inclusionFee, spend, baseMints } = this.config;
     const { usdc } = network.evm;
     const evm = this.evmClients();
 
@@ -819,9 +923,12 @@ export class Relayer {
     const value = <T>(settled: PromiseSettledResult<T>): T | null =>
       settled.status === "fulfilled" ? settled.value : null;
 
-    const xlm = value(relayerEntry);
+    const entry = value(relayerEntry);
+    const held = entry ? BigInt(entry.balance.toString()) : null;
     const usdcHeld = value(payerUsdc);
     const ethHeld = value(payerEth);
+    const spent = this.fees.spent();
+    const remaining = maxDailyFees > spent ? maxDailyFees - spent : BigInt(0);
     return {
       ok: [ledger, relayerEntry, payerUsdc, payerEth].every((settled) => settled.status === "fulfilled"),
       network: network.name,
@@ -829,7 +936,7 @@ export class Relayer {
       latestLedger: value(ledger)?.sequence ?? null,
       relayer: {
         address: this.address,
-        xlm: xlm ? formatAmount(BigInt(xlm.balance.toString()), 7) : null,
+        xlm: held === null ? null : formatAmount(held, 7),
       },
       payer: payer
         ? {
@@ -839,8 +946,29 @@ export class Relayer {
             eth: ethHeld === null ? null : formatEther(ethHeld),
           }
         : null,
-      /** The most a relayed call may cost in resource fees, in stroops. */
-      maxResourceFee: maxResourceFee.toString(),
+      /**
+       * In stroops. A transaction may cost `maxResourceFee` in resources and
+       * bids `inclusionFee` on top, twice that each time it is sent again.
+       * `spentToday` and `remainingToday` are what this server instance has
+       * set aside over the last 24 hours and what that leaves of
+       * `maxDailyFees`. `minBalance` is what the account keeps.
+       */
+      fees: {
+        maxResourceFee: maxResourceFee.toString(),
+        inclusionFee: inclusionFee.toString(),
+        maxDailyFees: maxDailyFees.toString(),
+        spentToday: spent.toString(),
+        remainingToday: remaining.toString(),
+        minBalance: minBalance.toString(),
+      },
+      /** How many transactions of each kind are paid for in an hour: from one caller, and from everyone. */
+      limits: spend,
+      /** False while a fee would be declined: the day's budget is spent, or the account is down to what it keeps. */
+      paysFees: remaining > BigInt(0) && held !== null && held > minBalance,
+      /** Whether a transfer back to Base is minted by the server. Where it is not, the owner's wallet submits the mint. */
+      paysBaseMints: baseMints.enabled && payer !== null,
+      /** Whether the testnet faucet is there to be asked. */
+      faucet: network.name === "testnet" && payer !== null,
     };
   }
 
@@ -969,7 +1097,7 @@ export class Relayer {
   }
 
   /** Deploys the owner's account unless it exists. Requests for the same owner share one deployment. */
-  private ensureDeployed(owner: Address): Promise<string | undefined> {
+  private ensureDeployed(owner: Address, caller: string): Promise<string | undefined> {
     const key = owner.toLowerCase();
     const running = this.deployments.get(key);
     if (running) return running;
@@ -981,7 +1109,7 @@ export class Relayer {
     const deployment = (async () => {
       if (await isDeployed(owner, network, this.server)) return undefined;
       try {
-        return await this.send(`deploy:${key}`, deployOperation(owner, network), assertNoAuthorisation);
+        return await this.send(`deploy:${key}`, { kind: "deploy", caller }, deployOperation(owner, network), assertNoAuthorisation);
       } catch (error) {
         if (error instanceof SimulationFailure) {
           throw new ApiError("unavailable", `The account could not be deployed: ${summary(error.diagnostic)}`);
@@ -993,7 +1121,7 @@ export class Relayer {
     return deployment;
   }
 
-  private async deliverOnce(sourceDomain: number, txHash: Hex): Promise<DeliverResult> {
+  private async deliverOnce(sourceDomain: number, txHash: Hex, caller: string): Promise<DeliverResult> {
     const { network } = this.config;
     const { status, attestation } = await this.lookUp(sourceDomain, txHash);
     if (!attestation) {
@@ -1022,7 +1150,9 @@ export class Relayer {
     // Built here from the attested bytes: the caller of the route supplies a hash, never a transaction.
     const operation = deliverOperation({ message, attestation: attestation.attestation, caller: this.address }, network);
     try {
-      const hash = await this.send(`deliver:${nonce}`, operation, (simulation) => assertOnlyCalledByRelayer(simulation, operation));
+      const hash = await this.send(`deliver:${nonce}`, { kind: "deliver", caller }, operation, (simulation) =>
+        assertOnlyCalledByRelayer(simulation, operation),
+      );
       return { status: "delivered", hash, route };
     } catch (error) {
       if (error instanceof SimulationFailure) {
@@ -1073,8 +1203,9 @@ export class Relayer {
 
   /**
    * The answer for an exit the server already knows about. A mint that was
-   * sent and not seen to land is looked for; a refusal is checked against
-   * Base again from time to time; nothing here ever sends.
+   * sent and not seen to land is looked for; a refusal, and an exit handed
+   * back for a wallet to mint, are checked against Base again from time to
+   * time; nothing here ever sends.
    */
   private async knownExit(txHash: string, exit: Exit): Promise<CompleteResult> {
     if (exit.kind === "minted") return exit.result;
@@ -1091,6 +1222,7 @@ export class Relayer {
         return result;
       }
     }
+    if (exit.kind === "attested") return { status: "attested", message: exit.message, attestation: exit.attestation };
     throw exit.refusal;
   }
 
@@ -1209,14 +1341,19 @@ export class Relayer {
   }
 
   /**
-   * Why Base would not accept this exit from the server, read off the message
-   * alone, or `null` when nothing in it stands in the way. None of this can
-   * change for the exit, so a reason found here is final.
+   * Why Base would not accept this exit, read off the message alone, or
+   * `null` when nothing in it stands in the way. `payer` is the server's
+   * account when the server is to submit the mint, and `null` when the mint
+   * is left to a wallet. None of this can change for the exit, so a reason
+   * found here is final.
    */
-  private unmintable(burn: BurnMessage, payer: Address): string | null {
+  private unmintable(burn: BurnMessage, payer: Address | null): string | null {
     const { stellar } = this.config.network;
-    if (burn.destinationCaller !== ZERO_BYTES32 && burn.destinationCaller !== pad(payer).toLowerCase()) {
-      return "it names the one address allowed to complete it, and that is not this server";
+    if (burn.destinationCaller !== ZERO_BYTES32) {
+      if (payer === null) return "it names the one address allowed to complete it, and only that address can submit the mint";
+      if (burn.destinationCaller !== pad(payer).toLowerCase()) {
+        return "it names the one address allowed to complete it, and that is not this server";
+      }
     }
     if (!/^0x0{24}[0-9a-f]{40}$/.test(burn.mintRecipient) || burn.mintRecipient === ZERO_BYTES32) {
       return "its recipient is not an address on Base";
@@ -1224,7 +1361,7 @@ export class Relayer {
     if (burn.burnToken !== toHex(StrKey.decodeContract(stellar.usdc))) {
       return "what it burned is not the USDC that Circle mints on Base";
     }
-    if (burn.amount < MIN_MINT_AMOUNT) {
+    if (payer !== null && burn.amount < MIN_MINT_AMOUNT) {
       return "it is too small for the server to pay its gas";
     }
     return null;
@@ -1258,10 +1395,10 @@ export class Relayer {
     const { burn, attestation } = this.hubExit(txHash, lookup.attestations);
     const { message } = attestation;
     const { publicClient, walletClient } = this.evmClients();
-    if (!walletClient) {
-      throw new ApiError("unavailable", "The server has no account on Base to submit the mint from");
-    }
-    const payer = walletClient.account.address;
+    // The server submits the mint only where it was set up to pay for one and has an account to pay from.
+    // Everywhere else the exit is checked in the same way and handed back for a wallet to submit.
+    const pays = baseMints.enabled && walletClient !== null;
+    const payer = pays ? walletClient.account.address : null;
     const unreachable = () => new ApiError("unavailable", `The server could not reach ${evm.chain.name}; try again later`);
 
     // Whether it has been received comes first: if it has, there is nothing left to decide.
@@ -1269,7 +1406,10 @@ export class Relayer {
     let held: bigint;
     try {
       if (await isReceivedOnEvm(publicClient, message, network)) return { status: "minted" };
-      [block, held] = await Promise.all([publicClient.getBlockNumber(), publicClient.getBalance({ address: payer })]);
+      [block, held] = await Promise.all([
+        publicClient.getBlockNumber(),
+        payer ? publicClient.getBalance({ address: payer }) : Promise.resolve(BigInt(0)),
+      ]);
     } catch {
       throw unreachable();
     }
@@ -1288,11 +1428,12 @@ export class Relayer {
         message,
       );
     }
-    if (held < baseMints.payerEthFloor) {
+    if (payer && held < baseMints.payerEthFloor) {
       throw new ApiError("unavailable", `The server is out of gas on ${evm.chain.name}; submit the mint from your own wallet`);
     }
 
-    // The exact call, simulated. What does not succeed here is not sent.
+    // The exact call, simulated. What does not succeed here is not sent, and not handed to a wallet either.
+    // Anyone may submit it, so without an account of the server's it is simulated as its own recipient would send it.
     const call = {
       address: evm.messageTransmitter,
       abi: messageTransmitterAbi,
@@ -1300,10 +1441,10 @@ export class Relayer {
       args: [message, attestation.attestation],
     } as const;
     let gas: bigint;
-    let fees: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint };
+    let fees: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } | undefined;
     try {
-      gas = await publicClient.estimateContractGas({ ...call, account: payer });
-      fees = await publicClient.estimateFeesPerGas();
+      gas = await publicClient.estimateContractGas({ ...call, account: payer ?? getAddress(`0x${burn.mintRecipient.slice(-40)}`) });
+      fees = payer ? await publicClient.estimateFeesPerGas() : undefined;
     } catch (error) {
       const reverted = revertReason(error);
       if (reverted === undefined) throw unreachable();
@@ -1314,6 +1455,11 @@ export class Relayer {
         SHORT_MEMORY_MS,
         message,
       );
+    }
+    if (!walletClient || !payer || !fees) {
+      const now = Date.now();
+      this.rememberExit(txHash, { kind: "attested", until: now + SHORT_MEMORY_MS, message, attestation: attestation.attestation, checkedAt: now });
+      return { status: "attested", message, attestation: attestation.attestation };
     }
     if (gas > MINT_GAS_LIMIT) {
       throw this.refuseExit(
@@ -1329,6 +1475,7 @@ export class Relayer {
     }
     const padded = (gas * BigInt(12)) / BigInt(10);
     const gasLimit = padded > MINT_GAS_LIMIT ? MINT_GAS_LIMIT : padded;
+    const mintFees = fees;
 
     // Only the send itself goes through the queue the account's transactions share; looking does not hold it up.
     const busy = () => new ApiError("unavailable", "The relayer is busy; try again in a moment");
@@ -1355,8 +1502,9 @@ export class Relayer {
             attestation: attestation.attestation,
             network,
             gas: gasLimit,
-            maxFeePerGas: fees.maxFeePerGas,
-            maxPriorityFeePerGas: fees.maxPriorityFeePerGas < fees.maxFeePerGas ? fees.maxPriorityFeePerGas : fees.maxFeePerGas,
+            maxFeePerGas: mintFees.maxFeePerGas,
+            maxPriorityFeePerGas:
+              mintFees.maxPriorityFeePerGas < mintFees.maxFeePerGas ? mintFees.maxPriorityFeePerGas : mintFees.maxFeePerGas,
             confirmations: MINT_CONFIRMATIONS,
             onSubmitted: (hash) => {
               reservation.hash = hash;
@@ -1535,9 +1683,10 @@ export class Relayer {
     return { burnTxHash, sourceDomain: cctpDomain, twin, amount: DEMO_FUND_AMOUNT.toString() };
   }
 
-  private transaction(source: Account, operation: xdr.Operation) {
+  /** A transaction of one operation that bids `bid` stroops to be included, on top of the resource fee simulation adds. */
+  private transaction(source: Account, operation: xdr.Operation, bid: bigint = this.config.inclusionFee) {
     return new TransactionBuilder(source, {
-      fee: INCLUSION_FEE,
+      fee: bid.toString(),
       networkPassphrase: this.config.network.stellar.networkPassphrase,
     })
       .addOperation(operation)
@@ -1571,13 +1720,14 @@ export class Relayer {
    * the simulation. Nothing is given back when a transaction fails or is not
    * taken: the budget may overstate what was spent, never understate it.
    * Returns what this transaction has set aside so far, so a rebuilt
-   * transaction only adds the difference.
+   * transaction, or one sent in place of one that can no longer be applied,
+   * only adds the difference.
    */
-  private setAsideFee(simulation: Simulated, fee: string, setAside: bigint): bigint {
+  private setAsideFee(simulation: Simulated, fee: string, bid: bigint, setAside: bigint): bigint {
     const { maxResourceFee } = this.config;
     const total = BigInt(fee);
     const simulated = BigInt(simulation.minResourceFee);
-    const carried = total - BigInt(INCLUSION_FEE);
+    const carried = total - bid;
     const resourceFee = carried > simulated ? carried : simulated;
     if (resourceFee > maxResourceFee) {
       throw new ApiError(
@@ -1588,58 +1738,141 @@ export class Relayer {
     }
     if (total <= setAside) return setAside;
     if (!this.fees.spend(total - setAside)) {
-      throw new ApiError("unavailable", "The relayer has used up what it spends on fees in a day; try again later");
+      throw new ApiError("unavailable", "The relayer has used up what it spends on fees in a day; try again later", {
+        reason: "daily_budget",
+      });
     }
     return total;
   }
 
   /**
-   * What became of a transaction that was handed to the network under `key`
-   * without its outcome being learned. Returns its hash when it was applied,
-   * and nothing when there is no such transaction or it can no longer be
-   * included. While it may still land, the answer is a refusal: the same
-   * thing is not sent twice.
+   * Counts one transaction against its caller and against the hour, or
+   * refuses when either has none left. Both are looked at before either is
+   * counted, and what is counted is never given back, whatever becomes of
+   * the transaction: failing is not a way to earn another try.
    */
-  private async settleSend(key: string): Promise<string | undefined> {
-    const pending = this.sends.get(key);
-    if (!pending) return undefined;
+  private countSpend(kind: SpendKind, caller: string): void {
+    const { perCaller, overall } = this.spending[kind];
+    const { perCallerPerHour, perHour } = this.config.spend[kind];
+    const { name } = this.config.network;
+    const what = SPEND_WORDS[kind];
 
-    let status: rpc.Api.GetTransactionStatus;
-    try {
-      ({ status } = await this.server.getTransaction(pending.hash));
-    } catch {
-      throw new ApiError(
-        "unavailable",
-        `Transaction ${pending.hash} is on its way and the network cannot be asked about it; try again in a moment`,
-        { hash: pending.hash, sent: true, retryAfterSeconds: ON_ITS_WAY_RETRY_SECONDS },
-      );
+    const mine = perCaller.check(caller);
+    if (!mine.ok) {
+      throw new ApiError("rate_limited", `The relayer pays for ${perCallerPerHour} ${what} an hour from one address on ${name}; try again later`, {
+        retryAfterSeconds: mine.retryAfterSeconds,
+      });
     }
-    if (status === rpc.Api.GetTransactionStatus.SUCCESS) {
-      this.sends.delete(key);
-      return pending.hash;
+    const everyone = overall.check(EVERYONE);
+    if (!everyone.ok) {
+      throw new ApiError("unavailable", `The relayer has paid for the ${perHour} ${what} it pays for in an hour on ${name}; try again later`, {
+        retryAfterSeconds: everyone.retryAfterSeconds,
+        reason: "hourly_limit",
+      });
     }
-    if (status === rpc.Api.GetTransactionStatus.FAILED) {
-      this.sends.delete(key);
-      throw new ApiError("transaction_failed", `Transaction ${pending.hash} was included and failed`, { hash: pending.hash });
+    const counted = [perCaller.take(caller), overall.take(EVERYONE)];
+    if (!counted.every((allowance) => allowance.ok)) {
+      throw new ApiError("unavailable", "The relayer cannot pay for this right now; try again later");
     }
-    // Not seen. Past its time bound the network no longer takes it; until then it may still land.
-    if (Date.now() > pending.deadline + SEND_DEADLINE_MARGIN_MS) {
-      this.sends.delete(key);
-      return undefined;
-    }
-    throw new ApiError("unavailable", `Transaction ${pending.hash} is on its way; ask again in a moment`, {
-      hash: pending.hash,
-      sent: true,
-      retryAfterSeconds: ON_ITS_WAY_RETRY_SECONDS,
-    });
   }
 
-  /** Refuses new sends while the table of transactions on their way is full of ones that may still land. */
+  /**
+   * Refuses to sign anything that could take the relayer account below what
+   * it keeps, so that it never runs down to the reserve the network holds
+   * back. The balance is read right before the transaction is signed; one
+   * that cannot be read counts as too low.
+   */
+  private async assertAboveFloor(fee: bigint): Promise<void> {
+    const { minBalance } = this.config;
+    if (minBalance === BigInt(0)) return;
+
+    let held: bigint;
+    try {
+      held = BigInt((await this.server.getAccountEntry(this.address)).balance.toString());
+    } catch {
+      throw new ApiError("unavailable", "The relayer could not read what its account holds; try again in a moment");
+    }
+    if (held - fee < minBalance) {
+      throw new ApiError(
+        "unavailable",
+        `The relayer's account is down to the ${formatAmount(minBalance, 7)} XLM it keeps in reserve; it pays no fees until it is topped up`,
+        { reason: "low_balance" },
+      );
+    }
+  }
+
+  /**
+   * What became of the transaction that was handed to the network under
+   * `key`: its hash when it was applied, nothing when there is none on
+   * record, and the record itself when the transaction can no longer be
+   * applied, so that the next one bids higher. While it may still land, the
+   * answer is a refusal: the same thing is not sent twice.
+   *
+   * A transaction that is in no ledger is given up only when the network
+   * says its time has passed. Until then, however long this server has been
+   * waiting, it counts as on its way.
+   */
+  private async settleSend(key: string): Promise<{ hash: string } | { expired: PendingSend } | undefined> {
+    let pending = this.sends.get(key);
+    if (!pending) return undefined;
+
+    if (!pending.expired) {
+      let seen: rpc.Api.GetTransactionResponse;
+      try {
+        seen = await this.server.getTransaction(pending.hash);
+      } catch {
+        throw new ApiError(
+          "unavailable",
+          `Transaction ${pending.hash} is on its way and the network cannot be asked about it; try again in a moment`,
+          { hash: pending.hash, sent: true, retryAfterSeconds: ON_ITS_WAY_RETRY_SECONDS },
+        );
+      }
+      const fate = fateOf(seen, pending.deadline);
+      if (fate === "applied") {
+        this.sends.delete(key);
+        return { hash: pending.hash };
+      }
+      if (fate === "failed") {
+        this.sends.delete(key);
+        throw new ApiError("transaction_failed", `Transaction ${pending.hash} was included and failed`, { hash: pending.hash });
+      }
+      if (fate === "unknown") {
+        throw new ApiError("unavailable", `Transaction ${pending.hash} is on its way; ask again in a moment`, {
+          hash: pending.hash,
+          sent: true,
+          retryAfterSeconds: ON_ITS_WAY_RETRY_SECONDS,
+        });
+      }
+      pending = this.expire(key, pending);
+    }
+
+    if (pending.pausedUntil === undefined) return { expired: pending };
+    if (Date.now() < pending.pausedUntil) throw leftOut(pending);
+    this.sends.delete(key);
+    return undefined;
+  }
+
+  /**
+   * Puts on record that a transaction can no longer be applied. What follows
+   * is another one with a higher bid, or, when this was the last one
+   * allowed, a pause.
+   */
+  private expire(key: string, pending: PendingSend): PendingSend {
+    const expired: PendingSend = {
+      ...pending,
+      expired: true,
+      ...(pending.submissions >= MAX_SUBMISSIONS ? { pausedUntil: Date.now() + RESEND_PAUSE_MS } : {}),
+    };
+    this.sends.set(key, expired);
+    return expired;
+  }
+
+  /** Refuses new sends while the table of transactions on their way is full of ones that still stand. */
   private assertSendRoom(key: string): void {
     if (this.sends.has(key) || this.sends.size < MAX_PENDING_SENDS) return;
     const now = Date.now();
     for (const [other, send] of this.sends) {
-      if (now > send.deadline + SEND_DEADLINE_MARGIN_MS) this.sends.delete(other);
+      if (now > (send.pausedUntil ?? send.deadline + SEND_DEADLINE_MARGIN_MS)) this.sends.delete(other);
     }
     if (this.sends.size >= MAX_PENDING_SENDS) {
       throw new ApiError("unavailable", "The relayer is waiting on too many transactions; try again in a moment");
@@ -1653,33 +1886,51 @@ export class Relayer {
    * Everything from reading the sequence number to the confirmation happens
    * inside the queue, one transaction at a time. The operation is simulated
    * there with the ledger as it is at that moment, `inspect` gets a say on
-   * that simulation, and the fee is checked against the cap and set aside
-   * from the day's budget before anything is signed. A transaction refused
-   * for a stale sequence number, which happens when another server instance
-   * used the account in between, is rebuilt and sent once more.
+   * that simulation, and before anything is signed the fee is checked
+   * against the cap, against what the account must keep, and set aside from
+   * the day's budget. A transaction refused for a stale sequence number,
+   * which happens when another server instance used the account in between,
+   * is rebuilt and sent once more.
    *
-   * `key` names what is being sent. The transaction is recorded under it
-   * before it goes out and the record is cleared only by a known outcome:
-   * applied, failed, or refused by the network. When the outcome is not
-   * learned, because the network stopped answering or the wait ran out, the
-   * record stands, and the same key is not sent again until the first
-   * transaction has been seen or can no longer be included.
+   * `key` names what is being sent, and `spend` whose allowance it counts
+   * against. The transaction is recorded under the key before it goes out
+   * and the record is cleared only by a known outcome: applied, failed, or
+   * refused by the network. When the outcome is not learned, because the
+   * network stopped answering or the wait ran out, the record stands, and
+   * nothing is sent under the same key until the first transaction has been
+   * seen or the network says it can no longer be applied.
+   *
+   * A transaction is valid for half a minute and is watched to the end of
+   * it. One that no ledger took in that time is dead for certain; the next
+   * request for the same thing sends another that bids twice as much, up to
+   * a fixed number of times. It is the same payment made again, so it is
+   * counted against its caller once.
    */
-  private send(key: string, operation: xdr.Operation, inspect: (simulation: Simulated) => void): Promise<string> {
+  private send(
+    key: string,
+    spend: { kind: SpendKind; caller: string },
+    operation: xdr.Operation,
+    inspect: (simulation: Simulated) => void,
+  ): Promise<string> {
     return this.queued(this.queue, async (signal) => {
       assertStillWanted(signal);
       this.assertPredecessorSettled();
       const earlier = await this.settleSend(key);
-      if (earlier) return earlier;
+      if (earlier && "hash" in earlier) return earlier.hash;
+      const leftOutBefore = earlier?.expired;
+      this.assertSendRoom(key);
+      if (!leftOutBefore) this.countSpend(spend.kind, spend.caller);
 
+      const bid = leftOutBefore ? leftOutBefore.bid * BigInt(2) : this.config.inclusionFee;
+      const submissions = (leftOutBefore?.submissions ?? 0) + 1;
+      let setAside = leftOutBefore?.setAside ?? BigInt(0);
       let staleSequences = 0;
       let busy = 0;
-      let setAside = BigInt(0);
       for (;;) {
         assertStillWanted(signal);
         this.assertSendRoom(key);
         const account = await this.server.getAccount(this.address);
-        const tx = this.transaction(account, operation);
+        const tx = this.transaction(account, operation, bid);
 
         const simulation = await this.server.simulateTransaction(tx);
         if (rpc.Api.isSimulationError(simulation)) {
@@ -1694,13 +1945,21 @@ export class Relayer {
         inspect(simulation);
 
         const ready = rpc.assembleTransaction(tx, simulation).build();
+        await this.assertAboveFloor(BigInt(ready.fee));
         // The queue may have given up on this transaction while the network was answering.
         assertStillWanted(signal);
-        setAside = this.setAsideFee(simulation, ready.fee, setAside);
+        setAside = this.setAsideFee(simulation, ready.fee, bid, setAside);
         ready.sign(this.config.relayer);
         const hash = Buffer.from(ready.hash()).toString("hex");
         const maxTime = Number(ready.timeBounds?.maxTime ?? 0) * 1000;
-        this.sends.set(key, { hash, deadline: maxTime || Date.now() + TRANSACTION_TIMEOUT_SECONDS * 1000 });
+        const pending: PendingSend = {
+          hash,
+          deadline: maxTime || Date.now() + TRANSACTION_TIMEOUT_SECONDS * 1000,
+          submissions,
+          bid,
+          setAside,
+        };
+        this.sends.set(key, pending);
 
         let sent: rpc.Api.SendTransactionResponse;
         try {
@@ -1715,8 +1974,9 @@ export class Relayer {
         }
 
         if (sent.status === "TRY_AGAIN_LATER" || sent.status === "ERROR") {
-          // Not taken: nothing is on its way.
-          this.sends.delete(key);
+          // Not taken: nothing is on its way. One the network left out before stays on record, so the next bid keeps its place.
+          if (leftOutBefore) this.sends.set(key, leftOutBefore);
+          else this.sends.delete(key);
           if (sent.status === "TRY_AGAIN_LATER") {
             if (busy < BUSY_RETRIES) {
               busy += 1;
@@ -1733,23 +1993,25 @@ export class Relayer {
           throw new ApiError("unavailable", `The network did not take the transaction (${reason})`);
         }
 
-        let status: rpc.Api.GetTransactionStatus | undefined;
+        let seen: rpc.Api.GetTransactionResponse | undefined;
         try {
-          ({ status } = await this.server.pollTransaction(hash, {
+          seen = await this.server.pollTransaction(hash, {
             attempts: CONFIRMATION_ATTEMPTS,
             sleepStrategy: rpc.BasicSleepStrategy,
-          }));
+          });
         } catch {
-          status = undefined;
+          seen = undefined;
         }
-        if (status === rpc.Api.GetTransactionStatus.SUCCESS) {
+        const fate = seen ? fateOf(seen, pending.deadline) : "unknown";
+        if (fate === "applied") {
           this.sends.delete(key);
           return hash;
         }
-        if (status === rpc.Api.GetTransactionStatus.FAILED) {
+        if (fate === "failed") {
           this.sends.delete(key);
           throw new ApiError("transaction_failed", `Transaction ${hash} was included and failed`, { hash });
         }
+        if (fate === "expired") throw leftOut(this.expire(key, pending));
         throw new ApiError("unavailable", `Transaction ${hash} was sent and has not been confirmed yet; ask again in a moment`, {
           hash,
           sent: true,
@@ -1759,6 +2021,9 @@ export class Relayer {
     });
   }
 }
+
+/**
+ * Why a simulated call reverted: the contract's own words when it gave any,}
 
 /**
  * Why a simulated call reverted: the contract's own words when it gave any,
@@ -1848,44 +2113,98 @@ function assertOnlyCalledByRelayer(simulation: Simulated, operation: xdr.Operati
   }
 }
 
-const globalForRelayer = globalThis as typeof globalThis & { pasoRelayer?: Relayer; pasoRelayerState?: unknown };
+const globalForRelayer = globalThis as typeof globalThis & {
+  pasoRelayers?: Partial<Record<NetworkName, Relayer>>;
+  pasoRelayerStates?: Partial<Record<NetworkName, unknown>>;
+  /** What code from before each network had a state of its own left behind: one state, for whichever network it worked on. */
+  pasoRelayerState?: unknown;
+};
 
 /**
- * The state the relayer of this process works with: the one already there
- * when it is of this code's making, a new one otherwise. A state this code
- * cannot read is not thrown away unseen. It becomes the predecessor of the
- * new one, which pays for nothing until the old one's transactions are done.
+ * The state the relayer of a network works with in this process: the one
+ * already there when it is of this code's making, a new one otherwise. A
+ * state this code cannot read is not thrown away unseen. It becomes the
+ * predecessor of the new one, which pays for nothing until the old one's
+ * transactions are done.
  */
 function processState(config: ServerConfig): RelayerState {
-  const existing = globalForRelayer.pasoRelayerState as Partial<RelayerState> | undefined;
-  if (existing && existing.version === STATE_VERSION) return existing as RelayerState;
+  const { name } = config.network;
+  const states = (globalForRelayer.pasoRelayerStates ??= {});
+  const own = states[name] as Partial<RelayerState> | undefined;
+  if (own && own.version === STATE_VERSION) return own as RelayerState;
+  const existing = own ?? (globalForRelayer.pasoRelayerState as Partial<RelayerState> | undefined);
 
   const state = createRelayerState(config);
   if (existing) {
     const inFlight = typeof existing.inFlight === "function" ? existing.inFlight.bind(existing) : undefined;
     state.predecessor = { inFlight, until: Date.now() + (inFlight ? HOUR_MS : PREDECESSOR_GRACE_MS) };
   }
-  globalForRelayer.pasoRelayerState = state;
+  states[name] = state;
   return state;
 }
 
 /**
- * The relayer of this server process, created from the environment on first
- * use. One instance per process keeps one queue per account and one set of
- * counts.
+ * The relayer of this server process for a network, created from the
+ * environment on first use. One instance per network and process keeps one
+ * queue per account and one set of counts. Without a network it is the one
+ * a request means when it names none.
+ *
+ * A network this server was not set up for has no relayer: asking for it is
+ * declined in so many words, and nothing of it is loaded.
  *
  * While developing, an edit replaces this module, and an instance made from
  * the module it replaced would go on running the old code: it is recognised
  * by its class and made anew. Its state is not: the new instance takes over
  * the counts, the budget and the transactions on their way.
  */
-export function getRelayer(): Relayer {
-  const existing = globalForRelayer.pasoRelayer;
+export function getRelayer(network: NetworkName = defaultNetwork()): Relayer {
+  if (!serves(network)) {
+    throw new ApiError("unavailable", `This server is not serving ${network} right now`, { reason: "not_serving" });
+  }
+  const relayers = (globalForRelayer.pasoRelayers ??= {});
+  const existing = relayers[network];
   const usable = process.env.NODE_ENV === "production" ? existing !== undefined : existing instanceof Relayer;
   if (existing && usable) return existing;
 
-  const config = loadConfig();
+  const config = loadConfig(process.env, network);
   const relayer = new Relayer(config, processState(config));
-  globalForRelayer.pasoRelayer = relayer;
+  relayers[network] = relayer;
   return relayer;
+}
+
+/** What one network's relayer reports, or that this server does not work on that network. */
+export type NetworkHealth = ({ enabled: true } & Awaited<ReturnType<Relayer["health"]>>) | { enabled: false };
+
+export interface ServerHealth {
+  /** True when every network this server works on answered in full. */
+  ok: boolean;
+  /** The network a request means when it names none. */
+  default: NetworkName;
+  networks: Record<NetworkName, NetworkHealth>;
+}
+
+/**
+ * What the server reports about itself: each network on its own, served or
+ * not. A network whose settings cannot be read is reported as not served,
+ * and the reason goes to the log.
+ */
+export async function serverHealth(): Promise<ServerHealth> {
+  const report = async (name: NetworkName): Promise<NetworkHealth> => {
+    if (!serves(name)) return { enabled: false };
+    try {
+      return { enabled: true, ...(await getRelayer(name).health()) };
+    } catch (error) {
+      if (!(error instanceof ConfigError)) throw error;
+      console.error("Configuration:", error.message);
+      return { enabled: false };
+    }
+  };
+  const [testnet, mainnet] = await Promise.all(networkNames().map(report));
+  const networks = { testnet: testnet!, mainnet: mainnet! };
+  const served = Object.values(networks).filter((network) => network.enabled);
+  return {
+    ok: served.length > 0 && served.every((network) => network.enabled && network.ok),
+    default: defaultNetwork(),
+    networks,
+  };
 }

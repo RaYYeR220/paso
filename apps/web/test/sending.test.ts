@@ -54,7 +54,7 @@ function scripted({ answers = [], confirmMs = 0, resourceFee = "100", env = {} }
       log.push("confirmed");
       return { status: "SUCCESS", txHash: hash };
     }),
-    getTransaction: vi.fn<(hash: string) => Promise<{ status: string }>>(async () => ({ status: "NOT_FOUND" })),
+    getTransaction: vi.fn<(hash: string) => Promise<{ status: string; latestLedgerCloseTime?: number }>>(async () => ({ status: "NOT_FOUND" })),
   };
   (relayer as unknown as { server: unknown }).server = server;
   return { relayer, server, log };
@@ -281,15 +281,18 @@ describe("a transaction whose outcome was not learned", () => {
     expect(server.sendTransaction).toHaveBeenCalledTimes(2);
   });
 
-  it("is sent anew only once it can no longer be included", async () => {
+  it("is sent anew only once the network says it can no longer be included", async () => {
     const { relayer, server, body } = await unconfirmed();
+    const [pending] = [...relayer.state.sends.values()];
+    const networkClock = (seconds: number) => ({ status: "NOT_FOUND", latestLedgerCloseTime: seconds });
 
-    // 50 seconds in: its time bound of a minute, and the margin after it, have not passed.
-    await vi.advanceTimersByTimeAsync(39_000);
-    await expect(relayer.deploy(body)).rejects.toMatchObject({ code: "unavailable" });
+    // The latest ledger closed exactly at the time bound: the next one may still carry the transaction.
+    server.getTransaction.mockResolvedValue(networkClock(pending!.deadline / 1000));
+    await vi.advanceTimersByTimeAsync(600_000);
+    await expect(relayer.deploy(body)).rejects.toMatchObject({ code: "unavailable", detail: expect.stringContaining("is on its way") });
     expect(server.sendTransaction).toHaveBeenCalledTimes(1);
 
-    await vi.advanceTimersByTimeAsync(2_000);
+    server.getTransaction.mockResolvedValue(networkClock(pending!.deadline / 1000 + 1));
     const anew = relayer.deploy(body);
     await vi.advanceTimersByTimeAsync(10);
     await expect(anew).resolves.toMatchObject({ alreadyDeployed: false });
@@ -345,7 +348,8 @@ describe("what the relayer keeps on record", () => {
   it("is never dropped to make room: with the table full, new sends are declined", async () => {
     const { relayer, server } = scripted();
     const { sends } = relayer.state;
-    for (let i = 0; i < 256; i += 1) sends.set(`deploy:${i}`, { hash: String(i), deadline: Date.now() + 60_000 });
+    const onItsWay = (hash: string, deadline: number) => ({ hash, deadline, submissions: 1, bid: BigInt(1_000), setAside: BigInt(1_100) });
+    for (let i = 0; i < 256; i += 1) sends.set(`deploy:${i}`, onItsWay(String(i), Date.now() + 60_000));
     const standing = [...sends.keys()];
 
     await expect(deployFor(relayer)).rejects.toMatchObject({
@@ -357,7 +361,7 @@ describe("what the relayer keeps on record", () => {
     expect(relayer.state.fees.spent()).toBe(BigInt(0));
 
     // An entry leaves when its own time is up, and that is what makes room.
-    sends.set("deploy:7", { hash: "7", deadline: Date.now() - 31_000 });
+    sends.set("deploy:7", onItsWay("7", Date.now() - 31_000));
     await expect(deployFor(relayer)).resolves.toMatchObject({ alreadyDeployed: false });
     expect(sends.has("deploy:7")).toBe(false);
     expect(sends.size).toBe(255);

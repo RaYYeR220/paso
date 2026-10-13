@@ -1,4 +1,5 @@
-import { limit, readJson, respond } from "@/lib/server/http";
+import { admit, respond } from "@/lib/server/http";
+import { clientIdentity } from "@/lib/server/ratelimit";
 import { getRelayer } from "@/lib/server/relayer";
 
 export const maxDuration = 60;
@@ -14,13 +15,17 @@ export const maxDuration = 60;
  *   200 { status: "pending", attestation: "not_found" | "pending" | "unreachable", delayReason? }
  *   200 { status: "delivered", hash?, route: "forwarder" | "direct" }
  *
+ *   503 { error: "unavailable", reason? }   the relayer is not delivering for now; `reason` says why
+ *
  * Each request asks Circle once: call again every couple of seconds while the
  * status is `pending`. `hash` is missing when the message had already been
- * delivered by someone else, which is just as good.
+ * delivered by someone else, which is just as good. A burn the relayer does
+ * not deliver is not lost: Circle has attested it, and anyone can deliver it
+ * from any funded Stellar account, at any time.
  */
 export async function POST(request: Request): Promise<Response> {
   return respond(async () => {
-    limit("deliver", request);
-    return getRelayer().deliver(await readJson(request));
+    const { body, network } = await admit("deliver", request);
+    return getRelayer(network).deliver(body, clientIdentity(request));
   });
 }

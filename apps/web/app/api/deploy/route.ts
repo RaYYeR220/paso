@@ -1,4 +1,5 @@
-import { limit, readJson, respond } from "@/lib/server/http";
+import { admit, respond } from "@/lib/server/http";
+import { clientIdentity } from "@/lib/server/ratelimit";
 import { getRelayer } from "@/lib/server/relayer";
 
 export const maxDuration = 60;
@@ -15,7 +16,7 @@ export const maxDuration = 60;
  */
 export async function POST(request: Request): Promise<Response> {
   return respond(async () => {
-    limit("deploy", request);
-    return getRelayer().deploy(await readJson(request));
+    const { body, network } = await admit("deploy", request);
+    return getRelayer(network).deploy(body, clientIdentity(request));
   });
 }

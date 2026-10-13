@@ -408,30 +408,14 @@ describe("what the server will not complete", () => {
     expect(lookups).not.toHaveBeenCalled();
   });
 
-  it("does not pay for mints on mainnet unless that was asked for by name", async () => {
-    const onMainnet = { PASO_NETWORK: "mainnet", PASO_ALLOW_MAINNET: "true" };
-    const body = { network: "mainnet", txHash: freshTxHash() };
+  it("asks Circle's production service about an exit on mainnet", async () => {
+    const onMainnet = { PASO_ALLOW_MAINNET: "true", RELAYER_SECRET_MAINNET: Keypair.random().secret() };
+    const relayer = new Relayer(loadConfig({ ...env, ...onMainnet }, "mainnet"));
     const lookups = stubIris(() => Response.json({ error: "Message not found" }, { status: 404 }));
 
-    const byDefault = completing({ env: onMainnet });
-    expect(await refusal(byDefault.relayer, body)).toMatchObject({
-      code: "not_found",
-      status: 404,
-      detail: expect.stringContaining("your own wallet"),
-    });
-    expect(lookups).not.toHaveBeenCalled();
-
-    const askedFor = completing({ env: { ...onMainnet, PAY_BASE_MINTS_ON_MAINNET: "true" } });
-    expect(await askedFor.relayer.complete(body, "caller")).toEqual({ status: "pending", attestation: "not_found" });
+    expect(await relayer.complete({ network: "mainnet", txHash: freshTxHash() }, "caller")).toEqual({ status: "pending", attestation: "not_found" });
     expect(lookups.mock.calls[0]![0]).toContain("https://iris-api.circle.com/v2/messages/27?");
-  });
-
-  it("is unavailable without an account on Base", async () => {
-    const relayer = new Relayer(loadConfig({ RELAYER_SECRET: env.RELAYER_SECRET }));
-    const lookups = stubIris(() => attested());
-
-    expect(await refusal(relayer)).toMatchObject({ code: "unavailable", detail: expect.stringContaining("no account on Base") });
-    expect(lookups).not.toHaveBeenCalled();
+    expect(await refusal(relayer, { network: "testnet", txHash: freshTxHash() })).toMatchObject({ code: "bad_request" });
   });
 });
 

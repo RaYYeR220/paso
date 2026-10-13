@@ -63,8 +63,11 @@ const simulated = (auth: xdr.SorobanAuthorizationEntry[]) => ({
 });
 
 /** A signed USDC approval by the owner's account, made without the network. */
-async function signedCall(amount = 1, validForLedgers = 120): Promise<{ signed: Signed; body: RelayRequest }> {
-  const server = { simulateTransaction: async (tx: never) => simulated([recorded(invocation(tx).call)]) } as unknown as rpc.Server;
+/** With `preparedAgo`, a call prepared that many ledgers back: one whose single ledger of validity has passed. */
+async function signedCall(amount = 1, validForLedgers = 120, preparedAgo = 0): Promise<{ signed: Signed; body: RelayRequest }> {
+  const server = {
+    simulateTransaction: async (tx: never) => ({ ...simulated([recorded(invocation(tx).call)]), latestLedger: LATEST - preparedAgo }),
+  } as unknown as rpc.Server;
   const prepared = await prepare(
     {
       kind: "invoke",
@@ -278,7 +281,7 @@ describe("a call this server has no record of", () => {
   });
 
   it("finds the transaction of an expired signature too, and otherwise says expired without a claim", async () => {
-    const stale = await signedCall(1, -3);
+    const stale = await signedCall(1, 1, 4);
     const ran = relaying({ spentIn: 4_999_000, transactions: [carrying(stale.body, 4_999_000, "ab".repeat(32))] });
     expect(await ran.relayer.relay(stale.body)).toEqual({ hash: "ab".repeat(32) });
 
@@ -403,5 +406,26 @@ describe("what the relayer remembers of relayed calls", () => {
     const later = await refusalOf(refused.relayer, body);
     expect(later).not.toBe(first);
     expect(later).toMatchObject({ code: "bad_signature", extra: { sent: false } });
+  });
+});
+
+describe("a signature that would stay good for longer than the relayer lets through", () => {
+  it("is not relayed, deployed for or sent: about ten minutes ahead is the most", async () => {
+    // Prepared against a ledger far ahead, so its last valid ledger is 620 ledgers from now.
+    const longLived = await signedCall(1, 120, -500);
+    const { relayer, server } = relaying();
+
+    const refused = await refusalOf(relayer, longLived.body);
+
+    expect(refused).toMatchObject({
+      code: "bad_request",
+      status: 400,
+      detail: expect.stringMatching(/valid for 620 ledgers.*at most 120/),
+      extra: { sent: false },
+    });
+    expect(server.sendTransaction).not.toHaveBeenCalled();
+
+    const atTheLimit = await signedCall(2, 120);
+    await expect(relaying().relayer.relay(atTheLimit.body)).resolves.toMatchObject({ hash: expect.any(String) });
   });
 });

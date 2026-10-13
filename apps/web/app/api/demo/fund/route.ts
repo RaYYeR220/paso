@@ -1,4 +1,4 @@
-import { limit, readJson, respond } from "@/lib/server/http";
+import { admit, respond } from "@/lib/server/http";
 import { clientIdentity } from "@/lib/server/ratelimit";
 import { getRelayer } from "@/lib/server/relayer";
 
@@ -8,7 +8,7 @@ export const maxDuration = 60;
  * Testnet faucet: burns 1 test USDC on Base Sepolia for the Stellar account
  * of an Ethereum address.
  *
- *   POST { owner }
+ *   POST { network?, owner }
  *   200  { burnTxHash, sourceDomain, twin, amount }
  *   429  { error: "rate_limited" }   with a Retry-After header
  *   503  { error: "unavailable" }    the faucet is empty, or has given out its day's worth
@@ -22,7 +22,7 @@ export const maxDuration = 60;
  */
 export async function POST(request: Request): Promise<Response> {
   return respond(async () => {
-    limit("fund", request);
-    return getRelayer().demoFund(await readJson(request), clientIdentity(request));
+    const { body, network } = await admit("fund", request);
+    return getRelayer(network).demoFund(body, clientIdentity(request));
   });
 }

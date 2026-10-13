@@ -169,12 +169,24 @@ describe("the demo faucet", () => {
   });
 
   it("exists on testnet only", async () => {
-    const { relayer, burnForDemo } = faucet({ PASO_NETWORK: "mainnet", PASO_ALLOW_MAINNET: "true" });
+    const onMainnet = {
+      PASO_ALLOW_MAINNET: "true",
+      RELAYER_SECRET_MAINNET: Keypair.random().secret(),
+      BASE_PAYER_PRIVATE_KEY_MAINNET: generatePrivateKey(),
+    };
+    const relayer = new Relayer(loadConfig({ ...env, ...onMainnet }, "mainnet"));
+    const internals = relayer as unknown as Internals;
+    const funded = vi.spyOn(internals, "assertFaucetFunded").mockResolvedValue(undefined);
+    const burnForDemo = vi.spyOn(internals, "burnForDemo").mockImplementation(paid);
 
-    await expect(relayer.demoFund({ owner: randomOwner() }, "203.0.113.1")).rejects.toMatchObject({
-      code: "not_found",
-      status: 404,
-    });
+    for (const body of [{ owner: randomOwner() }, { owner: randomOwner(), network: "mainnet" }]) {
+      await expect(relayer.demoFund(body, "203.0.113.1")).rejects.toMatchObject({
+        code: "not_found",
+        status: 404,
+        detail: "The demo faucet exists on testnet only",
+      });
+    }
+    expect(funded).not.toHaveBeenCalled();
     expect(burnForDemo).not.toHaveBeenCalled();
   });
 
@@ -273,31 +285,38 @@ describe.skipIf(!live)("on testnet", () => {
     const body = JSON.parse(text);
 
     expect(response.status).toBe(200);
-    expect(body).toMatchObject({
+    expect(Object.keys(body).sort()).toEqual(["default", "networks", "ok"]);
+    expect(body.default).toBe("testnet");
+    const { testnet } = body.networks;
+    expect(testnet).toMatchObject({
+      enabled: true,
       ok: true,
       network: "testnet",
       hub: NETWORKS.testnet.stellar.hub,
-      relayer: { address: getRelayer().address, xlm: expect.stringMatching(/^\d+(\.\d+)?$/) },
-      maxResourceFee: "5000000",
+      relayer: { address: getRelayer("testnet").address, xlm: expect.stringMatching(/^\d+(\.\d+)?$/) },
+      fees: { maxResourceFee: "5000000", inclusionFee: "1000", maxDailyFees: "500000000", minBalance: "0" },
+      paysFees: true,
     });
-    expect(Object.keys(body).sort()).toEqual(["hub", "latestLedger", "maxResourceFee", "network", "ok", "payer", "relayer"]);
-    expect(body.latestLedger).toBeGreaterThan(0);
-    expect(Number(body.relayer.xlm)).toBeGreaterThan(1);
+    expect(Object.keys(testnet).sort()).toEqual(
+      ["enabled", "faucet", "fees", "hub", "latestLedger", "limits", "network", "ok", "payer", "paysBaseMints", "paysFees", "relayer"],
+    );
+    expect(testnet.latestLedger).toBeGreaterThan(0);
+    expect(Number(testnet.relayer.xlm)).toBeGreaterThan(1);
     if (process.env.DEMO_PAYER_PRIVATE_KEY) {
-      expect(body.payer).toMatchObject({
+      expect(testnet.payer).toMatchObject({
         address: privateKeyToAccount(process.env.DEMO_PAYER_PRIVATE_KEY as `0x${string}`).address,
         chain: "Base Sepolia",
         usdc: expect.stringMatching(/^\d+(\.\d+)?$/),
         eth: expect.stringMatching(/^\d+(\.\d+)?$/),
       });
     }
-    for (const secret of [process.env.RELAYER_SECRET, process.env.DEMO_PAYER_PRIVATE_KEY]) {
+    for (const secret of [process.env.RELAYER_SECRET, process.env.RELAYER_SECRET_MAINNET, process.env.DEMO_PAYER_PRIVATE_KEY]) {
       if (secret) expect(text).not.toContain(secret);
     }
   });
 
   it("POST /api/demo/fund says so when the payer has no test USDC, and does not count the request", async () => {
-    const report = await (await health()).json();
+    const report = (await (await health()).json()).networks.testnet;
     if (!report.payer || Number(report.payer.usdc) >= 3) return;
     const owner = randomOwner();
 
