@@ -14,7 +14,9 @@
     "test": "pnpm test:contracts && pnpm test:sdk",
     "test:web": "pnpm --filter @paso/web test",
     "e2e": "tsx scripts/e2e.ts",
-    "verify": "tsx scripts/verify.ts"
+    "verify": "tsx scripts/verify.ts",
+    "deliver": "tsx scripts/deliver.ts",
+    "mint": "tsx scripts/mint.ts"
   },
   "devDependencies": {
     "@stellar/stellar-sdk": "17.2.1",

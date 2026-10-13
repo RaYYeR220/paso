@@ -83,8 +83,6 @@ import {
   formatEther,
   formatGwei,
   getAddress,
-  hexToBytes,
-  hexToString,
   http,
   isAddress,
   keccak256,
@@ -145,24 +143,14 @@ import {
   type NetworkName,
   type Signed,
 } from "../packages/sdk/src/index";
+import { deliveredOnStellar, stellarRecipient } from "./cctp";
 import { describe, formatXlm, MINIMUM_BALANCE, simulatedFee, STROOPS_PER_XLM, xlmBalance } from "./fees";
+import { INCLUSION_BID, sendAndWait as sendFrom, simulated, VALIDITY_SECONDS, type Applied } from "./sender";
 
 const HONEST_AMOUNT = 1n;
 const TAMPERED_AMOUNT = parseStellarAmount("1000000");
 const ATTESTATION_TIMEOUT_MS = 20 * 60 * 1000;
 const POLL_MS = 2000;
-/**
- * What a Stellar transaction bids to get into a ledger, in stroops, on top of
- * its resource fee. The network charges the going rate, never more than the
- * bid. When mainnet ledgers are full, a transaction bidding the 100-stroop
- * minimum is dropped without a trace, so a mainnet run bids 0.01 XLM and
- * doubles the bid each time it has to send a transaction again.
- */
-const INCLUSION_BID: Record<NetworkName, bigint> = { testnet: 100n, mainnet: 100_000n };
-/** How long a submitted transaction can still be applied. After that it is dead and can be sent again. */
-const VALIDITY_SECONDS = 60;
-/** How many times a transaction is sent before the run gives up on it. */
-const SUBMISSIONS = 3;
 /** How long the approval of the first call stays usable, in ledgers. */
 const APPROVAL_LEDGERS = 1000;
 /**
@@ -384,69 +372,13 @@ function reached(run: Run, ...flags: string[]): void {
   continuation = ["pnpm e2e", ...run.options.kept, ...flags].join(" ");
 }
 
-type Applied = rpc.Api.GetSuccessfulTransactionResponse | rpc.Api.GetFailedTransactionResponse;
-
-/**
- * Sends a transaction from the fee payer and waits until the network has
- * applied it, whether it succeeded or failed there.
- *
- * `build` makes the transaction for the payer's current sequence number and
- * the given bid. A transaction no ledger took before its time bound passed
- * can never be applied, so it is built again with twice the bid and sent
- * again. Both carry the same sequence number, so at most one of them is ever
- * applied; and every call sent here is either harmless to repeat or guarded
- * by a nonce that can be used once.
- */
-async function sendAndWait(
+/** Sends a transaction from the fee payer and waits until the network has applied it; see `sendAndWait` in sender.ts. */
+function sendAndWait(
   run: Run,
   what: string,
   build: (account: Account, bid: bigint) => Promise<Transaction>,
 ): Promise<Applied> {
-  const source = requireSource(run);
-  let bid = INCLUSION_BID[run.config.name];
-  for (let attempt = 1; ; attempt += 1) {
-    const tx = await build(await run.server.getAccount(source.publicKey()), bid);
-    tx.sign(source);
-    const hash = toHex(tx.hash()).slice(2);
-    const expires = Number(tx.timeBounds?.maxTime ?? 0);
-
-    let sent = await run.server.sendTransaction(tx);
-    // A busy node asks to be offered the same transaction again.
-    while (sent.status === "TRY_AGAIN_LATER" && Date.now() / 1000 < expires) {
-      await sleep(POLL_MS);
-      sent = await run.server.sendTransaction(tx);
-    }
-    if (sent.status === "ERROR") {
-      const reason = sent.errorResult?.result.type ?? "no reason given";
-      // Someone else sent from the payer's account in the meantime: the same transaction is built on the new sequence number.
-      if (reason === "txBadSeq" && attempt < SUBMISSIONS) {
-        line("again", `the fee payer's sequence number moved under ${hash}; building the transaction again`);
-        continue;
-      }
-      throw new Error(`The network did not take the transaction ${what}: ${reason} (${hash})`);
-    }
-
-    // Until a ledger closes after the time bound, the transaction can still be applied.
-    for (;;) {
-      const result = await run.server.getTransaction(hash).catch((error: unknown) => {
-        if (Date.now() / 1000 > expires + 2 * VALIDITY_SECONDS) throw error;
-        return undefined;
-      });
-      if (result && result.status !== rpc.Api.GetTransactionStatus.NOT_FOUND) return result;
-      if (result && result.latestLedgerCloseTime > expires) break;
-      await sleep(POLL_MS);
-    }
-
-    if (attempt === SUBMISSIONS) {
-      throw new Error(
-        `The transaction ${what} was sent ${SUBMISSIONS} times and no ledger took it before it expired (last: ${hash}). ` +
-          "Nothing was charged for it; the network is busy, try again later",
-      );
-    }
-    bid *= 2n;
-    line("expired", `${hash} was not applied before its time ran out, and never will be`);
-    line("", `sending it again, bidding ${formatXlm(bid)} to be included (attempt ${attempt + 1} of ${SUBMISSIONS})`);
-  }
+  return sendFrom(run.server, requireSource(run), run.config.name, what, build, line);
 }
 
 /**
@@ -455,22 +387,9 @@ async function sendAndWait(
  */
 async function execute(run: Run, what: string, operation: xdr.Operation): Promise<string> {
   const applied = await sendAndWait(run, what, async (account, bid) => {
-    const tx = new TransactionBuilder(account, {
-      fee: bid.toString(),
-      networkPassphrase: run.config.stellar.networkPassphrase,
-    })
-      .addOperation(operation)
-      .setTimeout(VALIDITY_SECONDS)
-      .build();
-    const simulation = await run.server.simulateTransaction(tx);
-    if (rpc.Api.isSimulationError(simulation)) {
-      throw new SimulationError(simulation.error);
-    }
-    if (rpc.Api.isSimulationRestore(simulation)) {
-      throw new SimulationError("ledger entries this call needs are archived and have to be restored first");
-    }
-    line("fee", `${formatXlm(BigInt(simulation.minResourceFee) + bid)} at most ${what}, simulated`);
-    return rpc.assembleTransaction(tx, simulation).build();
+    const { tx, fee } = await simulated(run.server, run.config.stellar.networkPassphrase, account, operation, bid);
+    line("fee", `${formatXlm(fee)} at most ${what}, simulated`);
+    return tx;
   });
   if (applied.status !== rpc.Api.GetTransactionStatus.SUCCESS) {
     throw new Error(`The transaction ${what} failed on chain: ${applied.txHash}`);
@@ -866,30 +785,6 @@ const usedNoncesAbi = [
 ] as const;
 
 /**
- * The Stellar address an attested burn pays: the one named in the hook data
- * when the USDC goes through Circle's forwarder, the mint recipient itself
- * otherwise.
- */
-function stellarRecipient(message: Hex, config: NetworkConfig): string {
-  const burn = decodeBurnMessage(message);
-  return inboundRouteOf(message, config) === "forwarder"
-    ? hexToString(slice(burn.hookData, 32))
-    : StrKey.encodeContract(Buffer.from(hexToBytes(burn.mintRecipient)));
-}
-
-/** Whether Circle's message transmitter on Stellar has taken a message: it takes each one once. */
-async function takenOnStellar(run: Run, nonce: Hex): Promise<boolean> {
-  const used = await readContract(
-    run.config.stellar.messageTransmitter,
-    "is_nonce_used",
-    [xdr.ScVal.scvBytes(hexToBytes(nonce))],
-    run.config,
-    run.server,
-  );
-  return renderArg(used) === "true";
-}
-
-/**
  * Whoever pays on Base when it is not the owner: for the burn when there is
  * no faucet, and for the mint that ends the way back. On mainnet the owner
  * pays and no other key is looked at.
@@ -941,7 +836,7 @@ async function journey(run: Run, options: Options): Promise<void> {
     }
 
     heading("The USDC is delivered on Stellar");
-    const delivered = await takenOnStellar(run, inbound.nonce);
+    const delivered = await deliveredOnStellar(config, server, inbound.nonce);
     if (delivered) line("delivered", "already: Circle's message transmitter on Stellar has taken this message");
     else await deliver(run, burnTxHash, inbound);
     reached(run, "--skip-fund");
