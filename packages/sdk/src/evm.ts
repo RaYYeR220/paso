@@ -10,8 +10,8 @@ import {
   type PublicClient,
   type WalletClient,
 } from "viem";
-import { decodeBurnMessage, FAST_FINALITY, fetchBurnFee, maxFeeFor } from "./iris";
-import { resolveNetwork, type Network } from "./networks";
+import { decodeBurnMessage, FAST_FINALITY, fetchBurnFee, maxFeeFor, STANDARD_FINALITY } from "./iris";
+import { evmChain, resolveNetwork, type EvmChainConfig, type EvmChainName, type Network } from "./networks";
 import { twinAddress, twinContractId } from "./twin";
 
 export const erc20Abi = [
@@ -99,7 +99,7 @@ export const messageTransmitterAbi = [
 ] as const;
 
 /**
- * How USDC burned on Base reaches a Stellar account.
+ * How USDC burned on an EVM chain reaches a Stellar account.
  *
  * - `forwarder`: mint to Circle's CctpForwarder, which passes the USDC on to
  *   the account named in the hook data. This is the route Circle documents.
@@ -139,20 +139,31 @@ export function forwardRecipientHookData(recipient: string): Hex {
   ]);
 }
 
-/** The part of a viem public client used to read Base. Clients for any chain fit, Base's own included. */
+/** The part of a viem public client used to read an EVM chain. Clients for any chain fit. */
 export type EvmReader = Pick<PublicClient, "readContract" | "waitForTransactionReceipt">;
 
 export interface FundFromEvmArgs {
-  /** Pays the USDC and the gas. Must have its account set and be connected to Base. */
+  /** Pays the USDC and the gas. Must have its account set and be connected to the chain the USDC leaves. */
   walletClient: WalletClient;
   publicClient: EvmReader;
-  /** USDC to burn, in 6-decimal units. */
+  /**
+   * USDC to burn, in 6-decimal units: the USDC token's units on every chain,
+   * Arc included, where the native balance counts the same USDC in 18.
+   */
   amount: bigint;
   /** The Ethereum address whose Stellar account receives the USDC. It need not be the payer. */
   owner: Address;
   network: Network;
+  /** The chain the USDC leaves. Defaults to Base. */
+  chain?: EvmChainName;
   route?: InboundRoute;
-  /** Fee cap in 6-decimal units. Defaults to Circle's current fast-transfer fee plus headroom. */
+  /**
+   * Defaults to a fast transfer where Circle offers one from the chain, and
+   * to a standard transfer elsewhere (Arc), which is attested within seconds
+   * there and costs nothing.
+   */
+  minFinalityThreshold?: number;
+  /** Fee cap in 6-decimal units. Defaults to Circle's current fee for the finality asked for, plus headroom. */
   maxFee?: bigint;
 }
 
@@ -167,25 +178,38 @@ export interface FundFromEvmResult {
 }
 
 /**
- * A transaction was included on Base and reverted. This is a known outcome:
- * unlike a timeout or a transport error, it says the transaction did not do
- * what it was sent for and never will.
+ * A transaction was included on an EVM chain and reverted. This is a known
+ * outcome: unlike a timeout or a transport error, it says the transaction did
+ * not do what it was sent for and never will.
  */
 export class TransactionRevertedError extends Error {
   constructor(
     readonly hash: Hex,
     what: string,
+    /** The chain, by the name it has on every network: "Base", "Arc". */
+    chainLabel = "Base",
   ) {
-    super(`The ${what} reverted on Base: ${hash}`);
+    super(`The ${what} reverted on ${chainLabel}: ${hash}`);
     this.name = "TransactionRevertedError";
   }
 }
 
-async function confirmed(publicClient: EvmReader, hash: Hex, what: string, confirmations?: number): Promise<void> {
+async function confirmed(
+  publicClient: EvmReader,
+  hash: Hex,
+  what: string,
+  chain: Pick<EvmChainConfig, "shortLabel">,
+  confirmations?: number,
+): Promise<void> {
   const receipt = await publicClient.waitForTransactionReceipt(confirmations ? { hash, confirmations } : { hash });
   if (receipt.status !== "success") {
-    throw new TransactionRevertedError(hash, what);
+    throw new TransactionRevertedError(hash, what, chain.shortLabel);
   }
+}
+
+/** The finality a burn on this chain asks for unless told otherwise: fast where Circle offers it, standard elsewhere. */
+export function defaultFinalityOf(chain: Pick<EvmChainConfig, "fastTransfer">): number {
+  return chain.fastTransfer ? FAST_FINALITY : STANDARD_FINALITY;
 }
 
 /**
@@ -217,18 +241,25 @@ function wordsOf(error: unknown): string {
 const SHORT_ALLOWANCE = /exceeds allowance|insufficient allowance/i;
 
 /**
- * Sends USDC from Base to the Stellar account of `owner`: approves Circle's
- * TokenMessenger when the allowance is short, waits for the approval to be
- * seen, then burns with a fast transfer.
+ * Sends USDC from an EVM chain, Base unless `chain` names another, to the
+ * Stellar account of `owner`: approves Circle's TokenMessenger when the
+ * allowance is short, waits for the approval to be seen, then burns, with a
+ * fast transfer where the chain has one.
+ *
+ * On Arc the USDC token and the gas come out of one balance: the payer needs
+ * the amount and the gas on top of it.
  *
  * The USDC appears on Stellar once the burn is attested and delivered there;
- * see `waitForAttestation` and `deliverOperation`.
+ * see `waitForAttestation`, which takes the chain's name as its source, and
+ * `deliverOperation`.
  */
 export async function fundFromEvm(args: FundFromEvmArgs): Promise<FundFromEvmResult> {
   const { walletClient, publicClient, amount, owner, route = DEFAULT_INBOUND_ROUTE } = args;
   const config = resolveNetwork(args.network);
-  const { chain, usdc, tokenMessenger, cctpDomain } = config.evm;
+  const source = evmChain(config, args.chain);
+  const { chain, usdc, tokenMessenger, cctpDomain } = source;
   const destinationDomain = config.stellar.cctpDomain;
+  const minFinalityThreshold = args.minFinalityThreshold ?? defaultFinalityOf(source);
 
   if (amount <= 0n) {
     throw new Error("The amount to send must be positive");
@@ -240,7 +271,8 @@ export async function fundFromEvm(args: FundFromEvmArgs): Promise<FundFromEvmRes
   const twin = twinAddress(owner, config);
 
   const maxFee =
-    args.maxFee ?? maxFeeFor(amount, await fetchBurnFee(cctpDomain, destinationDomain, config));
+    args.maxFee ??
+    maxFeeFor(amount, await fetchBurnFee(cctpDomain, destinationDomain, config, { finalityThreshold: minFinalityThreshold }));
   if (maxFee >= amount) {
     throw new Error(`The fee cap (${maxFee}) must be less than the amount (${amount})`);
   }
@@ -263,7 +295,7 @@ export async function fundFromEvm(args: FundFromEvmArgs): Promise<FundFromEvmRes
       chain,
       account,
     });
-    await confirmed(publicClient, approveTxHash, "approval");
+    await confirmed(publicClient, approveTxHash, "approval", source);
     for (let poll = 0; poll < APPROVAL_POLLS && (await readAllowance()) < amount; poll += 1) {
       await pause(APPROVAL_POLL_MS);
     }
@@ -276,7 +308,7 @@ export async function fundFromEvm(args: FundFromEvmArgs): Promise<FundFromEvmRes
         address: tokenMessenger,
         abi: tokenMessengerAbi,
         functionName: "depositForBurnWithHook",
-        args: [amount, destinationDomain, forwarder, usdc, forwarder, maxFee, FAST_FINALITY, forwardRecipientHookData(twin)],
+        args: [amount, destinationDomain, forwarder, usdc, forwarder, maxFee, minFinalityThreshold, forwardRecipientHookData(twin)],
         chain,
         account,
       });
@@ -285,7 +317,7 @@ export async function fundFromEvm(args: FundFromEvmArgs): Promise<FundFromEvmRes
       address: tokenMessenger,
       abi: tokenMessengerAbi,
       functionName: "depositForBurn",
-      args: [amount, destinationDomain, twinContractId(owner, config), usdc, zeroHash, maxFee, FAST_FINALITY],
+      args: [amount, destinationDomain, twinContractId(owner, config), usdc, zeroHash, maxFee, minFinalityThreshold],
       chain,
       account,
     });
@@ -303,22 +335,25 @@ export async function fundFromEvm(args: FundFromEvmArgs): Promise<FundFromEvmRes
       await pause(BURN_RETRY_MS);
     }
   }
-  await confirmed(publicClient, burnTxHash, "burn");
+  await confirmed(publicClient, burnTxHash, "burn", source);
 
   return { burnTxHash, approveTxHash, route, twin, maxFee };
 }
 
 /**
- * Whether Circle's MessageTransmitter on Base has taken a message already.
- * A message is received once: its nonce is marked as used when it is.
+ * Whether Circle's MessageTransmitter on an EVM chain, Base unless `chain`
+ * names another, has taken a message already. A message is received once:
+ * its nonce is marked as used when it is. `publicClient` has to read that
+ * chain.
  */
 export async function isReceivedOnEvm(
   publicClient: Pick<EvmReader, "readContract">,
   message: Hex,
   network: Network,
+  chain?: EvmChainName,
 ): Promise<boolean> {
   const used = await publicClient.readContract({
-    address: resolveNetwork(network).evm.messageTransmitter,
+    address: evmChain(network, chain).messageTransmitter,
     abi: messageTransmitterAbi,
     functionName: "usedNonces",
     args: [decodeBurnMessage(message).nonce],
@@ -327,13 +362,18 @@ export async function isReceivedOnEvm(
 }
 
 export interface ReceiveOnEvmArgs {
-  /** Pays the gas. Must have its account set and be connected to Base. */
+  /** Pays the gas. Must have its account set and be connected to the chain the message is for. */
   walletClient: WalletClient;
   publicClient: EvmReader;
   /** The attested message and its attestation, as Circle's Iris service returned them. */
   message: Hex;
   attestation: Hex;
   network: Network;
+  /**
+   * The chain the message is for. Defaults to Base. A message whose
+   * destination domain is not this chain's is refused before anything is sent.
+   */
+  chain?: EvmChainName;
   /**
    * Gas limit for the call. When given, the wallet does not estimate it, so
    * nothing stops a call that would revert: simulate first.
@@ -355,9 +395,10 @@ export interface ReceiveOnEvmResult {
 }
 
 /**
- * Completes a transfer from Stellar on Base: hands the attested message to
- * Circle's MessageTransmitter, which mints the USDC to the recipient the
- * message names. Anyone may do this; the caller only pays the gas.
+ * Completes a transfer from Stellar on an EVM chain, Base unless `chain`
+ * names another: hands the attested message to Circle's MessageTransmitter,
+ * which mints the USDC to the recipient the message names. Anyone may do
+ * this; the caller only pays the gas.
  *
  * A message is received once. If someone else got there first, before the
  * call or while it was on its way, this resolves with `alreadyReceived`
@@ -369,32 +410,37 @@ export interface ReceiveOnEvmResult {
 export async function receiveMessageOnEvm(args: ReceiveOnEvmArgs): Promise<ReceiveOnEvmResult> {
   const { walletClient, publicClient, message, attestation, gas, maxFeePerGas, maxPriorityFeePerGas } = args;
   const config = resolveNetwork(args.network);
+  const target = evmChain(config, args.chain);
   const account = walletClient.account;
   if (!account) {
     throw new Error("The wallet client has no account to pay from");
   }
-  if (await isReceivedOnEvm(publicClient, message, config)) {
+  const { destinationDomain } = decodeBurnMessage(message);
+  if (args.chain !== undefined && destinationDomain !== target.cctpDomain) {
+    throw new Error(`The message is for CCTP domain ${destinationDomain}, not for ${target.label} (${target.cctpDomain})`);
+  }
+  if (await isReceivedOnEvm(publicClient, message, config, target.name)) {
     return { alreadyReceived: true };
   }
 
   try {
     const hash = await walletClient.writeContract({
-      address: config.evm.messageTransmitter,
+      address: target.messageTransmitter,
       abi: messageTransmitterAbi,
       functionName: "receiveMessage",
       args: [message, attestation],
-      chain: config.evm.chain,
+      chain: target.chain,
       account,
       ...(gas === undefined ? {} : { gas }),
       ...(maxFeePerGas === undefined ? {} : { maxFeePerGas }),
       ...(maxPriorityFeePerGas === undefined ? {} : { maxPriorityFeePerGas }),
     });
     args.onSubmitted?.(hash);
-    await confirmed(publicClient, hash, "mint", args.confirmations);
+    await confirmed(publicClient, hash, "mint", target, args.confirmations);
     return { hash, alreadyReceived: false };
   } catch (error) {
     // A call that lost the race reverts with "Nonce already used". The chain is asked rather than the error read.
-    if (await isReceivedOnEvm(publicClient, message, config).catch(() => false)) {
+    if (await isReceivedOnEvm(publicClient, message, config, target.name).catch(() => false)) {
       return { alreadyReceived: true };
     }
     throw error;

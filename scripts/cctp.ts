@@ -3,16 +3,20 @@
  * and where an attested message sends its USDC.
  */
 import { StrKey, xdr, type rpc } from "@stellar/stellar-sdk";
-import { getAddress, hexToBytes, hexToNumber, hexToString, size, slice, type Address, type Hex } from "viem";
+import { getAddress, hexToBytes, hexToNumber, hexToString, pad, size, slice, type Address, type Hex } from "viem";
 import {
   decodeBurnMessage,
   fetchAttestations,
+  findBurnSource,
   inboundRouteOf,
   readContract,
   renderArg,
   type Attestation,
+  type EvmChainConfig,
+  type EvmChainName,
   type NetworkConfig,
 } from "../packages/sdk/src/index";
+import { expectSame } from "./evm";
 import type { Report } from "./sender";
 
 const POLL_MS = 2000;
@@ -69,6 +73,41 @@ export async function attestedMessages(
 }
 
 /**
+ * The chain a burn on an EVM chain was made on, from its hash alone: Iris is
+ * asked under the domain of every chain the network lists, or of `chains`.
+ * With `wait`, a hash no chain knows yet is asked about again for a minute,
+ * since a burn just made takes a moment to show.
+ */
+export async function burnSource(
+  txHash: string,
+  config: NetworkConfig,
+  options: { wait: boolean; report: Report; chains?: readonly EvmChainName[] },
+): Promise<EvmChainConfig> {
+  const started = Date.now();
+  let last = "";
+  for (;;) {
+    const found = await findBurnSource(txHash, config, { chains: options.chains });
+    if (found.state === "found") return found.chain;
+    if (found.state === "ambiguous") {
+      throw new Error(`Iris has a burn ${txHash} on ${found.chains.map((chain) => chain.label).join(" and ")}: name the chain with --chain`);
+    }
+    const text = found.state === "unreachable" ? `unreachable: ${found.detail}` : "has no burn under this hash on any chain yet";
+    if (text !== last) {
+      options.report("circle", text);
+      last = text;
+    }
+    if (found.state === "not_found" && (!options.wait || Date.now() - started > NOT_FOUND_MS)) {
+      throw new Error(
+        `Iris (${config.irisUrl}) knows no burn ${txHash} on any chain Paso lists for ${config.name}. ` +
+          "Check the hash and the network; a burn made a moment ago shows within seconds",
+      );
+    }
+    if (!options.wait && found.state === "unreachable") throw new Error(`Iris could not be asked: ${found.detail}`);
+    await new Promise((done) => setTimeout(done, POLL_MS));
+  }
+}
+
+/**
  * The Stellar address an attested burn pays: the one named in the hook data
  * when the USDC goes through Circle's forwarder, the mint recipient itself
  * otherwise.
@@ -92,7 +131,7 @@ export function stellarRecipient(message: Hex, config: NetworkConfig): string {
   return recipient;
 }
 
-/** The Base address an attested exit pays: the last 20 bytes of the mint recipient. */
+/** The EVM address an attested exit pays: the last 20 bytes of the mint recipient. */
 export function evmRecipient(message: Hex): Address {
   return getAddress(slice(decodeBurnMessage(message).mintRecipient, 12));
 }
@@ -107,4 +146,40 @@ export async function deliveredOnStellar(config: NetworkConfig, server: rpc.Serv
     server,
   );
   return renderArg(used) === "true";
+}
+
+/**
+ * Circle's three contracts on Stellar have to name each other, carry
+ * Stellar's domain, be running, and know `chain`: its token messenger for its
+ * domain, and its USDC paired with Stellar's.
+ */
+export async function checkStellarCircle(config: NetworkConfig, server: rpc.Server, chain: EvmChainConfig, report: Report): Promise<void> {
+  const { tokenMessenger, messageTransmitter, forwarder, cctpDomain, usdc } = config.stellar;
+  const read = async (contract: string, fn: string, ...args: xdr.ScVal[]) =>
+    renderArg(await readContract(contract, fn, args, config, server));
+  const bytes32 = (value: Hex) => xdr.ScVal.scvBytes(Buffer.from(hexToBytes(value)));
+
+  expectSame("The message transmitter of Circle's forwarder", await read(forwarder, "get_message_transmitter"), messageTransmitter);
+  expectSame("The token messenger of Circle's forwarder", await read(forwarder, "get_token_messenger_minter"), tokenMessenger);
+  expectSame(
+    "The message transmitter of Circle's token messenger",
+    await read(tokenMessenger, "get_local_message_transmitter"),
+    messageTransmitter,
+  );
+  expectSame("Stellar's CCTP domain", await read(messageTransmitter, "get_local_domain"), String(cctpDomain));
+  expectSame(
+    `The token messenger Stellar knows for ${chain.label}`,
+    await read(tokenMessenger, "get_remote_token_messenger", xdr.ScVal.scvU32(chain.cctpDomain)),
+    pad(chain.tokenMessenger),
+  );
+  expectSame(
+    `The Stellar USDC minted for USDC from ${chain.label}`,
+    await read(tokenMessenger, "get_local_token", xdr.ScVal.scvU32(chain.cctpDomain), bytes32(pad(chain.usdc))),
+    usdc,
+  );
+  for (const contract of [forwarder, tokenMessenger, messageTransmitter]) {
+    expectSame(`Whether ${contract} is paused`, await read(contract, "paused"), "false");
+  }
+  report("stellar", "forwarder, token messenger and message transmitter name each other; none is paused");
+  report("", `domain ${cctpDomain}, with ${chain.label} registered as domain ${chain.cctpDomain} and its USDC paired`);
 }

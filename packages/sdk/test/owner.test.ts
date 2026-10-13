@@ -1,7 +1,7 @@
 import type { Address, Hex } from "viem";
 import { base, baseSepolia, mainnet } from "viem/chains";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { NETWORKS } from "../src/networks";
+import { listEvmChains, NETWORKS } from "../src/networks";
 import { codeKind, OWNER_CHAINS, ownerKind, type CodeKind, type OwnerChain, type OwnerKindOptions } from "../src/owner";
 import { ISSUER, OWNER } from "./helpers";
 
@@ -23,6 +23,9 @@ function reader(answers: Record<number, Answer>) {
 }
 
 const codes = (check: { chains: { code: CodeKind }[] }) => check.chains.map(({ code }) => code);
+
+/** Ethereum mainnet, Base and Base Sepolia: three chains, enough to show how answers combine. */
+const TRIO: readonly OwnerChain[] = [{ chain: mainnet }, { chain: base }, { chain: baseSepolia }];
 
 afterEach(() => {
   vi.useRealTimers();
@@ -57,15 +60,32 @@ describe("codeKind", () => {
 });
 
 describe("OWNER_CHAINS", () => {
-  it("asks Ethereum mainnet, Base and Base Sepolia through their public endpoints", () => {
-    expect(OWNER_CHAINS.map(({ chain }) => chain.id)).toEqual([1, 8453, 84532]);
-    expect(OWNER_CHAINS.map(({ chain }) => chain)).toEqual([mainnet, base, baseSepolia]);
-    expect(OWNER_CHAINS.map(({ rpcUrls }) => rpcUrls ?? [])).toEqual([[], [], []]);
+  it("asks every EVM chain Paso lists, mainnet first, Ethereum first on each", () => {
+    expect(OWNER_CHAINS.map(({ chain }) => chain.id)).toEqual([1, 8453, 42161, 10, 5042, 11155111, 84532, 421614, 11155420, 5042002]);
+    expect(OWNER_CHAINS.slice(0, 2).map(({ chain }) => chain)).toEqual([mainnet, base]);
+    expect(new Set(OWNER_CHAINS.map(({ chain }) => chain.id)).size).toBe(OWNER_CHAINS.length);
   });
 
-  it("takes the Base chains from the networks the SDK serves", () => {
-    expect(OWNER_CHAINS[1]?.chain).toBe(NETWORKS.mainnet.evm.chain);
-    expect(OWNER_CHAINS[2]?.chain).toBe(NETWORKS.testnet.evm.chain);
+  it("takes each chain and its public endpoints from the networks the SDK serves", () => {
+    const listed = [...listEvmChains("mainnet"), ...listEvmChains("testnet")];
+    expect(OWNER_CHAINS).toHaveLength(listed.length);
+    for (const { chain, rpcUrls } of OWNER_CHAINS) {
+      const config = listed.find((entry) => entry.chain.id === chain.id);
+      expect(chain).toBe(config?.chain);
+      expect(rpcUrls).toEqual(config?.rpcUrls);
+      expect(rpcUrls?.length).toBeGreaterThan(0);
+    }
+    expect(OWNER_CHAINS.find(({ chain }) => chain.id === 8453)?.chain).toBe(NETWORKS.mainnet.evm.chain);
+    expect(OWNER_CHAINS.find(({ chain }) => chain.id === 84532)?.chain).toBe(NETWORKS.testnet.evm.chain);
+  });
+
+  it("is what ownerKind asks when no chains are given", async () => {
+    const getCode = reader({ 5042002: CONTRACT_CODE });
+    const check = await ownerKind(OWNER, { getCode });
+
+    expect(getCode.mock.calls).toEqual(OWNER_CHAINS.map((chain) => [chain, OWNER]));
+    expect(check.kind).toBe("contract");
+    expect(check.chains.filter(({ code }) => code === "contract")).toEqual([{ name: "Arc Testnet", chainId: 5042002, code: "contract" }]);
   });
 });
 
@@ -73,7 +93,7 @@ describe("ownerKind", () => {
   it("calls an address with no code on any chain a wallet", async () => {
     const getCode = reader({ 1: undefined, 8453: "0x", 84532: undefined });
 
-    expect(await ownerKind(OWNER, { getCode })).toEqual({
+    expect(await ownerKind(OWNER, { chains: TRIO, getCode })).toEqual({
       kind: "wallet",
       chains: [
         { name: "Ethereum", chainId: 1, code: "none" },
@@ -81,18 +101,18 @@ describe("ownerKind", () => {
         { name: "Base Sepolia", chainId: 84532, code: "none" },
       ],
     });
-    expect(getCode.mock.calls).toEqual(OWNER_CHAINS.map((chain) => [chain, OWNER]));
+    expect(getCode.mock.calls).toEqual(TRIO.map((chain) => [chain, OWNER]));
   });
 
   it("calls an address that delegates through EIP-7702 a wallet: it still has a key", async () => {
-    const check = await ownerKind(OWNER, { getCode: reader({ 1: DELEGATION, 8453: undefined, 84532: DELEGATION }) });
+    const check = await ownerKind(OWNER, { chains: TRIO, getCode: reader({ 1: DELEGATION, 8453: undefined, 84532: DELEGATION }) });
 
     expect(check.kind).toBe("wallet");
     expect(codes(check)).toEqual(["delegated", "none", "delegated"]);
   });
 
   it.each([1, 8453, 84532])("calls an address with code on chain %d alone a contract", async (chainId) => {
-    const check = await ownerKind(OWNER, { getCode: reader({ [chainId]: CONTRACT_CODE }) });
+    const check = await ownerKind(OWNER, { chains: TRIO, getCode: reader({ [chainId]: CONTRACT_CODE }) });
 
     expect(check.kind).toBe("contract");
     expect(check.chains.filter(({ code }) => code === "contract").map((chain) => chain.chainId)).toEqual([chainId]);
@@ -101,14 +121,14 @@ describe("ownerKind", () => {
 
   it("calls it a contract when one chain has code, even if another failed", async () => {
     const getCode = reader({ 1: new Error("502 Bad Gateway"), 8453: CONTRACT_CODE, 84532: undefined });
-    const check = await ownerKind(OWNER, { getCode });
+    const check = await ownerKind(OWNER, { chains: TRIO, getCode });
 
     expect(check.kind).toBe("contract");
     expect(codes(check)).toEqual(["unknown", "contract", "none"]);
   });
 
   it("calls it a contract when one chain has code and another has a delegation", async () => {
-    const check = await ownerKind(OWNER, { getCode: reader({ 1: DELEGATION, 8453: CONTRACT_CODE }) });
+    const check = await ownerKind(OWNER, { chains: TRIO, getCode: reader({ 1: DELEGATION, 8453: CONTRACT_CODE }) });
 
     expect(check.kind).toBe("contract");
     expect(codes(check)).toEqual(["delegated", "contract", "none"]);
@@ -116,7 +136,7 @@ describe("ownerKind", () => {
 
   it("answers unknown when a chain fails and no chain has code", async () => {
     const getCode = reader({ 1: undefined, 8453: new Error("fetch failed"), 84532: undefined });
-    const check = await ownerKind(OWNER, { getCode });
+    const check = await ownerKind(OWNER, { chains: TRIO, getCode });
 
     expect(check.kind).toBe("unknown");
     expect(codes(check)).toEqual(["none", "unknown", "none"]);
@@ -124,7 +144,7 @@ describe("ownerKind", () => {
 
   it("answers unknown, without throwing, when every chain fails", async () => {
     const getCode = vi.fn<NonNullable<OwnerKindOptions["getCode"]>>(() => Promise.reject(new Error("offline")));
-    const check = await ownerKind(OWNER, { getCode });
+    const check = await ownerKind(OWNER, { chains: TRIO, getCode });
 
     expect(check.kind).toBe("unknown");
     expect(codes(check)).toEqual(["unknown", "unknown", "unknown"]);
@@ -136,13 +156,13 @@ describe("ownerKind", () => {
       return Promise.resolve(undefined);
     }) satisfies OwnerKindOptions["getCode"];
 
-    const check = await ownerKind(OWNER, { getCode });
+    const check = await ownerKind(OWNER, { chains: TRIO, getCode });
     expect(check.kind).toBe("unknown");
     expect(codes(check)).toEqual(["unknown", "none", "none"]);
   });
 
   it("answers unknown when a chain answers with something that is not code", async () => {
-    const check = await ownerKind(OWNER, { getCode: reader({ 1: "<html>" as Hex }) });
+    const check = await ownerKind(OWNER, { chains: TRIO, getCode: reader({ 1: "<html>" as Hex }) });
 
     expect(check.kind).toBe("unknown");
     expect(codes(check)).toEqual(["unknown", "none", "none"]);
@@ -151,7 +171,7 @@ describe("ownerKind", () => {
   it("asks every chain at once, not one after another", async () => {
     vi.useFakeTimers();
     const getCode = reader({ 1: "never", 8453: "never", 84532: "never" });
-    const pending = ownerKind(OWNER, { getCode });
+    const pending = ownerKind(OWNER, { chains: TRIO, getCode });
 
     await vi.advanceTimersByTimeAsync(0);
     expect(getCode).toHaveBeenCalledTimes(3);
@@ -163,7 +183,7 @@ describe("ownerKind", () => {
   it("gives a chain 6 seconds by default and then reports it as unknown", async () => {
     vi.useFakeTimers();
     let settled = false;
-    const pending = ownerKind(OWNER, { getCode: reader({ 1: undefined, 8453: "never", 84532: undefined }) });
+    const pending = ownerKind(OWNER, { chains: TRIO, getCode: reader({ 1: undefined, 8453: "never", 84532: undefined }) });
     void pending.then(() => (settled = true));
 
     await vi.advanceTimersByTimeAsync(5_999);
@@ -180,7 +200,7 @@ describe("ownerKind", () => {
     vi.useFakeTimers();
     let settled = false;
     const getCode = reader({ 1: "never", 8453: undefined, 84532: undefined });
-    const pending = ownerKind(OWNER, { getCode, timeoutMs: 250 });
+    const pending = ownerKind(OWNER, { chains: TRIO, getCode, timeoutMs: 250 });
     void pending.then(() => (settled = true));
 
     await vi.advanceTimersByTimeAsync(249);
@@ -193,7 +213,7 @@ describe("ownerKind", () => {
 
   it("still finds a contract when another chain never answers", async () => {
     vi.useFakeTimers();
-    const pending = ownerKind(OWNER, { getCode: reader({ 1: "never", 8453: CONTRACT_CODE, 84532: undefined }) });
+    const pending = ownerKind(OWNER, { chains: TRIO, getCode: reader({ 1: "never", 8453: CONTRACT_CODE, 84532: undefined }) });
 
     await vi.advanceTimersByTimeAsync(6_000);
     const check = await pending;
@@ -203,7 +223,7 @@ describe("ownerKind", () => {
 
   it("does not wait for the timeout when every chain answers, and leaves no timer behind", async () => {
     vi.useFakeTimers();
-    const check = await ownerKind(OWNER, { getCode: reader({}) });
+    const check = await ownerKind(OWNER, { chains: TRIO, getCode: reader({}) });
 
     expect(check.kind).toBe("wallet");
     expect(vi.getTimerCount()).toBe(0);
@@ -215,7 +235,7 @@ describe("ownerKind", () => {
     const getCode = vi.fn<NonNullable<OwnerKindOptions["getCode"]>>(({ chain }) =>
       chain.id === 1 ? new Promise<Hex>((resolve) => (answerLate = resolve)) : Promise.resolve(undefined),
     );
-    const pending = ownerKind(OWNER, { getCode, timeoutMs: 100 });
+    const pending = ownerKind(OWNER, { chains: TRIO, getCode, timeoutMs: 100 });
 
     await vi.advanceTimersByTimeAsync(100);
     const check = await pending;
@@ -270,7 +290,7 @@ describe("ownerKind", () => {
 
   it("asks no chain when the caller has already given up", async () => {
     const getCode = reader({ 8453: CONTRACT_CODE });
-    const check = await ownerKind(OWNER, { getCode, signal: AbortSignal.abort() });
+    const check = await ownerKind(OWNER, { chains: TRIO, getCode, signal: AbortSignal.abort() });
 
     expect(check.kind).toBe("unknown");
     expect(codes(check)).toEqual(["unknown", "unknown", "unknown"]);
@@ -281,7 +301,7 @@ describe("ownerKind", () => {
     vi.useFakeTimers();
     const controller = new AbortController();
     const getCode = reader({ 1: undefined, 8453: "never", 84532: "never" });
-    const pending = ownerKind(OWNER, { getCode, signal: controller.signal });
+    const pending = ownerKind(OWNER, { chains: TRIO, getCode, signal: controller.signal });
 
     await vi.advanceTimersByTimeAsync(10);
     controller.abort();

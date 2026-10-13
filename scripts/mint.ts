@@ -1,14 +1,16 @@
 /**
- * Completes a transfer from Stellar on Base. Anyone can.
+ * Completes a transfer from Stellar on an EVM chain. Anyone can.
  *
- *   pnpm mint <stellar exit tx hash> [--network testnet|mainnet] [--dry-run] [--from <0x…>]
+ *   pnpm mint <stellar exit tx hash> [--chain <name>] [--network testnet|mainnet] [--dry-run] [--from <0x…>]
  *
- * It looks the exit up in Circle's attestation service, checks that the
- * message is addressed to Base and has not been received there, simulates
+ * It looks the exit up in Circle's attestation service and mints on the
+ * chain the message names: Base, Ethereum, Arbitrum, OP Mainnet or Arc, or
+ * their testnets. `--chain` only checks that the message is for that chain.
+ * It checks that the message has not been received there, simulates
  * `receiveMessage` on Circle's MessageTransmitter and sends it. Circle's
  * contract checks the attestation and mints to the recipient the message
  * names; whoever sends the transaction only pays the gas, and does not have
- * to be the recipient.
+ * to be the recipient. On Arc the gas is paid in USDC.
  *
  * A message that has been received already is reported as it stands, and
  * that is a success.
@@ -16,12 +18,14 @@
  * Environment (on testnet also read from apps/web/.env.local when that file
  * exists; on mainnet from the environment alone):
  *
- *   PASO_EVM_KEY           Private key of any Base account with a little ETH: it pays the gas.
- *                          On testnet PASO_E2E_PAYER_KEY or DEMO_PAYER_PRIVATE_KEY stand in
- *                          when it is not set.
+ *   PASO_EVM_KEY           Private key of any account with a little gas on the chain: it pays
+ *                          for the mint. On testnet PASO_E2E_PAYER_KEY or DEMO_PAYER_PRIVATE_KEY
+ *                          stand in when it is not set.
  *   PASO_CONFIRM_MAINNET   Mainnet only: 1, once the simulated fee has been read. Without it
  *                          the fee is printed and nothing is sent.
- *   BASE_RPC_URL           Base RPC endpoint. Defaults to the chain's public one.
+ *   <CHAIN>_RPC_URL        The chain's RPC endpoint: BASE_RPC_URL, ETHEREUM_RPC_URL,
+ *                          ARBITRUM_RPC_URL, OPTIMISM_RPC_URL, ARC_RPC_URL. Defaults to the
+ *                          public endpoints the SDK lists for the chain.
  *
  * `--dry-run` does every read and the simulation and sends nothing. It needs
  * no key; `--from` names the account to simulate for when no key does.
@@ -30,14 +34,11 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { StrKey } from "@stellar/stellar-sdk";
 import {
-  createPublicClient,
   createWalletClient,
   encodeFunctionData,
-  formatEther,
   formatGwei,
   getAddress,
   hexToBytes,
-  http,
   isAddress,
   isAddressEqual,
   slice,
@@ -46,24 +47,29 @@ import {
   type Hex,
 } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
-import { publicActionsL2 } from "viem/op-stack";
 import {
   decodeBurnMessage,
   erc20Abi,
   evmAddressUrl,
+  evmChain,
+  evmChainForDomain,
   evmTxUrl,
   formatEvmAmount,
   isReceivedOnEvm,
+  listEvmChains,
   messageTransmitterAbi,
   receiveMessageOnEvm,
   resolveNetwork,
   stellarAddressUrl,
   stellarTxUrl,
   type Attestation,
+  type EvmChainConfig,
+  type EvmChainName,
   type NetworkConfig,
   type NetworkName,
 } from "../packages/sdk/src/index";
 import { attestedMessages, evmRecipient } from "./cctp";
+import { chargesDataFee, dataFee, evmReader, evmTransport, formatGas, parseChain, rpcVariable } from "./evm";
 import { describe } from "./fees";
 
 /** Gas headroom over the estimate, in percent: the estimate is for the state it was made in. */
@@ -72,25 +78,32 @@ const GAS_HEADROOM_PERCENT = 20n;
 interface Options {
   exit: string;
   network: NetworkName;
+  /** The chain the message has to be for; any chain Paso lists when not given. */
+  chain?: EvmChainName;
   dryRun: boolean;
   from?: Address;
 }
 
 function usage(message?: string): never {
   if (message) console.error(`${message}\n`);
-  console.error("Usage: pnpm mint <stellar exit tx hash> [--network testnet|mainnet] [--dry-run] [--from <0x…>]");
+  console.error(
+    "Usage: pnpm mint <stellar exit tx hash> [--chain base|ethereum|arbitrum|optimism|arc] [--network testnet|mainnet]\n" +
+      "                 [--dry-run] [--from <0x…>]",
+  );
   process.exit(2);
 }
 
 function parseArgs(argv: string[]): Options {
   let exit: string | undefined;
   let network: NetworkName = "testnet";
+  let chain: EvmChainName | undefined;
   let dryRun = false;
   let from: Address | undefined;
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]!;
     const value = () => argv[(i += 1)] ?? usage(`${arg} needs a value`);
     if (arg === "--dry-run") dryRun = true;
+    else if (arg === "--chain") chain = parseChain(value(), usage);
     else if (arg === "--network") {
       const name = value();
       if (name !== "testnet" && name !== "mainnet") usage("--network takes testnet or mainnet");
@@ -106,7 +119,7 @@ function parseArgs(argv: string[]): Options {
   }
   if (!exit) usage();
   if (from && !dryRun) usage("--from names the account a dry run simulates for; a mint is paid by PASO_EVM_KEY");
-  return { exit, network, dryRun, from };
+  return { exit, network, chain, dryRun, from };
 }
 
 function line(label: string, value: string): void {
@@ -122,47 +135,53 @@ function payerKey(network: NetworkName): PrivateKeyAccount | undefined {
   return privateKeyToAccount(key as Hex);
 }
 
-function baseClients(config: NetworkConfig, payer: PrivateKeyAccount | undefined) {
-  const { chain } = config.evm;
-  const transport = http(process.env.BASE_RPC_URL?.trim() || undefined);
+/** A reader and, when there is a key, a wallet on the chain a message is for. Its endpoint has to serve that chain. */
+async function clientsFor(chain: EvmChainConfig, payer: PrivateKeyAccount | undefined) {
+  const reader = evmReader(chain);
+  const chainId = await reader.getChainId();
+  if (chainId !== chain.chain.id) {
+    throw new Error(`The ${chain.label} endpoint serves chain ${chainId}, not ${chain.chain.id}; check ${rpcVariable(chain)}`);
+  }
   return {
-    base: createPublicClient({ chain, transport }).extend(publicActionsL2()),
-    wallet: payer ? createWalletClient({ account: payer, chain, transport }) : undefined,
+    reader,
+    wallet: payer ? createWalletClient({ account: payer, chain: chain.chain, transport: evmTransport(chain) }) : undefined,
   };
 }
 
-type Clients = ReturnType<typeof baseClients>;
+type Clients = Awaited<ReturnType<typeof clientsFor>>;
 
-async function showBalance(config: NetworkConfig, { base }: Clients, recipient: Address): Promise<void> {
-  const held = await base.readContract({ address: config.evm.usdc, abi: erc20Abi, functionName: "balanceOf", args: [recipient] });
-  line("balance", `${formatEvmAmount(held)} USDC in ${recipient} on ${config.evm.chain.name}`);
+async function showBalance(chain: EvmChainConfig, { reader }: Clients, recipient: Address): Promise<void> {
+  const held = await reader.readContract({ address: chain.usdc, abi: erc20Abi, functionName: "balanceOf", args: [recipient] });
+  line("balance", `${formatEvmAmount(held)} USDC in ${recipient} on ${chain.label}`);
 }
 
-/** Mints one attested message on Base, or reports it minted. Returns whether it is minted at the end. */
+/** Mints one attested message on the chain it is for, or reports it minted. Returns whether it is minted at the end. */
 async function mintOne(
   config: NetworkConfig,
+  target: EvmChainConfig,
   clients: Clients,
   options: Options,
   payer: PrivateKeyAccount | undefined,
   { message, attestation, nonce }: Attestation,
 ): Promise<boolean> {
-  const { chain, messageTransmitter } = config.evm;
-  const { base, wallet } = clients;
+  const { messageTransmitter, label } = target;
+  const { reader, wallet } = clients;
   const burn = decodeBurnMessage(message);
   const recipient = evmRecipient(message);
   const sender = StrKey.encodeContract(Buffer.from(hexToBytes(burn.messageSender)));
 
   line("amount", `${formatEvmAmount(burn.amount)} USDC burned, ${formatEvmAmount(burn.feeExecuted)} kept by Circle, ` +
     `${formatEvmAmount(burn.amount - burn.feeExecuted)} to mint`);
+  line("chain", `${label}, CCTP domain ${target.cctpDomain}: Circle's MessageTransmitter ${messageTransmitter}`);
   line("to", recipient);
-  line("", evmAddressUrl(recipient, config));
+  line("", evmAddressUrl(recipient, config, target.name));
   line("sent by", `${sender}${sender === config.stellar.hub ? ", the Paso hub" : ""}`);
   line("", stellarAddressUrl(sender, config));
   line("nonce", nonce);
 
-  if (await isReceivedOnEvm(base, message, config)) {
-    line("minted", `already: Circle's message transmitter on ${chain.name} has taken this message, and takes it once`);
-    await showBalance(config, clients, recipient);
+  if (await isReceivedOnEvm(reader, message, config, target.name)) {
+    line("minted", `already: Circle's message transmitter on ${label} has taken this message, and takes it once`);
+    await showBalance(target, clients, recipient);
     return true;
   }
 
@@ -176,8 +195,8 @@ async function mintOne(
     }
   }
   if (burn.expirationBlock !== 0n) {
-    const latest = await base.getBlockNumber();
-    line("expires", `at block ${burn.expirationBlock}; ${chain.name} is at ${latest}`);
+    const latest = await reader.getBlockNumber();
+    line("expires", `at block ${burn.expirationBlock}; ${label} is at ${latest}`);
     if (latest >= burn.expirationBlock) throw new Error("The message has expired: Circle's contract no longer takes it");
   }
 
@@ -189,44 +208,50 @@ async function mintOne(
   } as const;
   let gas: bigint;
   try {
-    await base.simulateContract({ ...call, account: caller });
-    gas = await base.estimateContractGas({ ...call, account: caller });
+    await reader.simulateContract({ ...call, account: caller });
+    gas = await reader.estimateContractGas({ ...call, account: caller });
   } catch (error) {
     throw new Error(`The mint does not simulate: ${describe(error).split("\n", 1)[0]}`);
   }
   const limit = gas + (gas * GAS_HEADROOM_PERCENT) / 100n;
-  const { maxFeePerGas, maxPriorityFeePerGas } = await base.estimateFeesPerGas();
-  const dataFee = await base.estimateL1Fee({ account: caller, to: messageTransmitter, data: encodeFunctionData(call), gas: limit });
-  const cost = limit * maxFeePerGas + dataFee;
-  const held = await base.getBalance({ address: caller });
+  const { maxFeePerGas, maxPriorityFeePerGas } = await reader.estimateFeesPerGas();
+  const posted = await dataFee(reader, target, { account: caller, to: messageTransmitter, data: encodeFunctionData(call), gas: limit });
+  const cost = limit * maxFeePerGas + posted;
+  const held = await reader.getBalance({ address: caller });
+  const symbol = target.gasToken.symbol;
   line(
     "fee",
-    `${formatEther(cost)} ETH at most, simulated: ${gas} gas (${limit} allowed) at ≤ ${formatGwei(maxFeePerGas)} gwei, ` +
-      `and ${formatEther(dataFee)} ETH for the data posted to Ethereum`,
+    `${formatGas(cost, target)} at most, simulated: ${gas} gas (${limit} allowed) at ≤ ${formatGwei(maxFeePerGas)} gwei` +
+      (chargesDataFee(target) ? `, and ${formatGas(posted, target)} for the data posted to Ethereum` : ""),
   );
-  line("payer", `${caller} holds ${formatEther(held)} ETH${payer || options.from ? "" : "  (the recipient, standing in for a payer)"}`);
-  line("", evmAddressUrl(caller, config));
+  line("payer", `${caller} holds ${formatGas(held, target)}${payer || options.from ? "" : "  (the recipient, standing in for a payer)"}`);
+  line("", evmAddressUrl(caller, config, target.name));
 
   if (options.dryRun) {
-    line("would", `send MessageTransmitter.receiveMessage on ${chain.name}`);
-    if (held < cost) line("", `but ${caller} does not hold that much ETH`);
+    line("would", `send MessageTransmitter.receiveMessage on ${label}`);
+    if (held < cost) line("", `but ${caller} does not hold that much ${symbol}`);
     return false;
   }
 
-  if (!payer || !wallet) throw new Error("Set PASO_EVM_KEY to the private key of any Base account with a little ETH: it pays the gas");
-  if (held < cost) throw new Error(`${payer.address} holds ${formatEther(held)} ETH and needs ${formatEther(cost)}. Nothing was sent`);
+  if (!payer || !wallet) {
+    throw new Error(`Set PASO_EVM_KEY to the private key of any account with a little ${symbol} on ${label}: it pays the gas`);
+  }
+  if (held < cost) {
+    throw new Error(`${payer.address} holds ${formatGas(held, target)} on ${label} and needs ${formatGas(cost, target)}. Nothing was sent`);
+  }
   if (config.name === "mainnet" && process.env.PASO_CONFIRM_MAINNET?.trim() !== "1") {
-    console.log("\nNothing was sent. This spends real ETH: to go ahead, run\n");
-    console.log(`    PASO_CONFIRM_MAINNET=1 pnpm mint ${options.exit} --network mainnet`);
+    console.log(`\nNothing was sent. This spends real ${symbol}: to go ahead, run\n`);
+    console.log(`    PASO_CONFIRM_MAINNET=1 pnpm mint ${options.exit} --chain ${target.name} --network mainnet`);
     process.exit(3);
   }
 
   const result = await receiveMessageOnEvm({
     walletClient: wallet,
-    publicClient: base,
+    publicClient: reader,
     message,
     attestation,
     network: config,
+    chain: target.name,
     gas: limit,
     maxFeePerGas,
     maxPriorityFeePerGas,
@@ -234,12 +259,12 @@ async function mintOne(
     confirmations: 2,
     onSubmitted: (hash) => {
       line("sent", hash);
-      line("", evmTxUrl(hash, config));
+      line("", evmTxUrl(hash, config, target.name));
     },
   });
   if (result.alreadyReceived) line("minted", "by someone else while this was on its way");
   else line("minted", `${result.hash}, confirmed`);
-  await showBalance(config, clients, recipient);
+  await showBalance(target, clients, recipient);
   return true;
 }
 
@@ -250,16 +275,13 @@ async function main(): Promise<void> {
   if (options.network === "testnet" && existsSync(envFile)) process.loadEnvFile(envFile);
 
   const config = resolveNetwork(options.network);
-  const { evm, stellar } = config;
+  const { stellar } = config;
+  const wanted = options.chain ? evmChain(config, options.chain) : undefined;
   // Only a mint that is still to be made needs a key: one made already is reported without it.
   const payer = payerKey(config.name);
-  const clients = baseClients(config, payer);
-  const chainId = await clients.base.getChainId();
-  if (chainId !== evm.chain.id) {
-    throw new Error(`The Base endpoint serves chain ${chainId}, not ${evm.chain.name} (${evm.chain.id}); check BASE_RPC_URL`);
-  }
 
-  console.log(`Completing a transfer from Stellar ${config.name} on ${evm.chain.name}${options.dryRun ? ", dry run: nothing is sent" : ""}`);
+  const where = wanted ? wanted.label : "the EVM chain it names";
+  console.log(`Completing a transfer from Stellar ${config.name} on ${where}${options.dryRun ? ", dry run: nothing is sent" : ""}`);
   console.log("");
   line("exit", options.exit);
   line("", stellarTxUrl(options.exit, config));
@@ -274,20 +296,34 @@ async function main(): Promise<void> {
     return;
   }
 
-  const outbound = attestations.filter(({ message }) => {
-    const { sourceDomain, destinationDomain } = decodeBurnMessage(message);
-    return sourceDomain === stellar.cctpDomain && destinationDomain === evm.cctpDomain;
+  // Each message names the chain it is for; it is minted there and nowhere else.
+  const outbound = attestations.flatMap((attestation) => {
+    const { sourceDomain, destinationDomain } = decodeBurnMessage(attestation.message);
+    const target = evmChainForDomain(config, destinationDomain);
+    if (sourceDomain !== stellar.cctpDomain || !target) return [];
+    if (wanted && target.name !== wanted.name) return [];
+    return [{ attestation, target }];
   });
   if (outbound.length === 0) {
     const domains = attestations.map(({ message }) => decodeBurnMessage(message).destinationDomain).join(", ");
-    throw new Error(`That exit is addressed to CCTP domain ${domains}, not to ${evm.chain.name} (${evm.cctpDomain})`);
+    const offered = wanted
+      ? `${wanted.label} (${wanted.cctpDomain})`
+      : `any chain Paso lists (${listEvmChains(config).map((chain) => `${chain.label} ${chain.cctpDomain}`).join(", ")})`;
+    throw new Error(`That exit is addressed to CCTP domain ${domains}, not to ${offered}`);
   }
-  line("attested", `${outbound.length === 1 ? "one message" : `${outbound.length} messages`} for ${evm.chain.name} (CCTP domain ${evm.cctpDomain})`);
+  const chains = [...new Set(outbound.map(({ target }) => target.label))].join(" and ");
+  line("attested", `${outbound.length === 1 ? "one message" : `${outbound.length} messages`} for ${chains}`);
 
+  const clients = new Map<EvmChainName, Clients>();
   let minted = 0;
-  for (const [index, attestation] of outbound.entries()) {
+  for (const [index, { attestation, target }] of outbound.entries()) {
     console.log(outbound.length > 1 ? `\n[message ${index + 1} of ${outbound.length}]` : "");
-    if (await mintOne(config, clients, options, payer, attestation)) minted += 1;
+    let onChain = clients.get(target.name);
+    if (!onChain) {
+      onChain = await clientsFor(target, payer);
+      clients.set(target.name, onChain);
+    }
+    if (await mintOne(config, target, onChain, options, payer, attestation)) minted += 1;
   }
   console.log(options.dryRun ? "\nNothing was sent." : minted === outbound.length ? "\nMinted." : "");
 }

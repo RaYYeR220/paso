@@ -9,8 +9,7 @@ import {
   type Chain,
   type Hex,
 } from "viem";
-import { mainnet } from "viem/chains";
-import { NETWORKS } from "./networks";
+import { listEvmChains, NETWORKS, type NetworkName } from "./networks";
 
 /**
  * What the code at an Ethereum address says about who controls it.
@@ -58,16 +57,30 @@ export interface OwnerKindOptions {
 }
 
 /**
- * The chains asked by default: Ethereum mainnet, Base and Base Sepolia.
+ * The chains asked by default: every EVM chain Paso lists, mainnet first
+ * (Ethereum, Base, Arbitrum, OP Mainnet, Arc), then their testnets, each
+ * through the public endpoints listed for it.
  *
  * A smart account often has the same address on several chains and is
  * deployed on only some of them, so code found on any one chain counts.
  */
-export const OWNER_CHAINS: readonly OwnerChain[] = [
-  { chain: mainnet },
-  { chain: NETWORKS.mainnet.evm.chain },
-  { chain: NETWORKS.testnet.evm.chain },
-];
+export const OWNER_CHAINS: readonly OwnerChain[] = ownerChainsOf(["mainnet", "testnet"]);
+
+function ownerChainsOf(networks: readonly NetworkName[]): OwnerChain[] {
+  const seen = new Set<number>();
+  const chains: OwnerChain[] = [];
+  for (const network of networks) {
+    const listed = listEvmChains(NETWORKS[network]);
+    // Ethereum first: it is where an address is most likely to have been used.
+    listed.sort((a, b) => Number(b.name === "ethereum") - Number(a.name === "ethereum"));
+    for (const { chain, rpcUrls } of listed) {
+      if (seen.has(chain.id)) continue;
+      seen.add(chain.id);
+      chains.push({ chain, rpcUrls });
+    }
+  }
+  return chains;
+}
 
 const DEFAULT_TIMEOUT_MS = 6000;
 const DELEGATION_PREFIX = "0xef0100";

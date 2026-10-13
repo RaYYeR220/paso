@@ -1,7 +1,12 @@
 /**
- * Delivers a transfer from Base on Stellar. Anyone can.
+ * Delivers a transfer from an EVM chain on Stellar. Anyone can.
  *
- *   pnpm deliver <base burn tx hash> [--network testnet|mainnet] [--dry-run] [--source <G…>]
+ *   pnpm deliver <burn tx hash> [--chain <name>] [--network testnet|mainnet] [--dry-run] [--source <G…>]
+ *
+ * `--chain` names the chain the USDC was burned on: base, ethereum,
+ * arbitrum, optimism or arc. Without it the chain is found from Circle's
+ * answer: the attestation service is asked under the domain of every chain
+ * Paso lists, and the one that knows the hash is the chain.
  *
  * It looks the burn up in Circle's attestation service, checks that the
  * message is addressed to Stellar and has not been delivered, and delivers it
@@ -32,6 +37,7 @@ import { toHex, type Hex } from "viem";
 import {
   decodeBurnMessage,
   deliverOperation,
+  evmChain,
   evmTxUrl,
   formatEvmAmount,
   formatStellarAmount,
@@ -42,10 +48,12 @@ import {
   stellarTxUrl,
   usdcBalance,
   type Attestation,
+  type EvmChainName,
   type NetworkConfig,
   type NetworkName,
 } from "../packages/sdk/src/index";
-import { attestedMessages, deliveredOnStellar, stellarRecipient } from "./cctp";
+import { attestedMessages, burnSource, deliveredOnStellar, stellarRecipient } from "./cctp";
+import { parseChain } from "./evm";
 import { describe, formatXlm, MINIMUM_BALANCE, xlmBalance } from "./fees";
 import { INCLUSION_BID, sendAndWait, simulated } from "./sender";
 
@@ -55,25 +63,32 @@ const NOBODY = StrKey.encodeEd25519PublicKey(Buffer.alloc(32));
 interface Options {
   burn: Hex;
   network: NetworkName;
+  /** The chain the burn was made on; found from Circle's answer when not given. */
+  chain?: EvmChainName;
   dryRun: boolean;
   source?: string;
 }
 
 function usage(message?: string): never {
   if (message) console.error(`${message}\n`);
-  console.error("Usage: pnpm deliver <base burn tx hash> [--network testnet|mainnet] [--dry-run] [--source <G…>]");
+  console.error(
+    "Usage: pnpm deliver <burn tx hash> [--chain base|ethereum|arbitrum|optimism|arc] [--network testnet|mainnet]\n" +
+      "                    [--dry-run] [--source <G…>]",
+  );
   process.exit(2);
 }
 
 function parseArgs(argv: string[]): Options {
   let burn: Hex | undefined;
   let network: NetworkName = "testnet";
+  let chain: EvmChainName | undefined;
   let dryRun = false;
   let source: string | undefined;
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]!;
     const value = () => argv[(i += 1)] ?? usage(`${arg} needs a value`);
     if (arg === "--dry-run") dryRun = true;
+    else if (arg === "--chain") chain = parseChain(value(), usage);
     else if (arg === "--network") {
       const name = value();
       if (name !== "testnet" && name !== "mainnet") usage("--network takes testnet or mainnet");
@@ -82,11 +97,11 @@ function parseArgs(argv: string[]): Options {
       source = value();
       if (!StrKey.isValidEd25519PublicKey(source)) usage(`--source takes a Stellar account (G…), not ${source}`);
     } else if (/^0x[0-9a-fA-F]{64}$/.test(arg) && burn === undefined) burn = arg.toLowerCase() as Hex;
-    else usage(`${arg} is neither an option nor the hash of a transaction on Base (0x and 64 hex digits)`);
+    else usage(`${arg} is neither an option nor the hash of a transaction on an EVM chain (0x and 64 hex digits)`);
   }
   if (!burn) usage();
   if (source && !dryRun) usage("--source names the account a dry run simulates for; a delivery is paid by PASO_SOURCE_SECRET");
-  return { burn, network, dryRun, source };
+  return { burn, network, chain, dryRun, source };
 }
 
 function line(label: string, value: string): void {
@@ -216,15 +231,19 @@ async function main(): Promise<void> {
   if (options.network === "testnet" && existsSync(envFile)) process.loadEnvFile(envFile);
 
   const config = resolveNetwork(options.network);
-  const { evm, stellar } = config;
+  const { stellar } = config;
   const server = new rpc.Server(stellar.rpcUrl);
   // Only a delivery that is still to be made needs a payer: one made already is reported without a key.
   const payer = secretKey(config.name);
 
-  console.log(`Delivering a transfer from ${evm.chain.name} on Stellar ${config.name}${options.dryRun ? ", dry run: nothing is sent" : ""}`);
+  console.log(`Delivering a transfer on Stellar ${config.name}${options.dryRun ? ", dry run: nothing is sent" : ""}`);
   console.log("");
   line("burn", options.burn);
-  line("", evmTxUrl(options.burn, config));
+  const evm = options.chain
+    ? evmChain(config, options.chain)
+    : await burnSource(options.burn, config, { wait: !options.dryRun, report: line });
+  line("from", `${evm.label}, CCTP domain ${evm.cctpDomain}${options.chain ? "" : ", found from Circle's answer"}`);
+  line("", evmTxUrl(options.burn, config, evm.name));
 
   const attestations = await attestedMessages(evm.cctpDomain, options.burn, config, {
     wait: !options.dryRun,
@@ -241,8 +260,13 @@ async function main(): Promise<void> {
     return sourceDomain === evm.cctpDomain && destinationDomain === stellar.cctpDomain;
   });
   if (inbound.length === 0) {
-    const domains = attestations.map(({ message }) => decodeBurnMessage(message).destinationDomain).join(", ");
-    throw new Error(`That burn is addressed to CCTP domain ${domains}, not to Stellar (${stellar.cctpDomain})`);
+    const routes = attestations.map(({ message }) => {
+      const { sourceDomain, destinationDomain } = decodeBurnMessage(message);
+      return `${sourceDomain} → ${destinationDomain}`;
+    });
+    throw new Error(
+      `That burn goes from CCTP domain ${routes.join(", ")}, not from ${evm.label} (${evm.cctpDomain}) to Stellar (${stellar.cctpDomain})`,
+    );
   }
   line("attested", `${inbound.length === 1 ? "one message" : `${inbound.length} messages`} for Stellar (CCTP domain ${stellar.cctpDomain})`);
 

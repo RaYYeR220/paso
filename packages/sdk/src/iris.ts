@@ -1,7 +1,15 @@
 import { Address, Contract, StrKey, xdr } from "@stellar/stellar-sdk";
 import { hexToBigInt, hexToBytes, hexToNumber, isHex, size, slice, toHex, type Hex } from "viem";
 import type { InboundRoute } from "./evm";
-import { resolveNetwork, type Network } from "./networks";
+import {
+  evmChain,
+  isEvmChainName,
+  listEvmChains,
+  resolveNetwork,
+  type EvmChainConfig,
+  type EvmChainName,
+  type Network,
+} from "./networks";
 
 /** Circle's finality thresholds: attest at soft finality (seconds) or at hard finality (minutes). */
 export const FAST_FINALITY = 1000;
@@ -11,17 +19,41 @@ const DEFAULT_POLL_INTERVAL_MS = 2000;
 const FEE_HEADROOM_DIVISOR = 5n;
 
 /**
+ * One end of a CCTP transfer: a domain number, an EVM chain of the network
+ * by name (`"arc"`), or `"stellar"`.
+ */
+export type CctpEndpoint = number | EvmChainName | "stellar";
+
+/** The CCTP domain an endpoint stands for on a network. An unknown name throws. */
+export function cctpDomainOf(endpoint: CctpEndpoint, network: Network): number {
+  if (typeof endpoint === "number") {
+    if (!Number.isInteger(endpoint) || endpoint < 0 || endpoint > 0xffff_ffff) {
+      throw new Error(`${endpoint} is not a CCTP domain`);
+    }
+    return endpoint;
+  }
+  if (endpoint === "stellar") return resolveNetwork(network).stellar.cctpDomain;
+  if (!isEvmChainName(endpoint)) {
+    throw new Error(`"${String(endpoint)}" is neither a CCTP domain, an EVM chain Paso lists, nor "stellar"`);
+  }
+  return evmChain(network, endpoint).cctpDomain;
+}
+
+/**
  * The fee Circle charges for a burn between two domains, in basis points of
- * the amount. Fractions are possible (`1.3`).
+ * the amount. Fractions are possible (`1.3`). Either end can be named by its
+ * domain or by its chain.
  */
 export async function fetchBurnFee(
-  sourceDomain: number,
-  destinationDomain: number,
+  sourceDomain: CctpEndpoint,
+  destinationDomain: CctpEndpoint,
   network: Network,
   options: { finalityThreshold?: number; signal?: AbortSignal } = {},
 ): Promise<number> {
   const { finalityThreshold = FAST_FINALITY, signal } = options;
-  const url = `${resolveNetwork(network).irisUrl}/v2/burn/USDC/fees/${sourceDomain}/${destinationDomain}`;
+  const source = cctpDomainOf(sourceDomain, network);
+  const destination = cctpDomainOf(destinationDomain, network);
+  const url = `${resolveNetwork(network).irisUrl}/v2/burn/USDC/fees/${source}/${destination}`;
   const response = await fetch(url, { signal });
   if (!response.ok) {
     throw new Error(`Iris answered ${response.status} for the burn fee (${url})`);
@@ -159,8 +191,8 @@ async function pollIris(
  * Asks Iris once about the burn in `txHash`. `attestation` is present when
  * the status is `complete`; every other status means: ask again later.
  */
-export function fetchAttestation(
-  sourceDomain: number,
+export async function fetchAttestation(
+  sourceDomain: CctpEndpoint,
   txHash: string,
   network: Network,
   options: { signal?: AbortSignal } = {},
@@ -198,7 +230,7 @@ const HEX_BYTES = /^0x(?:[0-9a-fA-F]{2})*$/;
  * `complete` means every message is attested.
  */
 export async function fetchAttestations(
-  sourceDomain: number,
+  sourceDomain: CctpEndpoint,
   txHash: string,
   network: Network,
   options: { signal?: AbortSignal } & AttestationLimits = {},
@@ -211,9 +243,10 @@ export async function fetchAttestations(
     maxAttestationBytes = 2_048,
   } = options;
 
+  const url = messagesUrl(sourceDomain, txHash, network);
   let body: unknown;
   try {
-    const response = await fetch(messagesUrl(sourceDomain, txHash, network), { signal });
+    const response = await fetch(url, { signal });
     if (response.status === 404) return { state: "not_found" };
     if (!response.ok) return { state: "unreachable", detail: `Iris answered ${response.status}` };
     body = JSON.parse(await boundedText(response, maxResponseBytes));
@@ -258,8 +291,58 @@ export async function fetchAttestations(
   return pending ?? { state: "complete", attestations };
 }
 
-function messagesUrl(sourceDomain: number, txHash: string, network: Network): string {
-  return `${resolveNetwork(network).irisUrl}/v2/messages/${sourceDomain}?transactionHash=${txHash}`;
+function messagesUrl(sourceDomain: CctpEndpoint, txHash: string, network: Network): string {
+  return `${resolveNetwork(network).irisUrl}/v2/messages/${cctpDomainOf(sourceDomain, network)}?transactionHash=${txHash}`;
+}
+
+/** Which EVM chain a burn was made on, as far as Iris can tell. */
+export type BurnSource =
+  /** Iris knows the transaction under the domain of `chain`; `lookup` is what it holds for it. */
+  | { state: "found"; chain: EvmChainConfig; lookup: Exclude<AttestationLookup, { state: "not_found" }> }
+  /** No chain asked has a burn under this hash. */
+  | { state: "not_found" }
+  /** No chain asked has it, and Iris could not answer for at least one of them. */
+  | { state: "unreachable"; detail: string }
+  /** More than one chain has a burn under this hash: name the chain. */
+  | { state: "ambiguous"; chains: EvmChainConfig[] };
+
+/**
+ * Finds the EVM chain a burn was made on, from its transaction hash alone.
+ *
+ * Iris files a burn under the domain of the chain it was made on, so it is
+ * asked under the domain of every chain listed (or of `chains`), all at
+ * once. Exactly one chain that knows the hash is the answer; every message
+ * attested for it has to name that chain's domain as its source.
+ */
+export async function findBurnSource(
+  txHash: string,
+  network: Network,
+  options: { chains?: readonly EvmChainName[]; signal?: AbortSignal } & AttestationLimits = {},
+): Promise<BurnSource> {
+  const { chains: names, ...lookupOptions } = options;
+  const candidates = names ? names.map((name) => evmChain(network, name)) : listEvmChains(network);
+  const answers = await Promise.all(
+    candidates.map(async (chain) => ({ chain, lookup: await fetchAttestations(chain.cctpDomain, txHash, network, lookupOptions) })),
+  );
+
+  const known = answers.filter(({ lookup }) => lookup.state !== "not_found" && lookup.state !== "unreachable");
+  if (known.length > 1) return { state: "ambiguous", chains: known.map(({ chain }) => chain) };
+  const [only] = known;
+  if (only) {
+    const { chain, lookup } = only;
+    if (lookup.state === "complete") {
+      const elsewhere = lookup.attestations.find(({ message }) => hexToNumber(slice(message, SOURCE_DOMAIN_START, SOURCE_DOMAIN_START + 4)) !== chain.cctpDomain);
+      if (elsewhere) {
+        return { state: "found", chain, lookup: { state: "malformed", detail: `Iris filed a message from another domain under ${chain.label}` } };
+      }
+    }
+    return { state: "found", chain, lookup: lookup as Exclude<AttestationLookup, { state: "not_found" }> };
+  }
+  const unreachable = answers.find(({ lookup }) => lookup.state === "unreachable");
+  if (unreachable && unreachable.lookup.state === "unreachable") {
+    return { state: "unreachable", detail: `${unreachable.chain.label}: ${unreachable.lookup.detail}` };
+  }
+  return { state: "not_found" };
 }
 
 /**
@@ -270,7 +353,7 @@ function messagesUrl(sourceDomain: number, txHash: string, network: Network): st
  * Abort it through `signal`.
  */
 export async function waitForAttestation(
-  sourceDomain: number,
+  sourceDomain: CctpEndpoint,
   txHash: string,
   network: Network,
   options: WaitForAttestationOptions = {},

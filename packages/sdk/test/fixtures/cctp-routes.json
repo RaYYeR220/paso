@@ -1,0 +1,468 @@
+{
+  "description": "What Circle's contracts said when each route was checked, read-only, before the chain was listed. Regenerate with: pnpm routes --network <testnet|mainnet> --json",
+  "sources": {
+    "domains": "https://developers.circle.com/cctp/cctp-supported-blockchains",
+    "contracts": "https://developers.circle.com/cctp/evm-smart-contracts",
+    "usdc": "https://developers.circle.com/stablecoins/usdc-contract-addresses",
+    "fees": "https://developers.circle.com/cctp/concepts/fees",
+    "finality": "https://developers.circle.com/cctp/concepts/finality-and-block-confirmations",
+    "stellarArc": "https://developers.circle.com/cctp/quickstarts/transfer-usdc-stellar-arc",
+    "arcNetwork": "https://docs.arc.io/integrate/connect-to-arc"
+  },
+  "arcUsdc": {
+    "note": "Arc's USDC token at 0x3600… reads the account's native balance: decimals() is 6 and balanceOf is the native balance (18 decimals) divided by 10^12. Checked with a state override that set a native balance of 7e18 wei and read balanceOf = 7000000.",
+    "allowanceSlot": 10
+  },
+  "stellarCli": {
+    "testnet": [
+      "testnet MT.get_local_domain = 27",
+      "testnet MT.paused = false",
+      "testnet TM.paused = false",
+      "testnet FW.paused = false",
+      "testnet TM.get_local_message_transmitter = \"CBJ6MTCKKZG73PMDZCJMSFRD7DQEMI4FKDH7CGDSV4W6FHCRBCQAVVJY\"  (expect CBJ6MTCKKZG73PMDZCJMSFRD7DQEMI4FKDH7CGDSV4W6FHCRBCQAVVJY)",
+      "testnet TM.get_max_burn_amount_per_message(USDC) = \"100000000000000\"",
+      "testnet domain 0: get_remote_token_messenger=\"0000000000000000000000008fe6b999dc680ccfdd5bf7eb0974218be2542daa\" [OK]; get_local_token(evm usdc)=\"CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA\" [OK]",
+      "testnet domain 2: get_remote_token_messenger=\"0000000000000000000000008fe6b999dc680ccfdd5bf7eb0974218be2542daa\" [OK]; get_local_token(evm usdc)=\"CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA\" [OK]",
+      "testnet domain 3: get_remote_token_messenger=\"0000000000000000000000008fe6b999dc680ccfdd5bf7eb0974218be2542daa\" [OK]; get_local_token(evm usdc)=\"CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA\" [OK]",
+      "testnet domain 6: get_remote_token_messenger=\"0000000000000000000000008fe6b999dc680ccfdd5bf7eb0974218be2542daa\" [OK]; get_local_token(evm usdc)=\"CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA\" [OK]",
+      "testnet domain 26: get_remote_token_messenger=\"0000000000000000000000008fe6b999dc680ccfdd5bf7eb0974218be2542daa\" [OK]; get_local_token(evm usdc)=\"CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA\" [OK]"
+    ],
+    "mainnet": [
+      "mainnet MT.get_local_domain = 27",
+      "mainnet MT.paused = false",
+      "mainnet TM.paused = false",
+      "mainnet FW.paused = false",
+      "mainnet TM.get_local_message_transmitter = \"CACMENFFJPJMSDAJQLX4R7K3SFZIW2LJSE3R2UMLGSWHFHS353FVXAZV\"  (expect CACMENFFJPJMSDAJQLX4R7K3SFZIW2LJSE3R2UMLGSWHFHS353FVXAZV)",
+      "mainnet TM.get_max_burn_amount_per_message(USDC) = \"100000000000000\"",
+      "mainnet domain 0: get_remote_token_messenger=\"00000000000000000000000028b5a0e9c621a5badaa536219b3a228c8168cf5d\" [OK]; get_local_token(evm usdc)=\"CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75\" [OK]",
+      "mainnet domain 2: get_remote_token_messenger=\"00000000000000000000000028b5a0e9c621a5badaa536219b3a228c8168cf5d\" [OK]; get_local_token(evm usdc)=\"CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75\" [OK]",
+      "mainnet domain 3: get_remote_token_messenger=\"00000000000000000000000028b5a0e9c621a5badaa536219b3a228c8168cf5d\" [OK]; get_local_token(evm usdc)=\"CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75\" [OK]",
+      "mainnet domain 6: get_remote_token_messenger=\"00000000000000000000000028b5a0e9c621a5badaa536219b3a228c8168cf5d\" [OK]; get_local_token(evm usdc)=\"CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75\" [OK]",
+      "mainnet domain 26: get_remote_token_messenger=\"00000000000000000000000028b5a0e9c621a5badaa536219b3a228c8168cf5d\" [OK]; get_local_token(evm usdc)=\"CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75\" [OK]"
+    ]
+  },
+  "networks": {
+    "testnet": {
+      "checkedAt": "2026-10-13T11:28:22.229Z",
+      "stellarTokenMessenger": "CDNG7HXAPBWICI2E3AUBP3YZWZELJLYSB6F5CC7WLDTLTHVM74SLRTHP",
+      "routes": [
+        {
+          "network": "testnet",
+          "chain": "base",
+          "label": "Base Sepolia",
+          "chainId": 84532,
+          "cctpDomain": 6,
+          "usdc": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+          "tokenMessenger": "0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA",
+          "messageTransmitter": "0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275",
+          "evm": {
+            "chainId": 84532,
+            "block": "48061299",
+            "localDomain": 6,
+            "localMessageTransmitter": "0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275",
+            "tokenMinter": "0xb43db544E2c27092c107639Ad201b3dEfAbcF192",
+            "remoteTokenMessenger": "0xda6f9ee0786c812344d82817ef19b648b4af120f8bd10bf658e6b99eacff24b8",
+            "localTokenForStellarUsdc": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+            "usdcDecimals": 6,
+            "codeBytes": {
+              "tokenMessenger": 2175,
+              "messageTransmitter": 2175,
+              "usdc": 1798,
+              "tokenMinter": 9295
+            }
+          },
+          "stellar": {
+            "remoteTokenMessenger": "0x0000000000000000000000008fe6b999dc680ccfdd5bf7eb0974218be2542daa",
+            "localToken": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA"
+          },
+          "fees": {
+            "toStellar": {
+              "1000": 1.3,
+              "2000": 0
+            },
+            "fromStellar": {
+              "1000": 0,
+              "2000": 0
+            }
+          },
+          "inboundFinality": 1000
+        },
+        {
+          "network": "testnet",
+          "chain": "ethereum",
+          "label": "Ethereum Sepolia",
+          "chainId": 11155111,
+          "cctpDomain": 0,
+          "usdc": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+          "tokenMessenger": "0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA",
+          "messageTransmitter": "0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275",
+          "evm": {
+            "chainId": 11155111,
+            "block": "11905774",
+            "localDomain": 0,
+            "localMessageTransmitter": "0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275",
+            "tokenMinter": "0xb43db544E2c27092c107639Ad201b3dEfAbcF192",
+            "remoteTokenMessenger": "0xda6f9ee0786c812344d82817ef19b648b4af120f8bd10bf658e6b99eacff24b8",
+            "localTokenForStellarUsdc": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+            "usdcDecimals": 6,
+            "codeBytes": {
+              "tokenMessenger": 2175,
+              "messageTransmitter": 2175,
+              "usdc": 1798,
+              "tokenMinter": 9295
+            }
+          },
+          "stellar": {
+            "remoteTokenMessenger": "0x0000000000000000000000008fe6b999dc680ccfdd5bf7eb0974218be2542daa",
+            "localToken": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA"
+          },
+          "fees": {
+            "toStellar": {
+              "1000": 1,
+              "2000": 0
+            },
+            "fromStellar": {
+              "1000": 0,
+              "2000": 0
+            }
+          },
+          "inboundFinality": 1000
+        },
+        {
+          "network": "testnet",
+          "chain": "arbitrum",
+          "label": "Arbitrum Sepolia",
+          "chainId": 421614,
+          "cctpDomain": 3,
+          "usdc": "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d",
+          "tokenMessenger": "0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA",
+          "messageTransmitter": "0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275",
+          "evm": {
+            "chainId": 421614,
+            "block": "318736207",
+            "localDomain": 3,
+            "localMessageTransmitter": "0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275",
+            "tokenMinter": "0xb43db544E2c27092c107639Ad201b3dEfAbcF192",
+            "remoteTokenMessenger": "0xda6f9ee0786c812344d82817ef19b648b4af120f8bd10bf658e6b99eacff24b8",
+            "localTokenForStellarUsdc": "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d",
+            "usdcDecimals": 6,
+            "codeBytes": {
+              "tokenMessenger": 2175,
+              "messageTransmitter": 2175,
+              "usdc": 1798,
+              "tokenMinter": 9295
+            }
+          },
+          "stellar": {
+            "remoteTokenMessenger": "0x0000000000000000000000008fe6b999dc680ccfdd5bf7eb0974218be2542daa",
+            "localToken": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA"
+          },
+          "fees": {
+            "toStellar": {
+              "1000": 1.3,
+              "2000": 0
+            },
+            "fromStellar": {
+              "1000": 0,
+              "2000": 0
+            }
+          },
+          "inboundFinality": 1000
+        },
+        {
+          "network": "testnet",
+          "chain": "optimism",
+          "label": "OP Sepolia",
+          "chainId": 11155420,
+          "cctpDomain": 2,
+          "usdc": "0x5fd84259d66Cd46123540766Be93DFE6D43130D7",
+          "tokenMessenger": "0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA",
+          "messageTransmitter": "0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275",
+          "evm": {
+            "chainId": 11155420,
+            "block": "50044178",
+            "localDomain": 2,
+            "localMessageTransmitter": "0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275",
+            "tokenMinter": "0xb43db544E2c27092c107639Ad201b3dEfAbcF192",
+            "remoteTokenMessenger": "0xda6f9ee0786c812344d82817ef19b648b4af120f8bd10bf658e6b99eacff24b8",
+            "localTokenForStellarUsdc": "0x5fd84259d66Cd46123540766Be93DFE6D43130D7",
+            "usdcDecimals": 6,
+            "codeBytes": {
+              "tokenMessenger": 2175,
+              "messageTransmitter": 2175,
+              "usdc": 1798,
+              "tokenMinter": 9295
+            }
+          },
+          "stellar": {
+            "remoteTokenMessenger": "0x0000000000000000000000008fe6b999dc680ccfdd5bf7eb0974218be2542daa",
+            "localToken": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA"
+          },
+          "fees": {
+            "toStellar": {
+              "1000": 1.3,
+              "2000": 0
+            },
+            "fromStellar": {
+              "1000": 0,
+              "2000": 0
+            }
+          },
+          "inboundFinality": 1000
+        },
+        {
+          "network": "testnet",
+          "chain": "arc",
+          "label": "Arc Testnet",
+          "chainId": 5042002,
+          "cctpDomain": 26,
+          "usdc": "0x3600000000000000000000000000000000000000",
+          "tokenMessenger": "0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA",
+          "messageTransmitter": "0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275",
+          "evm": {
+            "chainId": 5042002,
+            "block": "66981619",
+            "localDomain": 26,
+            "localMessageTransmitter": "0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275",
+            "tokenMinter": "0xb43db544E2c27092c107639Ad201b3dEfAbcF192",
+            "remoteTokenMessenger": "0xda6f9ee0786c812344d82817ef19b648b4af120f8bd10bf658e6b99eacff24b8",
+            "localTokenForStellarUsdc": "0x3600000000000000000000000000000000000000",
+            "usdcDecimals": 6,
+            "codeBytes": {
+              "tokenMessenger": 2175,
+              "messageTransmitter": 2175,
+              "usdc": 1798,
+              "tokenMinter": 9295
+            }
+          },
+          "stellar": {
+            "remoteTokenMessenger": "0x0000000000000000000000008fe6b999dc680ccfdd5bf7eb0974218be2542daa",
+            "localToken": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA"
+          },
+          "fees": {
+            "toStellar": {
+              "1000": 0,
+              "2000": 0
+            },
+            "fromStellar": {
+              "1000": 0,
+              "2000": 0
+            }
+          },
+          "inboundFinality": 2000
+        }
+      ]
+    },
+    "mainnet": {
+      "checkedAt": "2026-10-13T11:28:35.679Z",
+      "stellarTokenMessenger": "CAE2G5Z77UP7GYPYGFOWFGW7C7J6I4YP2AFGSADRKQY62SYUFLPNFTXL",
+      "routes": [
+        {
+          "network": "mainnet",
+          "chain": "base",
+          "label": "Base",
+          "chainId": 8453,
+          "cctpDomain": 6,
+          "usdc": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "tokenMessenger": "0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d",
+          "messageTransmitter": "0x81D40F21F12A8F0E3252Bccb954D722d4c464B64",
+          "evm": {
+            "chainId": 8453,
+            "block": "52550778",
+            "localDomain": 6,
+            "localMessageTransmitter": "0x81D40F21F12A8F0E3252Bccb954D722d4c464B64",
+            "tokenMinter": "0xfd78EE919681417d192449715b2594ab58f5D002",
+            "remoteTokenMessenger": "0x09a3773ffd1ff361f8315d629adf17d3e4730fd00a6900715431ed4b142aded2",
+            "localTokenForStellarUsdc": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "usdcDecimals": 6,
+            "codeBytes": {
+              "tokenMessenger": 2175,
+              "messageTransmitter": 2175,
+              "usdc": 1852,
+              "tokenMinter": 9295
+            }
+          },
+          "stellar": {
+            "remoteTokenMessenger": "0x00000000000000000000000028b5a0e9c621a5badaa536219b3a228c8168cf5d",
+            "localToken": "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75"
+          },
+          "fees": {
+            "toStellar": {
+              "1000": 1.3,
+              "2000": 0
+            },
+            "fromStellar": {
+              "1000": 0,
+              "2000": 0
+            }
+          },
+          "inboundFinality": 1000
+        },
+        {
+          "network": "mainnet",
+          "chain": "ethereum",
+          "label": "Ethereum",
+          "chainId": 1,
+          "cctpDomain": 0,
+          "usdc": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+          "tokenMessenger": "0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d",
+          "messageTransmitter": "0x81D40F21F12A8F0E3252Bccb954D722d4c464B64",
+          "evm": {
+            "chainId": 1,
+            "block": "26183270",
+            "localDomain": 0,
+            "localMessageTransmitter": "0x81D40F21F12A8F0E3252Bccb954D722d4c464B64",
+            "tokenMinter": "0xfd78EE919681417d192449715b2594ab58f5D002",
+            "remoteTokenMessenger": "0x09a3773ffd1ff361f8315d629adf17d3e4730fd00a6900715431ed4b142aded2",
+            "localTokenForStellarUsdc": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+            "usdcDecimals": 6,
+            "codeBytes": {
+              "tokenMessenger": 2175,
+              "messageTransmitter": 2175,
+              "usdc": 2186,
+              "tokenMinter": 9295
+            }
+          },
+          "stellar": {
+            "remoteTokenMessenger": "0x00000000000000000000000028b5a0e9c621a5badaa536219b3a228c8168cf5d",
+            "localToken": "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75"
+          },
+          "fees": {
+            "toStellar": {
+              "1000": 1,
+              "2000": 0
+            },
+            "fromStellar": {
+              "1000": 0,
+              "2000": 0
+            }
+          },
+          "inboundFinality": 1000
+        },
+        {
+          "network": "mainnet",
+          "chain": "arbitrum",
+          "label": "Arbitrum",
+          "chainId": 42161,
+          "cctpDomain": 3,
+          "usdc": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+          "tokenMessenger": "0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d",
+          "messageTransmitter": "0x81D40F21F12A8F0E3252Bccb954D722d4c464B64",
+          "evm": {
+            "chainId": 42161,
+            "block": "514414907",
+            "localDomain": 3,
+            "localMessageTransmitter": "0x81D40F21F12A8F0E3252Bccb954D722d4c464B64",
+            "tokenMinter": "0xfd78EE919681417d192449715b2594ab58f5D002",
+            "remoteTokenMessenger": "0x09a3773ffd1ff361f8315d629adf17d3e4730fd00a6900715431ed4b142aded2",
+            "localTokenForStellarUsdc": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+            "usdcDecimals": 6,
+            "codeBytes": {
+              "tokenMessenger": 2175,
+              "messageTransmitter": 2175,
+              "usdc": 1852,
+              "tokenMinter": 9295
+            }
+          },
+          "stellar": {
+            "remoteTokenMessenger": "0x00000000000000000000000028b5a0e9c621a5badaa536219b3a228c8168cf5d",
+            "localToken": "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75"
+          },
+          "fees": {
+            "toStellar": {
+              "1000": 1.4,
+              "2000": 0
+            },
+            "fromStellar": {
+              "1000": 0,
+              "2000": 0
+            }
+          },
+          "inboundFinality": 1000
+        },
+        {
+          "network": "mainnet",
+          "chain": "optimism",
+          "label": "OP Mainnet",
+          "chainId": 10,
+          "cctpDomain": 2,
+          "usdc": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
+          "tokenMessenger": "0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d",
+          "messageTransmitter": "0x81D40F21F12A8F0E3252Bccb954D722d4c464B64",
+          "evm": {
+            "chainId": 10,
+            "block": "158146067",
+            "localDomain": 2,
+            "localMessageTransmitter": "0x81D40F21F12A8F0E3252Bccb954D722d4c464B64",
+            "tokenMinter": "0xfd78EE919681417d192449715b2594ab58f5D002",
+            "remoteTokenMessenger": "0x09a3773ffd1ff361f8315d629adf17d3e4730fd00a6900715431ed4b142aded2",
+            "localTokenForStellarUsdc": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
+            "usdcDecimals": 6,
+            "codeBytes": {
+              "tokenMessenger": 2175,
+              "messageTransmitter": 2175,
+              "usdc": 1852,
+              "tokenMinter": 9295
+            }
+          },
+          "stellar": {
+            "remoteTokenMessenger": "0x00000000000000000000000028b5a0e9c621a5badaa536219b3a228c8168cf5d",
+            "localToken": "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75"
+          },
+          "fees": {
+            "toStellar": {
+              "1000": 1.3,
+              "2000": 0
+            },
+            "fromStellar": {
+              "1000": 0,
+              "2000": 0
+            }
+          },
+          "inboundFinality": 1000
+        },
+        {
+          "network": "mainnet",
+          "chain": "arc",
+          "label": "Arc",
+          "chainId": 5042,
+          "cctpDomain": 26,
+          "usdc": "0x3600000000000000000000000000000000000000",
+          "tokenMessenger": "0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d",
+          "messageTransmitter": "0x81D40F21F12A8F0E3252Bccb954D722d4c464B64",
+          "evm": {
+            "chainId": 5042,
+            "block": "25744984",
+            "localDomain": 26,
+            "localMessageTransmitter": "0x81D40F21F12A8F0E3252Bccb954D722d4c464B64",
+            "tokenMinter": "0xfd78EE919681417d192449715b2594ab58f5D002",
+            "remoteTokenMessenger": "0x09a3773ffd1ff361f8315d629adf17d3e4730fd00a6900715431ed4b142aded2",
+            "localTokenForStellarUsdc": "0x3600000000000000000000000000000000000000",
+            "usdcDecimals": 6,
+            "codeBytes": {
+              "tokenMessenger": 2175,
+              "messageTransmitter": 2175,
+              "usdc": 1798,
+              "tokenMinter": 9295
+            }
+          },
+          "stellar": {
+            "remoteTokenMessenger": "0x00000000000000000000000028b5a0e9c621a5badaa536219b3a228c8168cf5d",
+            "localToken": "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75"
+          },
+          "fees": {
+            "toStellar": {
+              "1000": 0,
+              "2000": 0
+            },
+            "fromStellar": {
+              "1000": 0,
+              "2000": 0
+            }
+          },
+          "inboundFinality": 2000
+        }
+      ]
+    }
+  }
+}

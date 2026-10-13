@@ -2,6 +2,10 @@ import { describe, expect, it } from "vitest";
 import * as sdk from "../src";
 import type {
   ArgConcern,
+  BurnSource,
+  CctpEndpoint,
+  EvmChainConfig,
+  EvmChainName,
   CodeKind,
   DescribedArg,
   DescribedCall,
@@ -37,9 +41,28 @@ describe("the package entry point", () => {
     const kind: OwnerKind = check.kind;
     const code: CodeKind = sdk.codeKind("0x");
 
-    expect(chains).toHaveLength(3);
+    expect(chains).toHaveLength(10);
     expect(kind).toBe("wallet");
     expect(code).toBe("none");
+  });
+
+  it("exports the EVM chains and what reads them", () => {
+    const names: readonly EvmChainName[] = sdk.EVM_CHAIN_NAMES;
+    const arc: EvmChainConfig = sdk.evmChain("testnet", "arc");
+    const endpoint: CctpEndpoint = "arc";
+    const notFound: BurnSource = { state: "not_found" };
+
+    expect(names).toContain(sdk.DEFAULT_EVM_CHAIN);
+    expect(sdk.listEvmChains("mainnet")).toHaveLength(names.length);
+    expect(sdk.cctpDomainOf(endpoint, "testnet")).toBe(arc.cctpDomain);
+    expect(sdk.evmChainForDomain("testnet", 26)).toBe(arc);
+    expect(sdk.evmChainForId("testnet", 5042002)).toBe(arc);
+    expect(sdk.isEvmChainName("arc")).toBe(true);
+    expect(sdk.CCTP_DOMAINS.arc).toBe(26);
+    expect(sdk.defaultFinalityOf(arc)).toBe(sdk.STANDARD_FINALITY);
+    expect(sdk.nativeUsdcToEvmUnits(sdk.evmUnitsToNativeUsdc(5n))).toBe(5n);
+    expect(sdk.findBurnSource).toBeTypeOf("function");
+    expect(notFound.state).toBe("not_found");
   });
 
   it("exports the network a salt stands for", () => {

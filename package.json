@@ -16,7 +16,8 @@
     "e2e": "tsx scripts/e2e.ts",
     "verify": "tsx scripts/verify.ts",
     "deliver": "tsx scripts/deliver.ts",
-    "mint": "tsx scripts/mint.ts"
+    "mint": "tsx scripts/mint.ts",
+    "routes": "tsx scripts/routes.ts"
   },
   "devDependencies": {
     "@stellar/stellar-sdk": "17.2.1",

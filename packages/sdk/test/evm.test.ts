@@ -2,12 +2,14 @@ import { StrKey } from "@stellar/stellar-sdk";
 import type { Hex, PublicClient, WalletClient } from "viem";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  defaultFinalityOf,
   forwardRecipientHookData,
   fundFromEvm,
   isReceivedOnEvm,
   receiveMessageOnEvm,
   TransactionRevertedError,
 } from "../src/evm";
+import { evmChain, NETWORKS } from "../src/networks";
 import { twinAddress } from "../src/twin";
 import { hex, OWNER, testNetwork } from "./helpers";
 
@@ -245,6 +247,108 @@ describe("fundFromEvm", () => {
     expect(writes[0]?.args[5]).toBe(156n);
   });
 
+  describe("from another chain", () => {
+    const arc = evmChain(testNetwork, "arc");
+    const fees = () => {
+      const fetchMock = vi.fn<typeof fetch>(
+        async () =>
+          new Response(
+            JSON.stringify([
+              { finalityThreshold: 1000, minimumFee: 1 },
+              { finalityThreshold: 2000, minimumFee: 0 },
+            ]),
+          ),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      return fetchMock;
+    };
+
+    it("burns on Arc through Arc's contracts, with a standard transfer and Circle's fee for it", async () => {
+      const fetchMock = fees();
+      const { walletClient, publicClient, writes, mocks } = clients({ allowance: 0n });
+      const { maxFee: _given, ...withoutFee } = base;
+      const result = await fundFromEvm({ ...withoutFee, walletClient, publicClient, route: "forwarder", chain: "arc" });
+
+      expect(String(fetchMock.mock.calls[0]?.[0])).toBe("https://iris-api-sandbox.circle.com/v2/burn/USDC/fees/26/27");
+      expect(mocks.publicClient.readContract).toHaveBeenCalledWith(
+        expect.objectContaining({ address: arc.usdc, functionName: "allowance", args: [PAYER, arc.tokenMessenger] }),
+      );
+      expect(writes.map((write) => [write.address, write.functionName, write.chain.id])).toEqual([
+        [arc.usdc, "approve", 5042002],
+        [arc.tokenMessenger, "depositForBurnWithHook", 5042002],
+      ]);
+      // 6-decimal units through the USDC token, as on every other chain.
+      expect(writes[0]?.args).toEqual([arc.tokenMessenger, 1_000_000n]);
+      expect(writes[1]?.args).toEqual([
+        1_000_000n,
+        27,
+        FORWARDER_BYTES32,
+        "0x3600000000000000000000000000000000000000",
+        FORWARDER_BYTES32,
+        0n,
+        2000,
+        forwardRecipientHookData(TWIN),
+      ]);
+      expect(result).toEqual({ burnTxHash: BURN_HASH, approveTxHash: APPROVE_HASH, route: "forwarder", twin: TWIN, maxFee: 0n });
+    });
+
+    it("burns on Ethereum with a fast transfer and Circle's fee for it", async () => {
+      const fetchMock = fees();
+      const ethereum = evmChain(testNetwork, "ethereum");
+      const { walletClient, publicClient, writes } = clients({ allowance: 1_000_000n });
+      const { maxFee: _given, ...withoutFee } = base;
+      const result = await fundFromEvm({ ...withoutFee, walletClient, publicClient, route: "direct", chain: "ethereum" });
+
+      expect(String(fetchMock.mock.calls[0]?.[0])).toBe("https://iris-api-sandbox.circle.com/v2/burn/USDC/fees/0/27");
+      expect(writes).toHaveLength(1);
+      expect(writes[0]).toMatchObject({
+        address: ethereum.tokenMessenger,
+        functionName: "depositForBurn",
+        args: [1_000_000n, 27, TWIN_BYTES32, ethereum.usdc, ZERO_BYTES32, 120n, 1000],
+        chain: { id: 11155111 },
+      });
+      expect(result.maxFee).toBe(120n);
+    });
+
+    it("burns with the finality it is given, and asks the fee for that finality", async () => {
+      const fetchMock = fees();
+      const { walletClient, publicClient, writes } = clients({ allowance: 1_000_000n });
+      const { maxFee: _given, ...withoutFee } = base;
+      await fundFromEvm({ ...withoutFee, walletClient, publicClient, route: "direct", chain: "optimism", minFinalityThreshold: 2000 });
+
+      expect(String(fetchMock.mock.calls[0]?.[0])).toBe("https://iris-api-sandbox.circle.com/v2/burn/USDC/fees/2/27");
+      expect(writes[0]?.args.slice(5)).toEqual([0n, 2000]);
+    });
+
+    it("asks for fast transfers where Circle offers them and standard ones elsewhere", () => {
+      for (const network of [NETWORKS.testnet, NETWORKS.mainnet]) {
+        expect(defaultFinalityOf(evmChain(network, "base"))).toBe(1000);
+        expect(defaultFinalityOf(evmChain(network, "ethereum"))).toBe(1000);
+        expect(defaultFinalityOf(evmChain(network, "arbitrum"))).toBe(1000);
+        expect(defaultFinalityOf(evmChain(network, "optimism"))).toBe(1000);
+        expect(defaultFinalityOf(evmChain(network, "arc"))).toBe(2000);
+      }
+    });
+
+    it("refuses a chain Paso does not list before anything is read or sent", async () => {
+      const fetchMock = fees();
+      const { walletClient, publicClient, writes, mocks } = clients();
+      await expect(
+        fundFromEvm({ ...base, walletClient, publicClient, chain: "polygon" as never }),
+      ).rejects.toThrow(/Unknown EVM chain "polygon"/);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(mocks.publicClient.readContract).not.toHaveBeenCalled();
+      expect(writes).toHaveLength(0);
+    });
+
+    it("names the chain a burn reverted on", async () => {
+      const { walletClient, publicClient } = clients({ allowance: 1_000_000n, burnStatus: "reverted" });
+      await expect(fundFromEvm({ ...base, walletClient, publicClient, route: "direct", chain: "arc" })).rejects.toThrow(
+        new RegExp(`burn reverted on Arc: ${BURN_HASH}`),
+      );
+    });
+  });
+
   it("fails when the burn reverts", async () => {
     const { walletClient, publicClient } = clients({ allowance: 1_000_000n, burnStatus: "reverted" });
     await expect(fundFromEvm({ ...base, walletClient, publicClient, route: "direct" })).rejects.toThrow(
@@ -396,6 +500,43 @@ describe("receiveMessageOnEvm", () => {
     await receiveMessageOnEvm({ ...args, onSubmitted: (hash) => order.push(`submitted ${hash}`) });
 
     expect(order).toEqual([`submitted ${MINT_HASH}`, "confirmed"]);
+  });
+
+  it("mints on the chain it is told, through that chain's transmitter", async () => {
+    const arc = evmChain(testNetwork, "arc");
+    const toArc = `0x${"00000001"}${"0000001b"}${"0000001a"}${NONCE.slice(2)}${"11".repeat(104)}${"22".repeat(228)}` as Hex;
+    const { args, publicClient, walletClient } = base();
+
+    expect(await receiveMessageOnEvm({ ...args, message: toArc, chain: "arc" })).toEqual({ hash: MINT_HASH, alreadyReceived: false });
+
+    expect(publicClient.readContract.mock.calls[0]![0].address).toBe(arc.messageTransmitter);
+    const request = walletClient.writeContract.mock.calls[0]![0];
+    expect(request.address).toBe(arc.messageTransmitter);
+    expect(request.chain.id).toBe(5042002);
+    expect(request.args).toEqual([toArc, ATTESTATION]);
+  });
+
+  it("refuses a message for another chain than the one it is told, before anything is read or sent", async () => {
+    const { args, publicClient, walletClient } = base();
+
+    await expect(receiveMessageOnEvm({ ...args, chain: "arc" })).rejects.toThrow(/CCTP domain 6, not for Arc Testnet \(26\)/);
+    expect(publicClient.readContract).not.toHaveBeenCalled();
+    expect(walletClient.writeContract).not.toHaveBeenCalled();
+  });
+
+  it("names the chain a mint reverted on", async () => {
+    const toArc = `0x${"00000001"}${"0000001b"}${"0000001a"}${NONCE.slice(2)}${"11".repeat(104)}${"22".repeat(228)}` as Hex;
+    const reverted = base({ status: "reverted" });
+    const failure = await receiveMessageOnEvm({ ...reverted.args, message: toArc, chain: "arc" }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(TransactionRevertedError);
+    expect((failure as Error).message).toBe(`The mint reverted on Arc: ${MINT_HASH}`);
+  });
+
+  it("reads whether a message was received on the chain it is told", async () => {
+    const { args, publicClient } = base({ used: [1n] });
+    expect(await isReceivedOnEvm(args.publicClient, MESSAGE, testNetwork, "ethereum")).toBe(true);
+    expect(publicClient.readContract.mock.calls[0]![0].address).toBe(evmChain(testNetwork, "ethereum").messageTransmitter);
+    await expect(isReceivedOnEvm(args.publicClient, MESSAGE, testNetwork, "polygon" as never)).rejects.toThrow(/Unknown EVM chain/);
   });
 
   it("needs a wallet with an account", async () => {

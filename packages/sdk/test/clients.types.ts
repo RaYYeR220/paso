@@ -5,8 +5,8 @@
  */
 import { createPublicClient, createWalletClient, http } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { base, baseSepolia } from "viem/chains";
-import { fundFromEvm, sign, type Prepared, type TypedDataSigner } from "../src";
+import { arbitrumSepolia, arcTestnet, base, baseSepolia, optimismSepolia, sepolia } from "viem/chains";
+import { fundFromEvm, receiveMessageOnEvm, sign, type Prepared, type TypedDataSigner } from "../src";
 
 const account = privateKeyToAccount(`0x${"11".repeat(32)}`);
 
@@ -24,6 +24,16 @@ export async function acceptsBaseClients(): Promise<void> {
   const walletClient = createWalletClient({ account, chain: base, transport: http() });
 
   await fundFromEvm({ walletClient, publicClient, amount: 1n, owner: account.address, network: "mainnet" });
+}
+
+export async function acceptsClientsOfEveryListedChain(prepared: Prepared): Promise<void> {
+  for (const chain of [arcTestnet, sepolia, arbitrumSepolia, optimismSepolia]) {
+    const publicClient = createPublicClient({ chain, transport: http() });
+    const walletClient = createWalletClient({ account, chain, transport: http() });
+    await fundFromEvm({ walletClient, publicClient, amount: 1n, owner: account.address, network: "testnet", chain: "arc" });
+    await receiveMessageOnEvm({ walletClient, publicClient, message: "0x", attestation: "0x", network: "testnet", chain: "arc" });
+    await sign(prepared, walletClient);
+  }
 }
 
 export function acceptsAWalletWithoutAHoistedAccount(prepared: Prepared): Promise<unknown> {

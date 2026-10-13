@@ -32,7 +32,15 @@ import {
   type TypedDataSigner,
 } from "./auth";
 import { deliverOperation, FAST_FINALITY, fetchBurnFee, maxFeeFor, type Attestation } from "./iris";
-import { requireHub, resolveNetwork, type Network, type NetworkConfig, type NetworkName } from "./networks";
+import {
+  evmChain,
+  requireHub,
+  resolveNetwork,
+  type EvmChainName,
+  type Network,
+  type NetworkConfig,
+  type NetworkName,
+} from "./networks";
 import { renderCalls, type Call } from "./render";
 import { twinAddress } from "./twin";
 import type { AuthorizationTypedData } from "./typedData";
@@ -47,14 +55,16 @@ export interface TransferAction {
   amount: bigint;
 }
 
-/** Send USDC from the account back to an EVM chain over CCTP. */
+/** Send USDC from the account to an EVM chain over CCTP. */
 export interface ExitAction {
   kind: "exit";
   /** USDC in 7-decimal units. The seventh decimal must be zero. */
   amount: bigint;
   /** Who receives the USDC on the destination chain. */
   recipient: Address;
-  /** CCTP domain to mint on. Defaults to Base. */
+  /** The chain to mint on, by name. Defaults to Base. */
+  destinationChain?: EvmChainName;
+  /** CCTP domain to mint on. Defaults to the domain of `destinationChain`; given with it, it has to be the same. */
   destinationDomain?: number;
   /** Fee cap in 7-decimal units, seventh decimal zero. Defaults to Circle's current fee plus headroom. */
   maxFee?: bigint;
@@ -260,7 +270,13 @@ async function exitOperation(action: ExitAction, account: string, config: Networ
   if (!isAddress(recipient, { strict: false })) {
     throw new Error(`"${recipient}" is not an Ethereum address`);
   }
-  const destinationDomain = action.destinationDomain ?? config.evm.cctpDomain;
+  const named = action.destinationChain === undefined ? undefined : evmChain(config, action.destinationChain);
+  if (named && action.destinationDomain !== undefined && action.destinationDomain !== named.cctpDomain) {
+    throw new Error(
+      `The exit names ${named.label}, whose CCTP domain is ${named.cctpDomain}, and domain ${action.destinationDomain}; give one`,
+    );
+  }
+  const destinationDomain = action.destinationDomain ?? named?.cctpDomain ?? config.evm.cctpDomain;
   const minFinalityThreshold = action.minFinalityThreshold ?? FAST_FINALITY;
   const maxFee =
     action.maxFee ??
@@ -322,8 +338,9 @@ function decodeEntries(entries: string[]): xdr.SorobanAuthorizationEntry[] {
  * Simulates an action and returns what the owner has to sign.
  *
  * Nothing here needs the owner's wallet or a funded Stellar account. Invalid
- * input (a recipient that is not an address, an exit amount Base cannot
- * represent, a validity longer than `MAX_VALIDITY_LEDGERS`) is rejected
+ * input (a recipient that is not an address, an exit amount an EVM chain
+ * cannot represent, an EVM chain Paso does not list, a validity longer than
+ * `MAX_VALIDITY_LEDGERS`) is rejected
  * before the network is contacted.
  */
 export async function prepare(action: Action, options: PrepareOptions): Promise<Prepared> {

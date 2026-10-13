@@ -192,6 +192,53 @@ describe("buildOperation", () => {
     }
   });
 
+  it.each([
+    ["ethereum", "0"],
+    ["optimism", "2"],
+    ["arbitrum", "3"],
+    ["base", "6"],
+    ["arc", "26"],
+  ] as const)("sends an exit to %s through its CCTP domain %s", async (destinationChain, domain) => {
+    const exit: Action = { kind: "exit", amount: 5_000_000n, recipient: EVM_RECIPIENT, maxFee: 0n, destinationChain };
+    expect(describeCall(await buildOperation(exit, options)).args[2]).toBe(domain);
+  });
+
+  it("asks Iris for the fee of the route to the chain the exit names", async () => {
+    const fetchMock = vi.fn<typeof fetch>(
+      async () => new Response(JSON.stringify([{ finalityThreshold: 1000, minimumFee: 0 }, { finalityThreshold: 2000, minimumFee: 0 }])),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const exit: Action = { kind: "exit", amount: 10_000_000n, recipient: EVM_RECIPIENT, destinationChain: "arc" };
+      const { args } = describeCall(await buildOperation(exit, options));
+      expect(args[2]).toBe("26");
+      expect(args[4]).toBe("0");
+      expect(String(fetchMock.mock.calls[0]?.[0])).toBe("https://iris-api-sandbox.circle.com/v2/burn/USDC/fees/27/26");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("takes a chain and its own domain together, and refuses a chain with another domain", async () => {
+    const same: Action = { kind: "exit", amount: 5_000_000n, recipient: EVM_RECIPIENT, maxFee: 0n, destinationChain: "arc", destinationDomain: 26 };
+    expect(describeCall(await buildOperation(same, options)).args[2]).toBe("26");
+
+    const clash: Action = { kind: "exit", amount: 5_000_000n, recipient: EVM_RECIPIENT, maxFee: 0n, destinationChain: "arc", destinationDomain: 6 };
+    await expect(buildOperation(clash, options)).rejects.toThrow(/Arc Testnet, whose CCTP domain is 26, and domain 6/);
+  });
+
+  it("refuses an exit to a chain Paso does not list before anything is signed", async () => {
+    const fetchMock = vi.fn<typeof fetch>();
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const exit = { kind: "exit", amount: 5_000_000n, recipient: EVM_RECIPIENT, destinationChain: "polygon" } as unknown as Action;
+      await expect(prepare(exit, { ...options, server: unreachableServer })).rejects.toThrow(/Unknown EVM chain "polygon"/);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("rejects amounts that are not positive", async () => {
     await expect(buildOperation({ kind: "transfer", to: ISSUER, amount: 0n }, options)).rejects.toThrow(/positive/);
     const exit: Action = { kind: "exit", amount: -10n, recipient: EVM_RECIPIENT, maxFee: 0n };

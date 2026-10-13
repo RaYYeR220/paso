@@ -1,10 +1,10 @@
 # @paso/sdk
 
-Every Ethereum address already has a Stellar account. This package finds it, funds it from Base and lets the same Ethereum key control it.
+Every Ethereum address already has a Stellar account. This package finds it, funds it from Base, Ethereum, Arbitrum, OP Mainnet or Arc and lets the same Ethereum key control it.
 
 - **Derive.** `twinAddress(owner, network)` returns the Stellar contract account (`C…`) of an Ethereum address. It is pure arithmetic: the account can receive USDC before it is deployed.
-- **Fund.** `fundFromEvm` burns USDC on Base through Circle's CCTP; `waitForAttestation` follows the transfer until it can be delivered on Stellar.
-- **Act.** `prepare` simulates a transfer, a withdrawal back to Base, or any contract call, and returns EIP-712 typed data. `sign` asks the wallet. `relay` hands the result to a relayer that pays the fee, or `submitWith` sends it from any funded Stellar account.
+- **Fund.** `fundFromEvm` burns USDC on an EVM chain through Circle's CCTP; `waitForAttestation` follows the transfer until it can be delivered on Stellar.
+- **Act.** `prepare` simulates a transfer, a withdrawal to an EVM chain, or any contract call, and returns EIP-712 typed data. `sign` asks the wallet. `relay` hands the result to a relayer that pays the fee, or `submitWith` sends it from any funded Stellar account.
 
 The wallet shows the real calls: contract, function and every argument as text. The account contract rebuilds that same text from what is about to execute and rejects the signature if anything differs.
 
@@ -41,7 +41,7 @@ const { hash } = await relay(signed, "https://example.org/api/relay");
 | Action | What runs on Stellar |
 |---|---|
 | `{ kind: "transfer", to, amount }` | USDC `transfer(account, to, amount)`. `to` is `G…`, `C…`, or `0x…` for the Stellar account of that Ethereum address. A muxed `M…` address is refused: a wallet could only show it as a hash. |
-| `{ kind: "exit", amount, recipient }` | `hub.exit(account, amount, domain, recipient, max_fee, min_finality_threshold)`: USDC leaves for `recipient` on Base. Optional `destinationDomain`, `maxFee`, `minFinalityThreshold`. |
+| `{ kind: "exit", amount, recipient }` | `hub.exit(account, amount, domain, recipient, max_fee, min_finality_threshold)`: USDC leaves for `recipient` on Base, or on `destinationChain` (`"ethereum"`, `"arbitrum"`, `"optimism"`, `"arc"`). Optional `destinationChain`, `destinationDomain`, `maxFee`, `minFinalityThreshold`. |
 | `{ kind: "invoke", contract, fn, args }` | Any contract function that asks the account for authorisation. |
 
 `prepare(action, { owner, network })` returns plain JSON: `{ network, owner, account, txXdr, entries, typedData, calls, validUntilLedger, preparedAtLedger }`. `entries` holds exactly one authorisation entry, the account's: a call that also needs the authorisation of anyone else, the fee payer included, is refused at this point.
@@ -101,18 +101,22 @@ The signed text has no types and is not escaped. The number `5` and the string `
 
 The first seven apply to `String` and `Symbol` arguments and to function names, and come in this order. They are shapes, not proofs: a look-alike letter from another alphabet is not caught. None of this is signed. It is for a front end to show next to the wallet prompt.
 
-## Funding from Base
+## Funding from an EVM chain
 
-`fundFromEvm({ walletClient, publicClient, amount, owner, network, route })` approves Circle's TokenMessenger when the allowance is short, then burns with a fast transfer. `amount` is in 6-decimal units; the payer need not be the owner.
+`fundFromEvm({ walletClient, publicClient, amount, owner, network, chain, route })` approves Circle's TokenMessenger when the allowance is short, then burns. `chain` is the chain the USDC leaves (`"base"` when absent); the wallet has to be connected to it. The burn asks for a fast transfer where Circle offers one, and for a standard transfer from Arc, which Circle attests within seconds and for nothing; `minFinalityThreshold` overrides that. `amount` is in 6-decimal units on every chain; the payer need not be the owner.
 
-| `route` | Burn on Base | Delivery on Stellar |
+| `route` | Burn on the EVM chain | Delivery on Stellar |
 |---|---|---|
 | `"forwarder"` (default) | `depositForBurnWithHook`, mint recipient and destination caller set to Circle's CctpForwarder, the account named in the hook data | `mintAndForwardOperation(message, attestation, network)` |
 | `"direct"` | `depositForBurn`, mint recipient set to the account's contract id, no destination caller | `receiveMessageOperation(caller, message, attestation, network)` |
 
-`waitForAttestation(sourceDomain, txHash, network, { signal, onStatus })` polls Circle's Iris service until the burn is attested and resolves to `{ message, attestation, nonce }`. It reports `not_found`, `pending`, `unreachable` and `complete` through `onStatus` and keeps polling until aborted. `fetchAttestation(sourceDomain, txHash, network)` asks once and returns `{ status, attestation? }`. For a burn made on Stellar, `txHash` is the transaction hash without `0x`.
+`waitForAttestation(source, txHash, network, { signal, onStatus })` polls Circle's Iris service until the burn is attested and resolves to `{ message, attestation, nonce }`. It reports `not_found`, `pending`, `unreachable` and `complete` through `onStatus` and keeps polling until aborted. `fetchAttestation(source, txHash, network)` asks once and returns `{ status, attestation? }`. `source` is a CCTP domain, a chain's name (`"arc"`) or `"stellar"`; `fetchBurnFee` takes both ends the same way. For a burn made on Stellar, `txHash` is the transaction hash without `0x`.
 
-`deliverOperation({ message, attestation, caller }, network)` picks the right delivery call from the message itself, and `deliverWith({ message, attestation }, keypair, network)` submits it from any funded Stellar account. Delivery is permissionless: Circle's contracts check the attestation and decide where the USDC goes. From a checkout of the repository, `pnpm deliver <base burn tx hash> --network <testnet|mainnet>` does the same with `PASO_SOURCE_SECRET` set to any funded Stellar account; it needs no key of the account's owner.
+`findBurnSource(txHash, network)` tells which chain a burn was made on from its hash alone: it asks Iris under the domain of every chain listed, all at once, and answers `found` with the chain and what Iris holds, `not_found`, `unreachable`, or `ambiguous`.
+
+`deliverOperation({ message, attestation, caller }, network)` picks the right delivery call from the message itself, and `deliverWith({ message, attestation }, keypair, network)` submits it from any funded Stellar account. Delivery is permissionless: Circle's contracts check the attestation and decide where the USDC goes. From a checkout of the repository, `pnpm deliver <burn tx hash> --network <testnet|mainnet>` does the same, on whichever chain the burn was made with `PASO_SOURCE_SECRET` set to any funded Stellar account; it needs no key of the account's owner.
+
+The way back ends on the EVM chain: `receiveMessageOnEvm({ walletClient, publicClient, message, attestation, network, chain })` hands the attested exit to Circle's MessageTransmitter there, and `isReceivedOnEvm(publicClient, message, network, chain)` says whether that has happened. `chain` defaults to Base; a message for another chain than the one named is refused before anything is sent. `pnpm mint <stellar exit tx hash>` mints on the chain the message names.
 
 ## Relayer
 
@@ -181,7 +185,7 @@ const { kind, chains } = await ownerKind(owner);
 // chains: [{ name: "Ethereum", chainId: 1, code: "none" }, …]
 ```
 
-`ownerKind(address, options)` asks Ethereum mainnet, Base and Base Sepolia (`OWNER_CHAINS`) for the code at the address, all at once and each for at most 6 seconds.
+`ownerKind(address, options)` asks every EVM chain the SDK lists, mainnet and testnet (`OWNER_CHAINS`, ten chains), for the code at the address, all at once and each for at most 6 seconds.
 
 | `kind` | Meaning |
 |---|---|
@@ -201,19 +205,33 @@ Options: `chains` (each `{ chain, rpcUrls }`; the endpoints are tried in order, 
 
 ## Units
 
-USDC has 6 decimals on Base and 7 on Stellar. Amounts are `bigint` in the units of the chain they are spent on: `fundFromEvm` takes 6-decimal units, actions take 7-decimal units.
+USDC has 6 decimals on every EVM chain listed and 7 on Stellar. Amounts are `bigint` in the units of the chain they are spent on: `fundFromEvm` takes 6-decimal units, actions take 7-decimal units.
+
+On Arc gas is paid in USDC. The USDC token at `0x3600…0000` and the native balance are one balance: the token counts it in 6 decimals, the native balance in 18. CCTP burns and mints through the token, in 6 decimals as everywhere else, and a burn's gas comes out of the same USDC. `nativeUsdcToEvmUnits(wei)` and `evmUnitsToNativeUsdc(usdc6)` convert between the two.
 
 `toStellarUnits(usdc6)` and `toEvmUnits(usdc7)` convert. `toEvmUnits` throws when the seventh decimal is not zero, and so does an `exit` with such an amount, before anything is signed. `parseStellarAmount`, `parseEvmAmount`, `formatStellarAmount` and `formatEvmAmount` convert to and from decimal text without rounding.
 
 ## Networks
 
-`NETWORKS.testnet` pairs Stellar testnet with Base Sepolia and Circle's sandbox; `NETWORKS.mainnet` pairs Stellar mainnet with Base. Every function takes a network name or a `NetworkConfig`, so a custom RPC endpoint is a spread away:
+`NETWORKS.testnet` pairs Stellar testnet with Circle's sandbox and five EVM test networks; `NETWORKS.mainnet` pairs Stellar mainnet with their mainnets. Base is the default chain, and `network.evm` is Base.
+
+| Name | Testnet | Mainnet | CCTP domain | Gas | Towards Stellar |
+|---|---|---|---|---|---|
+| `base` | Base Sepolia (84532) | Base (8453) | 6 | ETH | fast transfer |
+| `ethereum` | Ethereum Sepolia (11155111) | Ethereum (1) | 0 | ETH | fast transfer |
+| `arbitrum` | Arbitrum Sepolia (421614) | Arbitrum (42161) | 3 | ETH | fast transfer |
+| `optimism` | OP Sepolia (11155420) | OP Mainnet (10) | 2 | ETH | fast transfer |
+| `arc` | Arc Testnet (5042002) | Arc (5042) | 26 | USDC | standard transfer, attested within seconds |
+
+`evmChain(network, name)` returns one chain: its viem `chain`, `label`, `shortLabel`, `usdc`, `tokenMessenger`, `messageTransmitter`, `cctpDomain`, `usdcDecimals`, `gasToken`, public `rpcUrls`, `explorerUrl`, `fastTransfer` and, on testnet, `faucets`. A name it does not list throws. `listEvmChains(network)` lists them, Base first; `evmChainForDomain` and `evmChainForId` find one by CCTP domain or chain id. Every address was read back from its chain before it was listed, and so were Stellar's registrations of each chain; `test/fixtures/cctp-routes.json` holds what the chains said, and `pnpm routes --network <testnet|mainnet>` checks again.
+
+Every function takes a network name or a `NetworkConfig`, so a custom RPC endpoint is a spread away:
 
 ```ts
 const network = { ...NETWORKS.testnet, stellar: { ...NETWORKS.testnet.stellar, rpcUrl: "https://my-rpc.example" } };
 ```
 
-Contract ids come from `deployments/<network>.json` at build time. Deriving an account on a network where the hub is not deployed throws. `stellarTxUrl`, `stellarAddressUrl`, `evmTxUrl` and `evmAddressUrl` build explorer links.
+Contract ids come from `deployments/<network>.json` at build time. Deriving an account on a network where the hub is not deployed throws. `stellarTxUrl`, `stellarAddressUrl`, `evmTxUrl(hash, network, chain?)` and `evmAddressUrl(address, network, chain?)` build explorer links; the EVM ones point at Base unless a chain is named.
 
 `networkId(network)` is the 32-byte id that salts the signing domain, and `saltNetwork(salt)` goes the other way: `"testnet"`, `"mainnet"`, or `null` for any other salt. The salt is the only readable field of a signing request that says which network it is for, so show its name next to the wallet prompt.
 

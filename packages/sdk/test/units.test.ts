@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  evmUnitsToNativeUsdc,
   formatEvmAmount,
+  nativeUsdcToEvmUnits,
   formatStellarAmount,
   parseEvmAmount,
   parseStellarAmount,
@@ -65,5 +67,22 @@ describe("parsing and formatting", () => {
     for (const text of ["0", "1", "0.1", "123456.7654321"]) {
       expect(formatStellarAmount(parseStellarAmount(text))).toBe(text);
     }
+  });
+});
+
+describe("Arc's native USDC", () => {
+  it("counts the token's 6-decimal units in 18 decimals", () => {
+    expect(evmUnitsToNativeUsdc(1_000_000n)).toBe(10n ** 18n);
+    expect(evmUnitsToNativeUsdc(1n)).toBe(10n ** 12n);
+    expect(evmUnitsToNativeUsdc(0n)).toBe(0n);
+  });
+
+  it("turns a native amount into token units, rounding a remainder up: gas is never undercounted", () => {
+    expect(nativeUsdcToEvmUnits(10n ** 18n)).toBe(1_000_000n);
+    expect(nativeUsdcToEvmUnits(10n ** 12n)).toBe(1n);
+    expect(nativeUsdcToEvmUnits(10n ** 12n + 1n)).toBe(2n);
+    expect(nativeUsdcToEvmUnits(1n)).toBe(1n);
+    expect(nativeUsdcToEvmUnits(0n)).toBe(0n);
+    expect(() => nativeUsdcToEvmUnits(-1n)).toThrow(/negative/);
   });
 });

@@ -2,10 +2,12 @@ import { Account, Address, Keypair, rpc, StrKey, xdr } from "@stellar/stellar-sd
 import type { Hex } from "viem";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  cctpDomainOf,
   decodeBurnMessage,
   fetchAttestation,
   fetchAttestations,
   fetchBurnFee,
+  findBurnSource,
   inboundRouteOf,
   maxFeeFor,
   mintAndForwardOperation,
@@ -403,5 +405,137 @@ describe("deliverWith", () => {
     const { call } = simulatedCall(server);
     expect(Address.fromScAddress(call.contractAddress).toString()).toBe(testNetwork.stellar.forwarder);
     expect(call.functionName.toString()).toBe("mint_and_forward");
+  });
+});
+
+describe("naming either end of a transfer by its chain", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it.each([
+    ["base", 6],
+    ["ethereum", 0],
+    ["arbitrum", 3],
+    ["optimism", 2],
+    ["arc", 26],
+    ["stellar", 27],
+    [26, 26],
+    [0, 0],
+  ] as const)("reads %j as domain %d", (endpoint, domain) => {
+    expect(cctpDomainOf(endpoint, "testnet")).toBe(domain);
+    expect(cctpDomainOf(endpoint, "mainnet")).toBe(domain);
+  });
+
+  it.each(["polygon", "Stellar", "", -1, 1.5, 2 ** 32])("refuses %j", (endpoint) => {
+    expect(() => cctpDomainOf(endpoint as never, "testnet")).toThrow();
+  });
+
+  it("asks Iris for the fee of the route between the chains named", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () => json([{ finalityThreshold: 2000, minimumFee: 0 }]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(await fetchBurnFee("arc", "stellar", "testnet", { finalityThreshold: 2000 })).toBe(0);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe("https://iris-api-sandbox.circle.com/v2/burn/USDC/fees/26/27");
+  });
+
+  it("looks a burn up under the domain of the chain named", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () => json({ messages: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await fetchAttestations("arbitrum", TX_HASH, "mainnet");
+    await fetchAttestation("optimism", TX_HASH, "testnet");
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+      `https://iris-api.circle.com/v2/messages/3?transactionHash=${TX_HASH}`,
+      `https://iris-api-sandbox.circle.com/v2/messages/2?transactionHash=${TX_HASH}`,
+    ]);
+  });
+
+  it("throws for a chain it does not know instead of calling Iris unreachable", async () => {
+    const fetchMock = vi.fn<typeof fetch>();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(fetchAttestations("polygon" as never, TX_HASH, "testnet")).rejects.toThrow(/neither a CCTP domain/);
+    await expect(fetchAttestation("polygon" as never, TX_HASH, "testnet")).rejects.toThrow(/neither a CCTP domain/);
+    await expect(fetchBurnFee("polygon" as never, 27, "testnet")).rejects.toThrow(/neither a CCTP domain/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("findBurnSource", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  /** The same burn message, sent from another domain. */
+  const fromDomain = (message: Hex, domain: number) => `${message.slice(0, 10)}${u32(domain)}${message.slice(18)}` as Hex;
+  const complete = (message: Hex) => ({ messages: [{ message, attestation: ATTESTATION, status: "complete" }] });
+
+  /** Iris as seen per domain: an answer for the domains given, 404 for every other. */
+  function iris(answers: Record<number, Response | (() => Response)>) {
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const domain = Number(/\/v2\/messages\/(\d+)\?/.exec(String(input))?.[1]);
+      const answer = answers[domain];
+      if (answer === undefined) return json({ error: "Message not found for provided parameters" }, 404);
+      return typeof answer === "function" ? answer() : answer;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  it("asks under the domain of every chain listed, all at once, and names the one that knows the hash", async () => {
+    const message = fromDomain(DIRECT_MESSAGE, 26);
+    const fetchMock = iris({ 26: json(complete(message)) });
+
+    const found = await findBurnSource(TX_HASH, "testnet");
+
+    expect(found).toMatchObject({ state: "found", chain: { name: "arc", cctpDomain: 26 }, lookup: { state: "complete" } });
+    expect(fetchMock.mock.calls.map(([url]) => String(url)).sort()).toEqual(
+      [6, 0, 3, 2, 26].map((domain) => `https://iris-api-sandbox.circle.com/v2/messages/${domain}?transactionHash=${TX_HASH}`).sort(),
+    );
+  });
+
+  it("names the chain of a burn Iris knows and has not attested yet", async () => {
+    iris({ 0: json({ messages: [{ message: "0x", attestation: "PENDING", status: "pending_confirmations" }] }) });
+    expect(await findBurnSource(TX_HASH, "mainnet")).toMatchObject({ state: "found", chain: { name: "ethereum" }, lookup: { state: "pending" } });
+  });
+
+  it("asks only the chains it is given", async () => {
+    const fetchMock = iris({ 6: json(complete(DIRECT_MESSAGE)) });
+    expect(await findBurnSource(TX_HASH, "testnet", { chains: ["arc", "base"] })).toMatchObject({ state: "found", chain: { name: "base" } });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("says not found when no chain knows the hash", async () => {
+    iris({});
+    expect(await findBurnSource(TX_HASH, "testnet")).toEqual({ state: "not_found" });
+  });
+
+  it("says unreachable when no chain knows the hash and one could not be asked", async () => {
+    iris({ 3: json({ error: "busy" }, 503) });
+    expect(await findBurnSource(TX_HASH, "testnet")).toEqual({ state: "unreachable", detail: "Arbitrum Sepolia: Iris answered 503" });
+  });
+
+  it("still names the chain that knows the hash when another could not be asked", async () => {
+    iris({ 3: json({ error: "busy" }, 503), 2: json(complete(fromDomain(DIRECT_MESSAGE, 2))) });
+    expect(await findBurnSource(TX_HASH, "testnet")).toMatchObject({ state: "found", chain: { name: "optimism" } });
+  });
+
+  it("refuses to guess when two chains know the hash", async () => {
+    iris({ 6: json(complete(DIRECT_MESSAGE)), 26: json(complete(fromDomain(DIRECT_MESSAGE, 26))) });
+    const found = await findBurnSource(TX_HASH, "testnet");
+    expect(found.state).toBe("ambiguous");
+    expect(found.state === "ambiguous" && found.chains.map((chain) => chain.name)).toEqual(["base", "arc"]);
+  });
+
+  it("calls an attested message from another domain than the one it was filed under malformed", async () => {
+    iris({ 26: json(complete(DIRECT_MESSAGE)) });
+    expect(await findBurnSource(TX_HASH, "testnet")).toMatchObject({
+      state: "found",
+      chain: { name: "arc" },
+      lookup: { state: "malformed", detail: expect.stringMatching(/another domain under Arc Testnet/) },
+    });
+  });
+
+  it("refuses a chain it does not list before asking anything", async () => {
+    const fetchMock = iris({});
+    await expect(findBurnSource(TX_HASH, "testnet", { chains: ["polygon" as never] })).rejects.toThrow(/Unknown EVM chain/);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

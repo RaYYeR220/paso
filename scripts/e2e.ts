@@ -2,10 +2,14 @@
  * Paso, end to end, on testnet or on mainnet.
  *
  *   pnpm e2e --stellar-only [--relayer <url>]
- *   pnpm e2e [--relayer <url>] [--fund demo|burn] [--to <address>]
- *   pnpm e2e --network mainnet [--burn 1] [--transfer 0.1] [--exit 0.5] [--to <address>]
- *   pnpm e2e --network mainnet --dry-run [--owner <0x…>] [--source <G…>]
- *   pnpm e2e [--resume-burn <base tx>] [--skip-fund] [--skip-transfer] [--resume-exit <stellar tx>] [--skip-exit]
+ *   pnpm e2e [--chain <name>] [--relayer <url>] [--fund demo|burn] [--to <address>]
+ *   pnpm e2e --network mainnet [--chain <name>] [--burn 1] [--transfer 0.1] [--exit 0.5] [--to <address>]
+ *   pnpm e2e --network mainnet --dry-run [--chain <name>] [--owner <0x…>] [--source <G…>]
+ *   pnpm e2e [--resume-burn <evm tx>] [--skip-fund] [--skip-transfer] [--resume-exit <stellar tx>] [--skip-exit]
+ *
+ * `--chain` names the EVM side of the run: base (the default), ethereum,
+ * arbitrum, optimism or arc; on testnet their test networks. On Arc the gas
+ * is paid in USDC, out of the same balance the transfer leaves.
  *
  * `--stellar-only` needs no USDC. It takes a fresh Ethereum key, makes the
  * first call from its Stellar account (which deploys the account), and then
@@ -13,9 +17,9 @@
  * recorded on chain as a failed transaction.
  *
  * Without the flag it runs the whole journey for the owner key: USDC leaves
- * Base, Circle attests the burn, it is delivered to the owner's Stellar
- * account, part of it is sent on to another account, part of it goes back to
- * Base, and the refusal closes the run. Every transaction is printed with its
+ * the EVM chain, Circle attests the burn, it is delivered to the owner's
+ * Stellar account, part of it is sent on to another account, part of it goes
+ * back to the same chain, and the refusal closes the run. Every transaction is printed with its
  * explorer link. `--burn`, `--transfer` and `--exit` set the three amounts in
  * USDC; they default to 1, 0.1 and 0.5.
  *
@@ -23,19 +27,19 @@
  * API and it pays their fees. Without it, the account in
  * `PASO_E2E_SOURCE_SECRET` pays: nothing here depends on a particular relayer.
  *
- * `--network mainnet` runs the same journey between Stellar mainnet and Base
- * with real funds, and pays for itself: the owner key pays the burn and the
- * final mint on Base, `PASO_E2E_SOURCE_SECRET` pays on Stellar, and there is
+ * `--network mainnet` runs the same journey between Stellar mainnet and the
+ * chain with real funds, and pays for itself: the owner key pays the burn and
+ * the final mint, `PASO_E2E_SOURCE_SECRET` pays on Stellar, and there is
  * no faucet and no relayer. Before anything is sent the run reads Circle's
  * contracts on both chains, prints what each account needs, and stops if
  * either is short. Each Stellar transaction prints its simulated fee first.
  *
  * A run that stops half way is picked up where it stopped, and says how when
- * it stops: `--resume-burn <tx>` starts from a burn on Base that exists and
+ * it stops: `--resume-burn <tx>` starts from a burn on the chain that exists and
  * delivers it unless it has been delivered; `--skip-fund` starts from the
  * USDC the account holds, with no burn and no delivery; `--skip-transfer`
  * leaves the transfer out; `--resume-exit <tx>` starts from an exit on
- * Stellar that exists and mints on Base unless that has been done;
+ * Stellar that exists and mints on the chain unless that has been done;
  * `--skip-exit` leaves the way back out. What Circle's contracts have taken
  * once they are not offered again.
  *
@@ -52,12 +56,15 @@
  * exists; on mainnet from the environment alone):
  *
  *   PASO_E2E_OWNER_KEY       Ethereum private key that owns the account. A fresh one when unset.
- *                            On mainnet it also pays on Base.
+ *                            On mainnet it also pays on the EVM chain.
  *   PASO_E2E_SOURCE_SECRET   Secret key of any funded Stellar account. Required without --relayer,
  *                            and for the refused transaction, which no relayer will send.
- *   PASO_E2E_PAYER_KEY       Testnet: Ethereum private key that pays the burn on Base (--fund burn).
- *                            Defaults to DEMO_PAYER_PRIVATE_KEY when that is set, else to the owner key.
- *   BASE_RPC_URL             Base RPC endpoint. Defaults to the chain's public one.
+ *   PASO_E2E_PAYER_KEY       Testnet: Ethereum private key that pays the burn and the mint on the
+ *                            EVM chain (--fund burn). Defaults to DEMO_PAYER_PRIVATE_KEY when that is
+ *                            set, else to the owner key.
+ *   <CHAIN>_RPC_URL          The chain's RPC endpoint: BASE_RPC_URL, ETHEREUM_RPC_URL, ARBITRUM_RPC_URL,
+ *                            OPTIMISM_RPC_URL, ARC_RPC_URL. Defaults to the public endpoints the SDK
+ *                            lists for the chain.
  */
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
@@ -76,38 +83,33 @@ import {
 } from "@stellar/stellar-sdk";
 import {
   concat,
-  createPublicClient,
   createWalletClient,
-  encodeAbiParameters,
   encodeFunctionData,
-  formatEther,
   formatGwei,
   getAddress,
-  http,
   isAddress,
   keccak256,
-  numberToHex,
-  pad,
   size,
   slice,
-  toHex,
   zeroHash,
   type Abi,
   type Address,
   type Hex,
-  type StateOverride,
   type WalletClient,
 } from "viem";
 import { generatePrivateKey, privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
-import { publicActionsL2 } from "viem/op-stack";
 import {
   buildOperation,
   decodeBurnMessage,
+  defaultFinalityOf,
   deliverOperation,
   deployOperation,
   erc20Abi,
   evmAddressUrl,
+  evmChain,
   evmTxUrl,
+  evmUnitsToNativeUsdc,
+  FAST_FINALITY,
   fetchBurnFee,
   formatEvmAmount,
   formatStellarAmount,
@@ -138,12 +140,26 @@ import {
   type Action,
   type Attestation,
   type Call,
+  type EvmChainConfig,
+  type EvmChainName,
   type EvmReader,
   type NetworkConfig,
   type NetworkName,
   type Signed,
 } from "../packages/sdk/src/index";
-import { deliveredOnStellar, stellarRecipient } from "./cctp";
+import { checkStellarCircle, deliveredOnStellar, stellarRecipient } from "./cctp";
+import {
+  chargesDataFee,
+  checkEvmCircle,
+  dataFee,
+  evmReader,
+  evmTransport,
+  formatGas,
+  fundedForBurn,
+  parseChain,
+  reportEvmCircle,
+  type ChainReader,
+} from "./evm";
 import { describe, formatXlm, MINIMUM_BALANCE, simulatedFee, STROOPS_PER_XLM, xlmBalance } from "./fees";
 import { INCLUSION_BID, sendAndWait as sendFrom, simulated, VALIDITY_SECONDS, type Applied } from "./sender";
 
@@ -160,18 +176,15 @@ const APPROVAL_LEDGERS = 1000;
  */
 const STELLAR_FEE_ALLOWANCE = 1n * STROOPS_PER_XLM;
 /**
- * Gas counted for `receiveMessage` on Base, which mints the USDC that came
- * back. It cannot be simulated before Circle has attested the exit.
+ * Gas counted for `receiveMessage` on the EVM chain, which mints the USDC
+ * that came back. It cannot be simulated before Circle has attested the exit.
  */
 const MINT_GAS_ALLOWANCE = 300_000n;
 /** The size of a CCTP burn message without hook data, and of the two signatures that attest it. */
 const BURN_MESSAGE_BYTES = 376;
 const ATTESTATION_BYTES = 130;
-/** Storage slots of Circle's FiatToken, the USDC contract on Base: balances, then allowances. */
-const USDC_BALANCES_SLOT = 9n;
-const USDC_ALLOWANCES_SLOT = 10n;
 /**
- * Until a hub exists there is no account address. The burn on Base never
+ * Until a hub exists there is no account address. The burn on the chain never
  * reads the address it carries, so a dry run simulates it with an address of
  * the same size derived from this placeholder.
  */
@@ -179,28 +192,30 @@ const PLACEHOLDER_HUB = StrKey.encodeContract(Buffer.alloc(32));
 
 interface Options {
   network: NetworkName;
+  /** The EVM side of the run. */
+  chain: EvmChainName;
   dryRun: boolean;
   stellarOnly: boolean;
   relayerUrl?: string;
   fund: "demo" | "burn";
   to?: string;
-  /** USDC that leaves Base, in 6-decimal units. */
+  /** USDC that leaves the EVM chain, in 6-decimal units. */
   burn: bigint;
   /** USDC sent on to another Stellar address, in 7-decimal units. */
   transfer: bigint;
-  /** USDC sent back to Base, in 7-decimal units. */
+  /** USDC sent back to the EVM chain, in 7-decimal units. */
   exit: bigint;
   /** The two addresses of a dry run, when no key names them. */
   owner?: Address;
   source?: string;
-  /** A burn on Base that has happened already: the run picks up at its attestation. */
+  /** A burn on the EVM chain that has happened already: the run picks up at its attestation. */
   resumeBurn?: Hex;
   /** An exit on Stellar that has happened already: the run picks up at its attestation. */
   resumeExit?: string;
-  /** The account holds its USDC already: no burn on Base and no delivery. */
+  /** The account holds its USDC already: no burn and no delivery. */
   skipFund: boolean;
   skipTransfer: boolean;
-  /** No exit, and so no mint on Base either. */
+  /** No exit, and so no mint on the EVM chain either. */
   skipExit: boolean;
   /** The arguments that say what the run is, not where in it to start: the command that continues a run repeats them. */
   kept: string[];
@@ -208,6 +223,8 @@ interface Options {
 
 interface Run {
   config: NetworkConfig;
+  /** The EVM chain the USDC comes from and goes back to. */
+  evm: EvmChainConfig;
   server: rpc.Server;
   options: Options;
   owner: PrivateKeyAccount;
@@ -221,9 +238,10 @@ interface Run {
 function usage(message?: string): never {
   if (message) console.error(`${message}\n`);
   console.error(
-    "Usage: pnpm e2e [--network testnet|mainnet] [--dry-run] [--stellar-only] [--relayer <url>] [--fund demo|burn]\n" +
+    "Usage: pnpm e2e [--network testnet|mainnet] [--chain base|ethereum|arbitrum|optimism|arc] [--dry-run]\n" +
+      "                [--stellar-only] [--relayer <url>] [--fund demo|burn]\n" +
       "                [--burn <usdc>] [--transfer <usdc>] [--exit <usdc>] [--to <G…|C…|0x…>]\n" +
-      "                [--resume-burn <base tx>] [--skip-fund] [--skip-transfer] [--resume-exit <stellar tx>] [--skip-exit]\n" +
+      "                [--resume-burn <evm tx>] [--skip-fund] [--skip-transfer] [--resume-exit <stellar tx>] [--skip-exit]\n" +
       "                [--owner <0x…>] [--source <G…>]   (dry run only)",
   );
   process.exit(2);
@@ -232,6 +250,7 @@ function usage(message?: string): never {
 function parseArgs(argv: string[]): Options {
   const options: Options = {
     network: "testnet",
+    chain: parseChain(undefined, usage),
     dryRun: false,
     stellarOnly: false,
     fund: "burn",
@@ -266,6 +285,7 @@ function parseArgs(argv: string[]): Options {
     };
     if (arg === "--stellar-only") options.stellarOnly = true;
     else if (arg === "--dry-run") options.dryRun = true;
+    else if (arg === "--chain") options.chain = parseChain(value(), usage);
     else if (arg === "--network") {
       const name = value();
       if (name !== "testnet" && name !== "mainnet") usage("--network takes testnet or mainnet");
@@ -304,13 +324,14 @@ function parseArgs(argv: string[]): Options {
   if (fund !== undefined && fund !== "demo" && fund !== "burn") usage("--fund takes demo or burn");
   options.fund = (fund as Options["fund"] | undefined) ?? (options.relayerUrl ? "demo" : "burn");
   if (options.fund === "demo" && !options.relayerUrl) usage("--fund demo needs --relayer, whose faucet it uses");
-  if (options.exit % 10n !== 0n) usage("--exit takes at most six decimals: Base cannot hold a seventh");
+  if (options.fund === "demo" && options.chain !== "base") usage("--fund demo burns on Base, from the relayer's faucet; pick --fund burn");
+  if (options.exit % 10n !== 0n) usage("--exit takes at most six decimals: USDC on an EVM chain cannot hold a seventh");
   if ((options.owner || options.source) && !options.dryRun) {
     usage("--owner and --source name addresses for a dry run; a real run takes its keys from the environment");
   }
   if (options.dryRun && options.relayerUrl) usage("A dry run talks to the chains only; leave --relayer out");
   if (options.network === "mainnet" && options.relayerUrl) {
-    usage("On mainnet the run pays for itself: PASO_E2E_SOURCE_SECRET on Stellar, the owner key on Base");
+    usage("On mainnet the run pays for itself: PASO_E2E_SOURCE_SECRET on Stellar, the owner key on the EVM chain");
   }
   return options;
 }
@@ -642,18 +663,17 @@ async function refusal(run: Run): Promise<void> {
 }
 
 function evmClients(run: Run, payer: PrivateKeyAccount) {
-  const { chain } = run.config.evm;
-  const transport = baseTransport();
   return {
-    publicClient: createPublicClient({ chain, transport }),
-    walletClient: createWalletClient({ account: payer, chain, transport }),
+    publicClient: evmReader(run.evm),
+    walletClient: createWalletClient({ account: payer, chain: run.evm.chain, transport: evmTransport(run.evm) }),
   };
 }
 
-/** USDC leaves Base for the owner's Stellar account. Returns the burn transaction. */
+/** USDC leaves the EVM chain for the owner's Stellar account. Returns the burn transaction. */
 async function fund(run: Run, options: Options, payer: PrivateKeyAccount): Promise<Hex> {
   const amount = run.options.burn;
-  heading(`${formatEvmAmount(amount)} USDC leaves ${run.config.evm.chain.name} for the account`);
+  const { evm } = run;
+  heading(`${formatEvmAmount(amount)} USDC leaves ${evm.label} for the account`);
   if (options.fund === "demo") {
     const { status, body } = await postJson(`${run.relayerUrl}/api/demo/fund`, { owner: run.owner.address });
     if (status !== 200 || typeof body.burnTxHash !== "string") {
@@ -661,22 +681,22 @@ async function fund(run: Run, options: Options, payer: PrivateKeyAccount): Promi
     }
     line("paid by", "the relayer's demo faucet");
     line("burned", body.burnTxHash);
-    line("", evmTxUrl(body.burnTxHash, run.config));
+    line("", evmTxUrl(body.burnTxHash, run.config, evm.name));
     return body.burnTxHash as Hex;
   }
 
   const clients = evmClients(run, payer);
-  const held = await clients.publicClient.readContract({
-    address: run.config.evm.usdc,
-    abi: erc20Abi,
-    functionName: "balanceOf",
-    args: [payer.address],
-  });
-  if (held < amount) {
-    const faucet = run.config.name === "testnet" ? " (https://faucet.circle.com)" : "";
+  const [held, native] = await Promise.all([
+    clients.publicClient.readContract({ address: evm.usdc, abi: erc20Abi, functionName: "balanceOf", args: [payer.address] }),
+    clients.publicClient.getBalance({ address: payer.address }),
+  ]);
+  // On Arc the gas comes out of the USDC itself: the native balance is the same USDC, in 18 decimals.
+  const gasLeft = evm.gasToken.isUsdc ? native - evmUnitsToNativeUsdc(amount) : native;
+  if (held < amount || gasLeft <= 0n) {
+    const faucets = evm.faucets ? ` (USDC: ${evm.faucets.usdc}; ${evm.gasToken.symbol}: ${evm.faucets.gas})` : "";
     throw new Error(
-      `${payer.address} holds ${formatEvmAmount(held)} USDC on ${run.config.evm.chain.name}; it needs ` +
-        `${formatEvmAmount(amount)} and some ETH for gas${faucet}`,
+      `${payer.address} holds ${formatEvmAmount(held)} USDC and ${formatGas(native, evm)} on ${evm.label}; it needs ` +
+        `${formatEvmAmount(amount)} USDC and some ${evm.gasToken.symbol} for gas${evm.gasToken.isUsdc ? " on top" : ""}${faucets}`,
     );
   }
   // The burn is estimated as soon as the approval is mined. Behind a public
@@ -692,14 +712,16 @@ async function fund(run: Run, options: Options, payer: PrivateKeyAccount): Promi
     amount,
     owner: run.owner.address,
     network: run.config,
+    chain: evm.name,
   });
   line("paid by", payer.address);
   if (approveTxHash) {
     line("approved", approveTxHash);
-    line("", evmTxUrl(approveTxHash, run.config));
+    line("", evmTxUrl(approveTxHash, run.config, evm.name));
   }
-  line("burned", `${burnTxHash}  (route ${route}, fee cap ${formatEvmAmount(maxFee)} USDC)`);
-  line("", evmTxUrl(burnTxHash, run.config));
+  const speed = defaultFinalityOf(evm) === FAST_FINALITY ? "fast transfer" : "standard transfer";
+  line("burned", `${burnTxHash}  (route ${route}, ${speed}, fee cap ${formatEvmAmount(maxFee)} USDC)`);
+  line("", evmTxUrl(burnTxHash, run.config, evm.name));
   return burnTxHash;
 }
 
@@ -722,7 +744,7 @@ async function attested(run: Run, sourceDomain: number, txHash: string): Promise
 }
 
 async function deliver(run: Run, burnTxHash: Hex, attestation: Attestation): Promise<void> {
-  const { cctpDomain } = run.config.evm;
+  const { cctpDomain } = run.evm;
   const route = inboundRouteOf(attestation.message, run.config);
 
   let hash: string | undefined;
@@ -785,49 +807,48 @@ const usedNoncesAbi = [
 ] as const;
 
 /**
- * Whoever pays on Base when it is not the owner: for the burn when there is
- * no faucet, and for the mint that ends the way back. On mainnet the owner
- * pays and no other key is looked at.
+ * Whoever pays on the EVM chain when it is not the owner: for the burn when
+ * there is no faucet, and for the mint that ends the way back. On mainnet the
+ * owner pays and no other key is looked at.
  */
-function basePayer(config: NetworkConfig): PrivateKeyAccount | undefined {
+function evmPayer(config: NetworkConfig): PrivateKeyAccount | undefined {
   if (config.name === "mainnet") return undefined;
   const key = privateKey("PASO_E2E_PAYER_KEY") ?? privateKey("DEMO_PAYER_PRIVATE_KEY");
   return key ? privateKeyToAccount(key) : undefined;
 }
 
-/** Base → the account → another account → back to Base. */
+/** The EVM chain → the account → another account → back to the EVM chain. */
 async function journey(run: Run, options: Options): Promise<void> {
-  const { config, server, account } = run;
-  const { chain } = config.evm;
-  const payer = basePayer(config) ?? run.owner;
+  const { config, server, account, evm } = run;
+  const payer = evmPayer(config) ?? run.owner;
   const context = { owner: run.owner.address, network: config, server };
   const before = await usdcBalance(account, config, server);
 
   if (options.skipFund) {
     heading("The USDC is in the account already");
-    line("skipped", `the burn on ${chain.name} and the delivery on Stellar${options.resumeExit ? "" : "  (--skip-fund)"}`);
+    line("skipped", `the burn on ${evm.label} and the delivery on Stellar${options.resumeExit ? "" : "  (--skip-fund)"}`);
     line("balance", `${formatStellarAmount(before)} USDC in ${account}`);
     const needed =
       (options.skipTransfer ? 0n : options.transfer) + (options.skipExit || options.resumeExit ? 0n : options.exit);
     if (before < needed) {
       throw new Error(
         `The account holds ${formatStellarAmount(before)} USDC and the steps that are left take ` +
-          `${formatStellarAmount(needed)}. Run without --skip-fund to burn on ${chain.name} first`,
+          `${formatStellarAmount(needed)}. Run without --skip-fund to burn on ${evm.label} first`,
       );
     }
   } else {
     let burnTxHash: Hex;
     if (options.resumeBurn) {
       burnTxHash = options.resumeBurn;
-      heading(`A burn on ${chain.name} that has happened already`);
+      heading(`A burn on ${evm.label} that has happened already`);
       line("resumed", `${burnTxHash}  (--resume-burn)`);
-      line("", evmTxUrl(burnTxHash, config));
+      line("", evmTxUrl(burnTxHash, config, evm.name));
     } else {
       burnTxHash = await fund(run, options, payer);
     }
     reached(run, "--resume-burn", burnTxHash);
 
-    const inbound = await attested(run, config.evm.cctpDomain, burnTxHash);
+    const inbound = await attested(run, evm.cctpDomain, burnTxHash);
     const burn = decodeBurnMessage(inbound.message);
     line("fee", `${formatEvmAmount(burn.feeExecuted)} USDC kept by Circle`);
     const destination = stellarRecipient(inbound.message, config);
@@ -869,8 +890,8 @@ async function journey(run: Run, options: Options): Promise<void> {
   reached(run, "--skip-fund", "--skip-transfer");
 
   if (options.skipExit) {
-    heading(`The way back to ${chain.name}`);
-    line("skipped", `the exit and the mint on ${chain.name}  (--skip-exit)`);
+    heading(`The way back to ${evm.label}`);
+    line("skipped", `the exit and the mint on ${evm.label}  (--skip-exit)`);
     return;
   }
 
@@ -881,9 +902,9 @@ async function journey(run: Run, options: Options): Promise<void> {
     line("resumed", `${exitTxHash}  (--resume-exit)`);
     line("", stellarTxUrl(exitTxHash, config));
   } else {
-    heading(`${formatStellarAmount(options.exit)} USDC back to ${chain.name}`);
+    heading(`${formatStellarAmount(options.exit)} USDC back to ${evm.label}`);
     const exit = await sign(
-      await prepare({ kind: "exit", amount: options.exit, recipient: run.owner.address }, context),
+      await prepare({ kind: "exit", amount: options.exit, recipient: run.owner.address, destinationChain: evm.name }, context),
       run.owner,
     );
     showCalls("wallet", exit.calls);
@@ -903,130 +924,53 @@ async function journey(run: Run, options: Options): Promise<void> {
   const outbound = await attested(run, config.stellar.cctpDomain, exitTxHash);
   const message = decodeBurnMessage(outbound.message);
   line("message", `${formatEvmAmount(message.amount)} USDC for 0x${message.mintRecipient.slice(-40)} on CCTP domain ${message.destinationDomain}`);
+  if (message.destinationDomain !== evm.cctpDomain) {
+    throw new Error(`That exit goes to CCTP domain ${message.destinationDomain}, not to ${evm.label} (${evm.cctpDomain}); run with the --chain it was made for`);
+  }
 
   const clients = evmClients(run, payer);
   const used = await clients.publicClient.readContract({
-    address: config.evm.messageTransmitter,
+    address: evm.messageTransmitter,
     abi: usedNoncesAbi,
     functionName: "usedNonces",
     args: [outbound.nonce],
   });
   if (used !== 0n) {
-    line("minted", `already: Circle's message transmitter on ${chain.name} has taken this message`);
+    line("minted", `already: Circle's message transmitter on ${evm.label} has taken this message`);
     reached(run, "--skip-fund", "--skip-transfer", "--skip-exit");
     return;
   }
   const gas = await clients.publicClient.getBalance({ address: payer.address });
   if (gas === 0n) {
-    line("mint", `attested and ready: anyone can call receiveMessage on ${config.evm.messageTransmitter}`);
+    line("mint", `attested and ready: anyone can call receiveMessage on ${evm.messageTransmitter} on ${evm.label}`);
     return;
   }
   const mint = {
-    address: config.evm.messageTransmitter,
+    address: evm.messageTransmitter,
     abi: messageTransmitterAbi,
     functionName: "receiveMessage",
     args: [outbound.message, outbound.attestation],
   } as const;
   const mintGas = await clients.publicClient.estimateContractGas({ ...mint, account: payer.address });
   const { maxFeePerGas } = await clients.publicClient.estimateFeesPerGas();
-  line("fee", `${formatEther(mintGas * maxFeePerGas)} ETH at most for the mint, simulated, paid by ${payer.address}`);
+  line("fee", `${formatGas(mintGas * maxFeePerGas, evm)} at most for the mint, simulated, paid by ${payer.address}`);
   const mintTxHash = await clients.walletClient.writeContract(mint);
   const receipt = await clients.publicClient.waitForTransactionReceipt({ hash: mintTxHash });
   if (receipt.status !== "success") {
-    throw new Error(`The mint on ${chain.name} reverted: ${mintTxHash}`);
+    throw new Error(`The mint on ${evm.label} reverted: ${mintTxHash}`);
   }
   line("minted", mintTxHash);
-  line("", evmTxUrl(mintTxHash, config));
+  line("", evmTxUrl(mintTxHash, config, evm.name));
+  const minted = await clients.publicClient.readContract({ address: evm.usdc, abi: erc20Abi, functionName: "balanceOf", args: [run.owner.address] });
+  line("balance", `${formatEvmAmount(minted)} USDC in ${run.owner.address} on ${evm.label}`);
   reached(run, "--skip-fund", "--skip-transfer", "--skip-exit");
-}
-
-/** Stops the run when a chain does not say what the configuration says. */
-function expectSame(what: string, actual: string, expected: string): void {
-  if (actual.toLowerCase() !== expected.toLowerCase()) {
-    throw new Error(`${what}: the configuration says ${expected}, the chain says ${actual}`);
-  }
-}
-
-/** Circle's three contracts on Stellar have to name each other, name Base, and be running. */
-async function checkStellarCircle(config: NetworkConfig, server: rpc.Server): Promise<void> {
-  const { tokenMessenger, messageTransmitter, forwarder, cctpDomain } = config.stellar;
-  const { chain, cctpDomain: evmDomain } = config.evm;
-  const read = async (contract: string, fn: string, ...args: xdr.ScVal[]) =>
-    renderArg(await readContract(contract, fn, args, config, server));
-
-  expectSame("The message transmitter of Circle's forwarder", await read(forwarder, "get_message_transmitter"), messageTransmitter);
-  expectSame("The token messenger of Circle's forwarder", await read(forwarder, "get_token_messenger_minter"), tokenMessenger);
-  expectSame(
-    "The message transmitter of Circle's token messenger",
-    await read(tokenMessenger, "get_local_message_transmitter"),
-    messageTransmitter,
-  );
-  expectSame("Stellar's CCTP domain", await read(messageTransmitter, "get_local_domain"), String(cctpDomain));
-  expectSame(
-    `The token messenger Stellar knows for ${chain.name}`,
-    await read(tokenMessenger, "get_remote_token_messenger", xdr.ScVal.scvU32(evmDomain)),
-    pad(config.evm.tokenMessenger),
-  );
-  for (const contract of [forwarder, tokenMessenger, messageTransmitter]) {
-    expectSame(`Whether ${contract} is paused`, await read(contract, "paused"), "false");
-  }
-  line("stellar", `forwarder, token messenger and message transmitter name each other; none is paused`);
-  line("", `domain ${cctpDomain}, with ${chain.name} registered as domain ${evmDomain}`);
-}
-
-const tokenMessengerRoutingAbi = [
-  {
-    type: "function",
-    name: "localMessageTransmitter",
-    stateMutability: "view",
-    inputs: [],
-    outputs: [{ name: "", type: "address" }],
-  },
-  {
-    type: "function",
-    name: "remoteTokenMessengers",
-    stateMutability: "view",
-    inputs: [{ name: "domain", type: "uint32" }],
-    outputs: [{ name: "", type: "bytes32" }],
-  },
-] as const;
-
-const baseTransport = () => http(process.env.BASE_RPC_URL?.trim() || undefined);
-
-/** Reads Base, including what it charges for posting a transaction's data to Ethereum. */
-function baseReader(config: NetworkConfig) {
-  return createPublicClient({ chain: config.evm.chain, transport: baseTransport() }).extend(publicActionsL2());
-}
-
-type BaseReader = ReturnType<typeof baseReader>;
-
-/** The endpoint has to serve the right chain, and Circle's contracts there have to name each other and Stellar. */
-async function checkBaseCircle(config: NetworkConfig, base: BaseReader): Promise<void> {
-  const { chain, tokenMessenger, messageTransmitter } = config.evm;
-  const chainId = await base.getChainId();
-  if (chainId !== chain.id) {
-    throw new Error(`The Base endpoint serves chain ${chainId}, not ${chain.name} (${chain.id}); check BASE_RPC_URL`);
-  }
-  const routing = { address: tokenMessenger, abi: tokenMessengerRoutingAbi } as const;
-  expectSame(
-    `The message transmitter of Circle's token messenger on ${chain.name}`,
-    await base.readContract({ ...routing, functionName: "localMessageTransmitter" }),
-    messageTransmitter,
-  );
-  expectSame(
-    `The token messenger ${chain.name} knows for Stellar`,
-    await base.readContract({ ...routing, functionName: "remoteTokenMessengers", args: [config.stellar.cctpDomain] }),
-    toHex(StrKey.decodeContract(config.stellar.tokenMessenger)),
-  );
-  line("base", `token messenger and message transmitter name each other on ${chain.name} (chain ${chain.id})`);
-  line("", `Stellar is registered as domain ${config.stellar.cctpDomain}`);
 }
 
 /** Who is involved in a run, by address: enough to read and simulate, not to sign. */
 interface Parties {
   /** The Ethereum address whose Stellar account the run is about. */
   owner: Address;
-  /** Pays on Base: the burn, and the mint that ends the way back. */
+  /** Pays on the EVM chain: the burn, and the mint that ends the way back. */
   payer: Address;
   /** Pays the fees on Stellar. */
   source: string;
@@ -1046,7 +990,8 @@ interface EvmCall {
  */
 async function burnCalls(
   config: NetworkConfig,
-  base: BaseReader,
+  evm: EvmChainConfig,
+  reader: ChainReader,
   { owner, payer }: Parties,
   amount: bigint,
 ): Promise<{ calls: EvmCall[]; maxFee: bigint }> {
@@ -1059,91 +1004,79 @@ async function burnCalls(
     },
   } as unknown as WalletClient;
   const publicClient = {
-    readContract: base.readContract,
+    readContract: reader.readContract,
     waitForTransactionReceipt: async () => ({ status: "success" }),
   } as unknown as EvmReader;
-  const { maxFee } = await fundFromEvm({ walletClient, publicClient, amount, owner, network: config });
+  const { maxFee } = await fundFromEvm({ walletClient, publicClient, amount, owner, network: config, chain: evm.name });
   return { calls, maxFee };
 }
 
-/** Gives `holder` the USDC and the allowance of a burn, for the length of one simulation. */
-function fundedForBurn(config: NetworkConfig, holder: Address, amount: bigint): StateOverride {
-  const slotOf = (key: Address, slot: Hex) =>
-    keccak256(encodeAbiParameters([{ type: "address" }, { type: "bytes32" }], [key, slot]));
-  const balance = slotOf(holder, numberToHex(USDC_BALANCES_SLOT, { size: 32 }));
-  const allowance = slotOf(config.evm.tokenMessenger, slotOf(holder, numberToHex(USDC_ALLOWANCES_SLOT, { size: 32 })));
-  const value = numberToHex(amount, { size: 32 });
-  return [
-    {
-      address: config.evm.usdc,
-      stateDiff: [
-        { slot: balance, value },
-        { slot: allowance, value },
-      ],
-    },
-  ];
-}
-
 /**
- * What `payer` sends on Base for the account of `owner`, and what it has to
- * hold for it. Returns the USDC that reaches Stellar, in 7-decimal units,
- * once Circle has kept its fee.
+ * What `payer` sends on the EVM chain for the account of `owner`, and what it
+ * has to hold for it. Returns the USDC that reaches Stellar, in 7-decimal
+ * units, once Circle has kept its fee.
  */
-async function planBase(
+async function planEvm(
   config: NetworkConfig,
-  base: BaseReader,
+  evm: EvmChainConfig,
+  reader: ChainReader,
   parties: Parties,
   options: Options,
   waiting: string[],
 ): Promise<bigint> {
   const { owner, payer } = parties;
-  const { chain, usdc, tokenMessenger, messageTransmitter } = config.evm;
+  const { label, usdc, tokenMessenger, messageTransmitter, gasToken } = evm;
   const amount = options.burn;
-  const [eth, held, allowance] = await Promise.all([
-    base.getBalance({ address: payer }),
-    base.readContract({ address: usdc, abi: erc20Abi, functionName: "balanceOf", args: [payer] }),
-    base.readContract({ address: usdc, abi: erc20Abi, functionName: "allowance", args: [payer, tokenMessenger] }),
+  const [native, held, allowance] = await Promise.all([
+    reader.getBalance({ address: payer }),
+    reader.readContract({ address: usdc, abi: erc20Abi, functionName: "balanceOf", args: [payer] }),
+    reader.readContract({ address: usdc, abi: erc20Abi, functionName: "allowance", args: [payer, tokenMessenger] }),
   ]);
-  line("payer", `${payer}${payer === owner ? ", the owner," : ""} holds ${formatEther(eth)} ETH and ${formatEvmAmount(held)} USDC`);
-  line("", evmAddressUrl(payer, config));
+  const who = `${payer}${payer === owner ? ", the owner," : ""}`;
+  line(
+    "payer",
+    gasToken.isUsdc
+      ? `${who} holds ${formatEvmAmount(held)} USDC, which also pays the gas (${formatGas(native, evm)} natively)`
+      : `${who} holds ${formatGas(native, evm)} and ${formatEvmAmount(held)} USDC`,
+  );
+  line("", evmAddressUrl(payer, config, evm.name));
 
   let gas = 0n;
-  let dataFee = 0n;
+  let posted = 0n;
   let arriving = 0n;
-  if (options.skipFund || options.resumeBurn) {
+  const burning = !(options.skipFund || options.resumeBurn);
+  if (!burning) {
     line("burn", options.resumeBurn ? `nothing to send: ${options.resumeBurn} is resumed` : "nothing to send  (--skip-fund)");
   } else {
     const hasHub = config.stellar.hub !== "";
     const planned = hasHub ? config : { ...config, stellar: { ...config.stellar, hub: PLACEHOLDER_HUB } };
-    const { calls, maxFee } = await burnCalls(planned, base, parties, amount);
+    const { calls, maxFee } = await burnCalls(planned, evm, reader, parties, amount);
     const asIfFunded = held < amount || allowance < amount;
     arriving = toStellarUnits(amount - maxFee);
     for (const call of calls) {
       const isBurn = call.address === tokenMessenger;
-      const label = isBurn ? "burn" : "approve";
-      const what = `${isBurn ? "TokenMessenger" : "USDC"}.${call.functionName}`;
+      const step = isBurn ? "burn" : "approve";
+      const what = `${isBurn ? `TokenMessenger ${tokenMessenger}` : `USDC ${usdc}`}.${call.functionName}`;
       try {
-        const callGas = await base.estimateContractGas({
+        const callGas = await reader.estimateContractGas({
           ...call,
           account: payer,
-          stateOverride: isBurn && asIfFunded ? fundedForBurn(config, payer, amount) : undefined,
+          stateOverride: isBurn && asIfFunded ? fundedForBurn(evm, payer, amount, native) : undefined,
         });
         gas += callGas;
-        dataFee += await base.estimateL1Fee({ account: payer, to: call.address, data: encodeFunctionData(call), gas: callGas });
-        line(label, `${what}  ${callGas} gas, simulated`);
+        posted += await dataFee(reader, evm, { account: payer, to: call.address, data: encodeFunctionData(call), gas: callGas });
+        line(step, `${what}  ${callGas} gas, simulated`);
       } catch (error) {
         const reason = describe(error).split("\n", 1)[0]!;
-        line(label, `${what}  does not simulate: ${reason}`);
-        waiting.push(`the ${label} on ${chain.name} does not simulate: ${reason}`);
+        line(step, `${what}  does not simulate: ${reason}`);
+        waiting.push(`the ${step} on ${label} does not simulate: ${reason}`);
       }
       if (isBurn) {
-        line("", `${formatEvmAmount(amount)} USDC to Stellar by fast transfer, fee cap ${formatEvmAmount(maxFee)} USDC`);
+        const speed = defaultFinalityOf(evm) === FAST_FINALITY ? "fast transfer" : "standard transfer, attested within seconds";
+        line("", `${formatEvmAmount(amount)} USDC to Stellar by ${speed}, fee cap ${formatEvmAmount(maxFee)} USDC`);
         if (asIfFunded) line("", "simulated as if the payer already held the USDC and had approved it");
         if (!hasHub) line("", "simulated towards a placeholder: the account address follows from the hub");
       }
-    }
-    if (held < amount) {
-      waiting.push(`${payer} holds ${formatEvmAmount(held)} USDC on ${chain.name} and needs ${formatEvmAmount(amount)}`);
     }
   }
 
@@ -1157,17 +1090,34 @@ async function planBase(
       args: [incompressible(BURN_MESSAGE_BYTES), incompressible(ATTESTATION_BYTES)],
     });
     gas += MINT_GAS_ALLOWANCE;
-    dataFee += await base.estimateL1Fee({ account: payer, to: messageTransmitter, data, gas: MINT_GAS_ALLOWANCE });
-    line("mint", `MessageTransmitter.receiveMessage  ${MINT_GAS_ALLOWANCE} gas allowed`);
+    posted += await dataFee(reader, evm, { account: payer, to: messageTransmitter, data, gas: MINT_GAS_ALLOWANCE });
+    line("mint", `MessageTransmitter ${messageTransmitter}.receiveMessage  ${MINT_GAS_ALLOWANCE} gas allowed`);
     line("", "not simulated: it needs Circle's attestation of the exit");
   }
 
-  const { maxFeePerGas } = await base.estimateFeesPerGas();
-  const needsEth = 2n * (gas * maxFeePerGas + dataFee);
-  line("gas", `${formatGwei(maxFeePerGas)} gwei at most, and ${formatEther(dataFee)} ETH for the data posted to Ethereum`);
-  line("needs", `${formatEther(needsEth)} ETH, twice what these transactions come to${arriving > 0n ? `, and ${formatEvmAmount(amount)} USDC` : ""}`);
-  if (eth < needsEth) {
-    waiting.push(`${payer} holds ${formatEther(eth)} ETH on ${chain.name} and needs ${formatEther(needsEth)}`);
+  const { maxFeePerGas } = await reader.estimateFeesPerGas();
+  const needsGas = 2n * (gas * maxFeePerGas + posted);
+  const usdcNeeded = burning ? amount : 0n;
+  line(
+    "gas",
+    `${formatGwei(maxFeePerGas)} gwei at most` + (chargesDataFee(evm) ? `, and ${formatGas(posted, evm)} for the data posted to Ethereum` : ""),
+  );
+  const faucet = (what: "usdc" | "gas") => (evm.faucets ? ` (${evm.faucets[what]})` : "");
+  if (gasToken.isUsdc) {
+    // One balance pays both: the USDC that leaves and the gas, counted natively in 18 decimals.
+    const needs = evmUnitsToNativeUsdc(usdcNeeded) + needsGas;
+    line("needs", `${formatGas(needs, evm)}: ${formatEvmAmount(usdcNeeded)} USDC to send and ${formatGas(needsGas, evm)} for gas, twice what it comes to`);
+    if (native < needs) {
+      waiting.push(`${payer} holds ${formatGas(native, evm)} on ${label} and needs ${formatGas(needs, evm)}${faucet("usdc")}`);
+    }
+  } else {
+    line("needs", `${formatGas(needsGas, evm)}, twice what these transactions come to${usdcNeeded > 0n ? `, and ${formatEvmAmount(usdcNeeded)} USDC` : ""}`);
+    if (held < usdcNeeded) {
+      waiting.push(`${payer} holds ${formatEvmAmount(held)} USDC on ${label} and needs ${formatEvmAmount(usdcNeeded)}${faucet("usdc")}`);
+    }
+    if (native < needsGas) {
+      waiting.push(`${payer} holds ${formatGas(native, evm)} on ${label} and needs ${formatGas(needsGas, evm)}${faucet("gas")}`);
+    }
   }
   return arriving;
 }
@@ -1184,6 +1134,7 @@ function incompressible(length: number): Hex {
 /** What the fee payer sends on Stellar and what it has to hold for it. */
 async function planStellar(
   config: NetworkConfig,
+  evm: EvmChainConfig,
   server: rpc.Server,
   { owner, source }: Parties,
   options: Options,
@@ -1232,9 +1183,9 @@ async function planStellar(
       if (!exits) line("exit", "nothing to send");
       else if (held < leaving) line("exit", `hub.exit  ${unfunded}`);
       else {
-        const exit: Action = { kind: "exit", amount: options.exit, recipient: owner };
+        const exit: Action = { kind: "exit", amount: options.exit, recipient: owner, destinationChain: evm.name };
         await estimate("exit", `hub.exit of ${formatStellarAmount(options.exit)} USDC`, await buildOperation(exit, context));
-        line("", `to ${owner} on ${config.evm.chain.name}`);
+        line("", `to ${owner} on ${evm.label}, CCTP domain ${evm.cctpDomain}`);
       }
       // What a resumed burn delivers is known once Circle's attestation has been read, which the run does.
       if (!options.resumeBurn && held + arriving < leaving) {
@@ -1266,30 +1217,43 @@ async function planStellar(
  */
 async function plan(
   config: NetworkConfig,
+  evm: EvmChainConfig,
   server: rpc.Server,
   options: Options,
   parties: Parties,
 ): Promise<string[]> {
   const waiting: string[] = [];
-  const { evm, stellar } = config;
+  const { stellar } = config;
 
   heading("Circle's contracts, read from both chains");
-  await checkStellarCircle(config, server);
+  await checkStellarCircle(config, server, evm, line);
   let arriving = 0n;
   if (!options.stellarOnly) {
-    const base = baseReader(config);
-    await checkBaseCircle(config, base);
-    const inbound = await fetchBurnFee(evm.cctpDomain, stellar.cctpDomain, config);
-    const outbound = await fetchBurnFee(stellar.cctpDomain, evm.cctpDomain, config);
-    line("circle", `fast transfers cost ${inbound} bps towards Stellar and ${outbound} bps back (${config.irisUrl})`);
+    const reader = evmReader(evm);
+    await checkEvmCircle(config, evm, reader);
+    reportEvmCircle(evm, line);
+    const inboundFinality = defaultFinalityOf(evm);
+    const inbound = await fetchBurnFee(evm.cctpDomain, stellar.cctpDomain, config, { finalityThreshold: inboundFinality });
+    const outbound = await fetchBurnFee(stellar.cctpDomain, evm.cctpDomain, config, { finalityThreshold: FAST_FINALITY });
+    const towards = inboundFinality === FAST_FINALITY ? "a fast transfer" : `a standard transfer (${evm.label} has no fast transfer)`;
+    line("circle", `${towards} costs ${inbound} bps towards Stellar; a fast transfer back costs ${outbound} bps (${config.irisUrl})`);
 
-    heading(`${evm.chain.name}: what the payer sends`);
-    arriving = await planBase(config, base, parties, options, waiting);
+    heading(`${evm.label}: what the payer sends`);
+    arriving = await planEvm(config, evm, reader, parties, options, waiting);
   }
 
   heading("Stellar: what the fee payer sends");
-  await planStellar(config, server, parties, options, arriving, waiting);
+  await planStellar(config, evm, server, parties, options, arriving, waiting);
   return waiting;
+}
+
+/** The EVM side of a run and Circle's contracts on it. */
+function showChain(evm: EvmChainConfig): void {
+  const gas = evm.gasToken.isUsdc ? "gas paid in USDC, out of the same balance" : `gas paid in ${evm.gasToken.symbol}`;
+  console.log(`    chain      ${evm.label}, chain id ${evm.chain.id}, CCTP domain ${evm.cctpDomain}, ${gas}`);
+  console.log(`    contracts  USDC ${evm.usdc} (${evm.usdcDecimals} decimals)`);
+  console.log(`               TokenMessengerV2 ${evm.tokenMessenger}`);
+  console.log(`               MessageTransmitterV2 ${evm.messageTransmitter}`);
 }
 
 function report(waiting: string[]): void {
@@ -1298,7 +1262,7 @@ function report(waiting: string[]): void {
 }
 
 /** Every read and simulation of a run, and nothing else. */
-async function dryRun(config: NetworkConfig, server: rpc.Server, options: Options): Promise<void> {
+async function dryRun(config: NetworkConfig, evm: EvmChainConfig, server: rpc.Server, options: Options): Promise<void> {
   const ownerKey = privateKey("PASO_E2E_OWNER_KEY");
   const secret = process.env.PASO_E2E_SOURCE_SECRET?.trim();
   const owner =
@@ -1321,9 +1285,10 @@ async function dryRun(config: NetworkConfig, server: rpc.Server, options: Option
     console.log(`    deployed   ${(await isDeployed(owner, config, server)) ? "yes" : "no"}`);
   }
   console.log(`    fees       paid by ${source}`);
+  showChain(evm);
 
-  const payer = basePayer(config)?.address ?? owner;
-  const waiting = await plan(config, server, options, { owner, payer, source });
+  const payer = evmPayer(config)?.address ?? owner;
+  const waiting = await plan(config, evm, server, options, { owner, payer, source });
   if (waiting.length > 0) report(waiting);
   else console.log("\nA run can start: both accounts hold what it needs.");
   console.log("\nNothing was sent.");
@@ -1337,9 +1302,10 @@ async function main(): Promise<void> {
   if (!mainnet && existsSync(envFile)) process.loadEnvFile(envFile);
 
   const config = resolveNetwork(options.network);
+  const evm = evmChain(config, options.chain);
   const server = new rpc.Server(config.stellar.rpcUrl);
   if (options.dryRun) {
-    await dryRun(config, server, options);
+    await dryRun(config, evm, server, options);
     return;
   }
 
@@ -1347,7 +1313,7 @@ async function main(): Promise<void> {
   if (!options.stellarOnly && !ownerKey && options.fund === "burn") {
     usage(
       mainnet
-        ? "Set PASO_E2E_OWNER_KEY to the key that owns the account and pays on Base"
+        ? `Set PASO_E2E_OWNER_KEY to the key that owns the account and pays on ${evm.label}`
         : "Set PASO_E2E_OWNER_KEY, or use --relayer <url> --fund demo to start from a fresh key",
     );
   }
@@ -1364,6 +1330,7 @@ async function main(): Promise<void> {
 
   const run: Run = {
     config,
+    evm,
     server,
     options,
     owner,
@@ -1378,11 +1345,12 @@ async function main(): Promise<void> {
   console.log(`               ${stellarAddressUrl(run.account, config)}`);
   console.log(`    deployed   ${(await isDeployed(owner.address, config, server)) ? "yes" : "no"}`);
   console.log(`    fees       ${run.relayerUrl ? `paid by the relayer at ${run.relayerUrl}` : `paid by ${source!.publicKey()}`}`);
+  if (!options.stellarOnly) showChain(evm);
 
   // Real funds: nothing is sent until both chains and both accounts have been looked at.
   if (mainnet) {
     const parties = { owner: owner.address, payer: owner.address, source: source!.publicKey() };
-    const waiting = await plan(config, server, options, parties);
+    const waiting = await plan(config, evm, server, options, parties);
     if (waiting.length > 0) {
       report(waiting);
       throw new Error("Nothing was sent.");
