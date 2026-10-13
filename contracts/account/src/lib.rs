@@ -14,6 +14,8 @@ mod eip712;
 mod render;
 
 #[cfg(test)]
+mod audit;
+#[cfg(test)]
 mod test;
 
 use soroban_sdk::{

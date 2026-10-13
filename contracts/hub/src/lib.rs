@@ -11,6 +11,8 @@
 #![no_std]
 
 #[cfg(test)]
+mod audit;
+#[cfg(test)]
 mod test;
 
 use soroban_sdk::{
