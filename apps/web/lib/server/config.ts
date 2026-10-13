@@ -1,4 +1,4 @@
-import { NETWORKS, type NetworkConfig, type NetworkName } from "@paso/sdk";
+import { NETWORKS, type NetworkConfig, type NetworkName } from "paso-sdk";
 import { Keypair } from "@stellar/stellar-sdk";
 import { isHex, size } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";

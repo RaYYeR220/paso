@@ -1,4 +1,4 @@
-import type { NetworkName } from "@paso/sdk";
+import type { NetworkName } from "paso-sdk";
 import { defaultNetwork } from "./config";
 import { ApiError, ConfigError } from "./errors";
 import { clientIdentity, createLimiter } from "./ratelimit";

@@ -13,8 +13,8 @@ const ENS_NAME = /^[^\s/]+\.eth$/i;
 
 type Derived = { address: string; account: string | null };
 
-let sdk: Promise<typeof import("@paso/sdk")> | undefined;
-const loadSdk = () => (sdk ??= import("@paso/sdk"));
+let sdk: Promise<typeof import("paso-sdk")> | undefined;
+const loadSdk = () => (sdk ??= import("paso-sdk"));
 
 /** A Stellar address in two halves, so it breaks in the middle when there is room for that. */
 function Account({ value }: { value: string }) {

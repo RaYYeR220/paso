@@ -1,4 +1,4 @@
-import { RelayError, SimulationError } from "@paso/sdk";
+import { RelayError, SimulationError } from "paso-sdk";
 import { describe, expect, it } from "vitest";
 import { ApiFailure, faucetStatus, relayerStatus, type HealthResponse, type RelayerReport } from "@/lib/client/api";
 import { NameNotFoundError } from "@/lib/client/ens";

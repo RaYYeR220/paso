@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { evmChain, formatEvmAmount, isEvmChainName, NETWORKS, parseEvmAmount, twinAddress, type NetworkName } from "@paso/sdk";
+import { evmChain, formatEvmAmount, isEvmChainName, NETWORKS, parseEvmAmount, twinAddress, type NetworkName } from "paso-sdk";
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { concat, getAddress, isAddress, keccak256, stringToHex, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";

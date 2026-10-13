@@ -159,7 +159,7 @@ jobs:
         run: pnpm build:sdk
 
       - name: Type-check the SDK
-        run: pnpm --filter @paso/sdk typecheck
+        run: pnpm --filter paso-sdk typecheck
 
       - name: Test without a network
         env:

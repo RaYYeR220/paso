@@ -1,4 +1,4 @@
-import { listEvmChains } from "@paso/sdk";
+import { listEvmChains } from "paso-sdk";
 import type { Chain } from "viem";
 import { createConfig, fallback, http, type Transport } from "wagmi";
 import { coinbaseWallet, injected } from "wagmi/connectors";

@@ -11,7 +11,7 @@ import {
   type ExitTransfer,
   type SubmitMint,
 } from "@/lib/client/exit";
-import { NETWORKS } from "@paso/sdk";
+import { NETWORKS } from "paso-sdk";
 import { memoryStorage, type KeyValueStore } from "@/lib/client/storage";
 import inbound from "../fixtures/delivered-message.json";
 import exitFixture from "../fixtures/exit-message.json";

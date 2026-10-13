@@ -8,7 +8,7 @@ import {
   usdcBalance,
   type EvmChainName,
   type NetworkName,
-} from "@paso/sdk";
+} from "paso-sdk";
 import { createPublicClient, fallback, http, type Address, type PublicClient } from "viem";
 import { createActionController, type ActionController } from "./action/controller";
 import { loadChainActivity, type ChainActivity } from "./activity/events";

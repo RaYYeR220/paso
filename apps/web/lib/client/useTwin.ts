@@ -1,6 +1,6 @@
 "use client";
 
-import { twinAddress, type NetworkName } from "@paso/sdk";
+import { twinAddress, type NetworkName } from "paso-sdk";
 import { useCallback, useMemo, useSyncExternalStore } from "react";
 import type { Address } from "viem";
 import { networkConfig } from "./config";

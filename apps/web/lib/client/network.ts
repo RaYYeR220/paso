@@ -1,4 +1,4 @@
-import type { NetworkName } from "@paso/sdk";
+import type { NetworkName } from "paso-sdk";
 import { removeKey, type KeyValueStore } from "./storage";
 import { createStore, type Listener } from "./store";
 

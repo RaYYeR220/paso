@@ -1,4 +1,4 @@
-import { NETWORKS, type NetworkName } from "@paso/sdk";
+import { NETWORKS, type NetworkName } from "paso-sdk";
 import { Account, Keypair, SorobanDataBuilder, StrKey, xdr } from "@stellar/stellar-sdk";
 import type { Address } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
@@ -696,7 +696,7 @@ describe("finishing an exit where the server does not pay for the mint", () => {
     };
     const reverting = async (): Promise<bigint> => {
       const { ContractFunctionRevertedError } = await import("viem");
-      const { messageTransmitterAbi } = await import("@paso/sdk");
+      const { messageTransmitterAbi } = await import("paso-sdk");
       throw new ContractFunctionRevertedError({ abi: messageTransmitterAbi, functionName: "receiveMessage", message: "Invalid attestation signature" });
     };
 

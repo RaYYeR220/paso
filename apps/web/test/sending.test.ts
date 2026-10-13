@@ -1,4 +1,4 @@
-import { twinAddress } from "@paso/sdk";
+import { twinAddress } from "paso-sdk";
 import { Account, Keypair, SorobanDataBuilder, xdr } from "@stellar/stellar-sdk";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it, vi } from "vitest";

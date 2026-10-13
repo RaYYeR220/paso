@@ -1,4 +1,4 @@
-import type { RelayErrorCode } from "@paso/sdk";
+import type { RelayErrorCode } from "paso-sdk";
 
 export type ApiErrorCode = RelayErrorCode | "not_found";
 

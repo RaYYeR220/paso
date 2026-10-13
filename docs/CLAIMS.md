@@ -174,7 +174,7 @@ The contracts and the signed format are unchanged. These are checks in this proj
 - **An exit that cannot be blocked.** Every `hub.exit` reaches Circle with the hub as caller. If Circle blocks the hub, `exit` stops for every account; funds stay in the accounts, and an account can still call Circle's contract itself.
 - **Typical mainnet fees.** The mainnet figures are one or two samples each, from two runs.
 - **Load.** No load test has been run.
-- **A published package.** `@paso/sdk` is not on npm.
+- **A published package.** `paso-sdk` is not on npm.
 - **Privacy.** Owner addresses, account addresses and calls are public.
 
 ## Statements about other projects

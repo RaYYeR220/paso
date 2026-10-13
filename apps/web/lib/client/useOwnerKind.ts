@@ -1,6 +1,6 @@
 "use client";
 
-import type { OwnerKind } from "@paso/sdk";
+import type { OwnerKind } from "paso-sdk";
 import { useEffect, useState } from "react";
 import type { Address } from "viem";
 import { checkOwner } from "./ownerCheck";

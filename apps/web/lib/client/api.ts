@@ -1,4 +1,4 @@
-import type { InboundRoute, NetworkName } from "@paso/sdk";
+import type { InboundRoute, NetworkName } from "paso-sdk";
 import type { Address, Hex } from "viem";
 import { ROUTES } from "./config";
 

@@ -1,4 +1,4 @@
-import { NETWORKS, ownerKind, type OwnerChain, type OwnerCheck } from "@paso/sdk";
+import { NETWORKS, ownerKind, type OwnerChain, type OwnerCheck } from "paso-sdk";
 import type { Address } from "viem";
 import { mainnet } from "viem/chains";
 import { MAINNET_RPC_URLS } from "./ens";

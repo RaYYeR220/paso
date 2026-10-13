@@ -1,4 +1,4 @@
-import { isDeployed, twinAddress } from "@paso/sdk";
+import { isDeployed, twinAddress } from "paso-sdk";
 import { rpc } from "@stellar/stellar-sdk";
 import { privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it } from "vitest";

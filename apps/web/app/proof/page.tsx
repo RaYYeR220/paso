@@ -1,4 +1,4 @@
-import { listEvmChains, STELLAR_CCTP_DOMAIN } from "@paso/sdk";
+import { listEvmChains, STELLAR_CCTP_DOMAIN } from "paso-sdk";
 import type { Metadata } from "next";
 import { Suspense } from "react";
 import { AccountPair, AppShell, ExternalLink, TopBar } from "@/components/app";

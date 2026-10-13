@@ -1,4 +1,4 @@
-import { DEFAULT_EVM_CHAIN, type NetworkConfig } from "@paso/sdk";
+import { DEFAULT_EVM_CHAIN, type NetworkConfig } from "paso-sdk";
 import { chainOf } from "../chains";
 import { evmTx, stellarAddress, stellarTx } from "../explorer";
 import { formatUsdc, shortAddress } from "../format";

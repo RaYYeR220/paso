@@ -1,4 +1,4 @@
-import { DEFAULT_EVM_CHAIN, parseStellarAmount, twinAddress, type Action, type NetworkConfig } from "@paso/sdk";
+import { DEFAULT_EVM_CHAIN, parseStellarAmount, twinAddress, type Action, type NetworkConfig } from "paso-sdk";
 import { chainOf } from "../chains";
 import type { Address } from "viem";
 import { NameNotFoundError } from "../ens";

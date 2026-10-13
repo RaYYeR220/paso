@@ -1,4 +1,4 @@
-import { decodeBurnMessage, listEvmChains, NETWORKS } from "@paso/sdk";
+import { decodeBurnMessage, listEvmChains, NETWORKS } from "paso-sdk";
 import { Keypair } from "@stellar/stellar-sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { POST as deliverRoute } from "@/app/api/cctp/deliver/route";

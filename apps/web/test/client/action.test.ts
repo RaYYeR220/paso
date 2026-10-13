@@ -1,4 +1,4 @@
-import { DEFAULT_VALIDITY_LEDGERS, networkId, prepare, RelayError, SimulationError, type PrepareOptions, type RelayResult, type Signed } from "@paso/sdk";
+import { DEFAULT_VALIDITY_LEDGERS, networkId, prepare, RelayError, SimulationError, type PrepareOptions, type RelayResult, type Signed } from "paso-sdk";
 import { nativeToScVal } from "@stellar/stellar-sdk";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it, vi } from "vitest";

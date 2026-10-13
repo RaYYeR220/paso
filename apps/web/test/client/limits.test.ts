@@ -1,4 +1,4 @@
-import { maxFeeFor } from "@paso/sdk";
+import { maxFeeFor } from "paso-sdk";
 import { describe, expect, it } from "vitest";
 import { burnAmountProblem, FAUCET_AMOUNT, WALLET_BURN_MIN } from "@/lib/client/funding/limits";
 import { isDiscovered, pickConnector, walletOptions, type ConnectorLike } from "@/lib/client/wallets";

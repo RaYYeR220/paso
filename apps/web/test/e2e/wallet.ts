@@ -1,4 +1,4 @@
-import { erc20Abi, listEvmChains, messageTransmitterAbi, tokenMessengerAbi, type EvmChainConfig, type NetworkConfig } from "@paso/sdk";
+import { erc20Abi, listEvmChains, messageTransmitterAbi, tokenMessengerAbi, type EvmChainConfig, type NetworkConfig } from "paso-sdk";
 import type { Page } from "@playwright/test";
 import {
   createPublicClient,

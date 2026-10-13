@@ -1,4 +1,4 @@
-import { evmAddressUrl, evmTxUrl, stellarAddressUrl, stellarTxUrl, type EvmChainName, type Network } from "@paso/sdk";
+import { evmAddressUrl, evmTxUrl, stellarAddressUrl, stellarTxUrl, type EvmChainName, type Network } from "paso-sdk";
 
 /**
  * Links to the block explorers. Each takes the network: the same hash or

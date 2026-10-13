@@ -1,8 +1,29 @@
 {
-  "name": "@paso/sdk",
+  "name": "paso-sdk",
   "version": "0.1.0",
   "description": "Derive, fund and control the Stellar account that belongs to an Ethereum address.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RaYYeR220/paso.git",
+    "directory": "packages/sdk"
+  },
+  "homepage": "https://github.com/RaYYeR220/paso/tree/main/packages/sdk#readme",
+  "bugs": {
+    "url": "https://github.com/RaYYeR220/paso/issues"
+  },
+  "keywords": [
+    "stellar",
+    "soroban",
+    "ethereum",
+    "eip-712",
+    "cctp",
+    "usdc",
+    "account-abstraction"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
   "type": "module",
   "sideEffects": false,
   "main": "./dist/index.js",

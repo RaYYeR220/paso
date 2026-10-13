@@ -1,4 +1,4 @@
-import { isDeployed, relayRequest, twinAddress, withArgument, type RelayRequest, type Signed } from "@paso/sdk";
+import { isDeployed, relayRequest, twinAddress, withArgument, type RelayRequest, type Signed } from "paso-sdk";
 import { Address, Keypair, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { beforeAll, describe, expect, it } from "vitest";

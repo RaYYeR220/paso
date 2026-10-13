@@ -1,4 +1,4 @@
-import type { NetworkName } from "@paso/sdk";
+import type { NetworkName } from "paso-sdk";
 import { isAddressEqual, recoverTypedDataAddress, size, type Address, type Hex } from "viem";
 import type { KeyValueStore } from "./storage";
 

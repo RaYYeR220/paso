@@ -1,6 +1,6 @@
 "use client";
 
-import { DEFAULT_EVM_CHAIN, receiveMessageOnEvm, type EvmChainConfig, type NetworkName } from "@paso/sdk";
+import { DEFAULT_EVM_CHAIN, receiveMessageOnEvm, type EvmChainConfig, type NetworkName } from "paso-sdk";
 import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import { chainOf } from "./chains";
 import { networkConfig } from "./config";

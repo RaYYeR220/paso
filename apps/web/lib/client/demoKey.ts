@@ -1,4 +1,4 @@
-import type { NetworkName } from "@paso/sdk";
+import type { NetworkName } from "paso-sdk";
 import type { Hex } from "viem";
 import { generatePrivateKey } from "viem/accounts";
 import { removeKey, type KeyValueStore } from "./storage";

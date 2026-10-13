@@ -7,7 +7,7 @@ import {
   RelayError,
   type PrepareOptions,
   type RelayResult,
-} from "@paso/sdk";
+} from "paso-sdk";
 import { nativeToScVal } from "@stellar/stellar-sdk";
 import { describe, expect, it, vi } from "vitest";
 import { parseArguments } from "@/lib/client/action/args";

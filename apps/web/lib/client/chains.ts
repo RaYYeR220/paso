@@ -6,7 +6,7 @@ import {
   type EvmChainConfig,
   type EvmChainName,
   type Network,
-} from "@paso/sdk";
+} from "paso-sdk";
 
 /**
  * The EVM chains USDC comes from and goes back to. Each network lists its

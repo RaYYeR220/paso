@@ -1,4 +1,4 @@
-import { prepare, sign, twinAddress, NETWORKS, type Signed } from "@paso/sdk";
+import { prepare, sign, twinAddress, NETWORKS, type Signed } from "paso-sdk";
 import { Address, nativeToScVal, rpc } from "@stellar/stellar-sdk";
 import type { PrivateKeyAccount } from "viem/accounts";
 

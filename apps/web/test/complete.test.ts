@@ -1,4 +1,4 @@
-import { evmChain, messageTransmitterAbi, NETWORKS } from "@paso/sdk";
+import { evmChain, messageTransmitterAbi, NETWORKS } from "paso-sdk";
 import { Keypair } from "@stellar/stellar-sdk";
 import { ContractFunctionRevertedError, getAddress } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";

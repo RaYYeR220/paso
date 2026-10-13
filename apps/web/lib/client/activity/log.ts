@@ -1,4 +1,4 @@
-import { isEvmChainName, type EvmChainName, type NetworkName } from "@paso/sdk";
+import { isEvmChainName, type EvmChainName, type NetworkName } from "paso-sdk";
 import { readJson, writeJson, type KeyValueStore } from "../storage";
 import { createStore, type Listener } from "../store";
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { formatAmount, type NetworkName } from "@paso/sdk";
+import { formatAmount, type NetworkName } from "paso-sdk";
 import { ExternalLink, Skeleton } from "@/components/app";
 import { SCRIPTS_URL } from "@/components/app/site";
 import { networkConfig, networkLabel, stellarAddress, useHealth, type NetworkHealth } from "@/lib/client";

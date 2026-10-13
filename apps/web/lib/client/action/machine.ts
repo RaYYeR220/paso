@@ -1,4 +1,4 @@
-import type { Call, DescribedCall, EvmChainName, NetworkName, OwnerKind, Prepared } from "@paso/sdk";
+import type { Call, DescribedCall, EvmChainName, NetworkName, OwnerKind, Prepared } from "paso-sdk";
 import type { xdr } from "@stellar/stellar-sdk";
 import type { Address } from "viem";
 import type { ProblemError } from "../errors";

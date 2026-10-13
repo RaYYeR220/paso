@@ -11,7 +11,7 @@ import {
   type FundFromEvmResult,
   type NetworkConfig,
   type NetworkName,
-} from "@paso/sdk";
+} from "paso-sdk";
 import type { Address, Hex, PublicClient, WalletClient } from "viem";
 import type { ActivityLog, LogStatus } from "../activity/log";
 import type { DeclineReason, DeliverResponse, PasoApi } from "../api";

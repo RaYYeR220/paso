@@ -1,4 +1,4 @@
-import type { NetworkConfig } from "@paso/sdk";
+import type { NetworkConfig } from "paso-sdk";
 import { Address, scValToNative, xdr, type rpc } from "@stellar/stellar-sdk";
 
 /** A USDC movement in or out of an account, read from the token's events. */

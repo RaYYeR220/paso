@@ -1,4 +1,4 @@
-import type { NetworkName } from "@paso/sdk";
+import type { NetworkName } from "paso-sdk";
 import Link from "next/link";
 
 export interface TopBarProps {

@@ -1,4 +1,4 @@
-import type { NetworkName } from "@paso/sdk";
+import type { NetworkName } from "paso-sdk";
 
 /** The pages of the app that every top bar links to. */
 export const SITE_LINKS = [

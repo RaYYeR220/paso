@@ -1,4 +1,4 @@
-import { networkId, NETWORKS, prepare, twinAddress, type Prepared, type PrepareOptions, type RelayResult, type Signed } from "@paso/sdk";
+import { networkId, NETWORKS, prepare, twinAddress, type Prepared, type PrepareOptions, type RelayResult, type Signed } from "paso-sdk";
 import { nativeToScVal } from "@stellar/stellar-sdk";
 import { describe, expect, it, vi } from "vitest";
 import { createActionController, type ActionDeps } from "@/lib/client/action/controller";

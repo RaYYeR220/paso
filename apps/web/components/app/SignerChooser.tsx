@@ -1,4 +1,4 @@
-import type { NetworkName } from "@paso/sdk";
+import type { NetworkName } from "paso-sdk";
 import type { ReactNode } from "react";
 
 export interface WalletOption {

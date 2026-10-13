@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { describeError } from "@/lib/client/errors";
 import { isKeyProven, keyProofStorageKey, keyProofTypedData, markKeyProven, proveKey } from "@/lib/client/keyProof";
 import { memoryStorage } from "@/lib/client/storage";
-import { NETWORKS, typedData as authorization } from "@paso/sdk";
+import { NETWORKS, typedData as authorization } from "paso-sdk";
 import { owner } from "./helpers";
 
 describe("showing that a wallet signs with a key", () => {

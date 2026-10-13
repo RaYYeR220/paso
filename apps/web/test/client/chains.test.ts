@@ -1,4 +1,4 @@
-import { prepare, type FundFromEvmArgs, type FundFromEvmResult, type PrepareOptions, type RelayResult } from "@paso/sdk";
+import { prepare, type FundFromEvmArgs, type FundFromEvmResult, type PrepareOptions, type RelayResult } from "paso-sdk";
 import type { Hex } from "viem";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createActionController, type ActionDeps } from "@/lib/client/action/controller";

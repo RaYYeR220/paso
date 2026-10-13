@@ -1,4 +1,4 @@
-import type { RelayErrorCode } from "@paso/sdk";
+import type { RelayErrorCode } from "paso-sdk";
 
 /**
  * What went wrong, in words a person can act on.

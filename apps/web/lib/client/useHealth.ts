@@ -1,6 +1,6 @@
 "use client";
 
-import type { NetworkName } from "@paso/sdk";
+import type { NetworkName } from "paso-sdk";
 import { useCallback, useMemo, useSyncExternalStore } from "react";
 import { faucetStatus, relayerStatus, type FaucetStatus, type HealthResponse, type NetworkHealth, type RelayerStatus } from "./api";
 import { healthResource } from "./registry";

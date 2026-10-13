@@ -1,6 +1,6 @@
 "use client";
 
-import { parseEvmAmount, type EvmChainConfig, type EvmChainName, type NetworkName } from "@paso/sdk";
+import { parseEvmAmount, type EvmChainConfig, type EvmChainName, type NetworkName } from "paso-sdk";
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type { Hex } from "viem";
 import { chainOf, chainsOf, FAUCET_CHAIN } from "./chains";

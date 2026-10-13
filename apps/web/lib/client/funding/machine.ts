@@ -1,4 +1,4 @@
-import type { EvmChainName, InboundRoute, NetworkName } from "@paso/sdk";
+import type { EvmChainName, InboundRoute, NetworkName } from "paso-sdk";
 import type { Address, Hex } from "viem";
 import type { DeclineReason } from "../api";
 

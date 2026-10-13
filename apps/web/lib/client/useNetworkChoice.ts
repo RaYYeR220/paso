@@ -1,6 +1,6 @@
 "use client";
 
-import type { NetworkName } from "@paso/sdk";
+import type { NetworkName } from "paso-sdk";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import {

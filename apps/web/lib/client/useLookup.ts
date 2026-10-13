@@ -1,6 +1,6 @@
 "use client";
 
-import type { NetworkName } from "@paso/sdk";
+import type { NetworkName } from "paso-sdk";
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type { Address } from "viem";
 import { resolveEnsName } from "./ens";

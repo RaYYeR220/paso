@@ -1,6 +1,6 @@
 "use client";
 
-import { formatEvmAmount } from "@paso/sdk";
+import { formatEvmAmount } from "paso-sdk";
 import { MAINNET_BURN_CEILING, type NetworkChoice } from "@/lib/client";
 import { MainnetConfirm, MainnetStrip } from "./Mainnet";
 import { SITE_LINKS } from "./site";

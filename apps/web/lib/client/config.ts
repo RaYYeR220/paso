@@ -1,4 +1,4 @@
-import { NETWORKS, type NetworkConfig, type NetworkName } from "@paso/sdk";
+import { NETWORKS, type NetworkConfig, type NetworkName } from "paso-sdk";
 import { rpc } from "@stellar/stellar-sdk";
 
 /**

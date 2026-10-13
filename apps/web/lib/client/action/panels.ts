@@ -1,4 +1,4 @@
-import { saltNetwork, type ArgConcern, type Call, type DescribedCall } from "@paso/sdk";
+import { saltNetwork, type ArgConcern, type Call, type DescribedCall } from "paso-sdk";
 import type { Hex } from "viem";
 
 /** The message a signature is about: what the wallet displays, and what the account contract rebuilds. */

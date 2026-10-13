@@ -1,4 +1,4 @@
-import { formatEvmAmount, type EvmChainConfig, type NetworkName } from "@paso/sdk";
+import { formatEvmAmount, type EvmChainConfig, type NetworkName } from "paso-sdk";
 
 /**
  * What the testnet faucet sends per request: 1 USDC, in 6-decimal units, on

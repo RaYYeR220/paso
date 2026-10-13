@@ -9,7 +9,7 @@ import {
   type NetworkName,
   type RelayRequest,
   type Signed,
-} from "@paso/sdk";
+} from "paso-sdk";
 import { Account, Address, Keypair, nativeToScVal, SorobanDataBuilder, xdr, type rpc } from "@stellar/stellar-sdk";
 import { generatePrivateKey, privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import { afterEach, describe, expect, it, vi } from "vitest";

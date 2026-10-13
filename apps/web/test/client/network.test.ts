@@ -1,4 +1,4 @@
-import { NETWORKS, twinAddress } from "@paso/sdk";
+import { NETWORKS, twinAddress } from "paso-sdk";
 import { describe, expect, it } from "vitest";
 import { activityLogKey } from "@/lib/client/activity/log";
 import { DEMO_KEY_STORAGE, ensureDemoKey, loadDemoKey } from "@/lib/client/demoKey";

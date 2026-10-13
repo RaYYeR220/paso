@@ -1,6 +1,6 @@
 "use client";
 
-import type { Call, NetworkName } from "@paso/sdk";
+import type { Call, NetworkName } from "paso-sdk";
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type { SignOptions } from "./action/controller";
 import {

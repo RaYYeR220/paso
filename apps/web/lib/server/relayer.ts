@@ -35,7 +35,7 @@ import {
   type NetworkName,
   type RelayResult,
   type Signed,
-} from "@paso/sdk";
+} from "paso-sdk";
 import { createHash } from "node:crypto";
 import { Account, Operation, rpc, StrKey, TransactionBuilder, xdr } from "@stellar/stellar-sdk";
 import {

@@ -1,4 +1,4 @@
-import { decodeBurnMessage, DEFAULT_EVM_CHAIN, type EvmChainName, type NetworkConfig, type NetworkName } from "@paso/sdk";
+import { decodeBurnMessage, DEFAULT_EVM_CHAIN, type EvmChainName, type NetworkConfig, type NetworkName } from "paso-sdk";
 import { StrKey } from "@stellar/stellar-sdk";
 import { isHex, size, toHex, type Hex } from "viem";
 import { declineReason, type DeclineReason } from "./api";

@@ -1,4 +1,4 @@
-import { EVM_DECIMALS, STELLAR_DECIMALS } from "@paso/sdk";
+import { EVM_DECIMALS, STELLAR_DECIMALS } from "paso-sdk";
 
 const ELLIPSIS = "…";
 

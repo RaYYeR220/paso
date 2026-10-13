@@ -1,6 +1,6 @@
 "use client";
 
-import type { NetworkName } from "@paso/sdk";
+import type { NetworkName } from "paso-sdk";
 import { useCallback, useMemo, useSyncExternalStore } from "react";
 import type { ChainActivity } from "./activity/events";
 import type { LogEntry } from "./activity/log";

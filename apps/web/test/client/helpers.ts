@@ -1,4 +1,4 @@
-import { NETWORKS, twinAddress, type NetworkConfig } from "@paso/sdk";
+import { NETWORKS, twinAddress, type NetworkConfig } from "paso-sdk";
 import { Address, xdr, type rpc, type TransactionBuilder } from "@stellar/stellar-sdk";
 import type { Address as EvmAddress, Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";

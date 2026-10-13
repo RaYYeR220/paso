@@ -1,4 +1,4 @@
-import { NETWORKS, twinAddress, type FundFromEvmArgs, type FundFromEvmResult } from "@paso/sdk";
+import { NETWORKS, twinAddress, type FundFromEvmArgs, type FundFromEvmResult } from "paso-sdk";
 import type { Hex } from "viem";
 import { describe, expect, it, vi } from "vitest";
 import { ApiFailure, type DeliverResponse, type DemoFundResponse } from "@/lib/client/api";

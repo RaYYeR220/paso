@@ -9,8 +9,8 @@
   "scripts": {
     "build:contracts": "stellar contract build",
     "test:contracts": "stellar contract build && cargo test",
-    "build:sdk": "pnpm --filter @paso/sdk build",
-    "test:sdk": "pnpm --filter @paso/sdk test",
+    "build:sdk": "pnpm --filter paso-sdk build",
+    "test:sdk": "pnpm --filter paso-sdk test",
     "test": "pnpm test:contracts && pnpm test:sdk",
     "test:web": "pnpm --filter @paso/web test",
     "e2e": "tsx scripts/e2e.ts",

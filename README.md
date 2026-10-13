@@ -337,7 +337,7 @@ A new hub means new account addresses for everyone. Deploy one hub per network.
 ### Use the SDK
 
 ```ts
-import { parseStellarAmount, prepare, relay, sign, twinAddress } from "@paso/sdk";
+import { parseStellarAmount, prepare, relay, sign, twinAddress } from "paso-sdk";
 
 // owner: the 0x address. walletClient: a viem wallet client with that account set.
 const account = twinAddress(owner, "testnet"); // C…, no network call
@@ -351,7 +351,7 @@ const signed = await sign(prepared, walletClient); // the wallet shows prepared.
 const { hash } = await relay(signed, "https://example.org/api/relay");
 ```
 
-`@paso/sdk` is a workspace package and is not published to npm. Its API is documented in [packages/sdk/README.md](packages/sdk/README.md).
+`paso-sdk` is a workspace package and is not published to npm. Its API is documented in [packages/sdk/README.md](packages/sdk/README.md).
 
 ## Repository layout
 

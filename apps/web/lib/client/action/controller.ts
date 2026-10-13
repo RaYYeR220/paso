@@ -17,7 +17,7 @@ import {
   type RelayResult,
   type Signed,
   type TypedDataSigner,
-} from "@paso/sdk";
+} from "paso-sdk";
 import { nativeToScVal, xdr } from "@stellar/stellar-sdk";
 import { isAddressEqual, type Address } from "viem";
 import type { ActivityLog, LogEntry } from "../activity/log";

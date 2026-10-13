@@ -1,6 +1,6 @@
 "use client";
 
-import type { AuthorizationTypedData, EvmChainName, NetworkConfig, NetworkName } from "@paso/sdk";
+import type { AuthorizationTypedData, EvmChainName, NetworkConfig, NetworkName } from "paso-sdk";
 import { useMemo, useSyncExternalStore } from "react";
 import type { Address, Hex } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";

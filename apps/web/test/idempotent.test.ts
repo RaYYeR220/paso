@@ -1,4 +1,4 @@
-import { prepare, relayRequest, sign, twinAddress, type RelayRequest, type Signed } from "@paso/sdk";
+import { prepare, relayRequest, sign, twinAddress, type RelayRequest, type Signed } from "paso-sdk";
 import { Account, Address, Keypair, nativeToScVal, Operation, SorobanDataBuilder, TransactionBuilder, xdr, type rpc } from "@stellar/stellar-sdk";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it, vi } from "vitest";

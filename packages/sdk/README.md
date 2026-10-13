@@ -1,4 +1,4 @@
-# @paso/sdk
+# paso-sdk
 
 Every Ethereum address already has a Stellar account. This package finds it, funds it from Base, Ethereum, Arbitrum, OP Mainnet or Arc and lets the same Ethereum key control it.
 
@@ -8,12 +8,20 @@ Every Ethereum address already has a Stellar account. This package finds it, fun
 
 The wallet shows the real calls: contract, function and every argument as text. The account contract rebuilds that same text from what is about to execute and rejects the signature if anything differs.
 
+## Install
+
+```sh
+npm install paso-sdk viem
+```
+
+ESM only, Node 22.12 or later, or any modern bundler. The deployed contract ids for Stellar testnet and mainnet are built in.
+
 ## Usage
 
 ```ts
 import { createPublicClient, createWalletClient, custom, http } from "viem";
 import { baseSepolia } from "viem/chains";
-import { fundFromEvm, parseStellarAmount, prepare, relay, sign, twinAddress, waitForAttestation } from "@paso/sdk";
+import { fundFromEvm, parseStellarAmount, prepare, relay, sign, twinAddress, waitForAttestation } from "paso-sdk";
 
 const [owner] = await window.ethereum.request({ method: "eth_requestAccounts" });
 const walletClient = createWalletClient({ account: owner, chain: baseSepolia, transport: custom(window.ethereum) });
@@ -178,7 +186,7 @@ These simulate a read and need no account or fee:
 An account obeys one thing: a signature from the key of its owner address. An Ethereum address that is a contract (a Safe, a smart wallet) has no private key, so the Stellar account derived from it can receive USDC and never spend it. Nobody can tell the two apart by looking at the address.
 
 ```ts
-import { ownerKind } from "@paso/sdk";
+import { ownerKind } from "paso-sdk";
 
 const { kind, chains } = await ownerKind(owner);
 // kind: "wallet" | "contract" | "unknown"
@@ -245,9 +253,9 @@ Contract ids come from `deployments/<network>.json` at build time. Deriving an a
 ## Develop
 
 ```sh
-pnpm --filter @paso/sdk test
-pnpm --filter @paso/sdk typecheck
-pnpm --filter @paso/sdk build
+pnpm --filter paso-sdk test
+pnpm --filter paso-sdk typecheck
+pnpm --filter paso-sdk build
 ```
 
 The tests reach Stellar testnet once the hub is deployed there; set `PASO_OFFLINE=1` to skip those. Two more are opt-in:

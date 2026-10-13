@@ -1,4 +1,4 @@
-import { NETWORKS, twinAddress } from "@paso/sdk";
+import { NETWORKS, twinAddress } from "paso-sdk";
 import { Keypair } from "@stellar/stellar-sdk";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it, vi } from "vitest";

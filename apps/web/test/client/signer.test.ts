@@ -1,4 +1,4 @@
-import { prepare, sign } from "@paso/sdk";
+import { prepare, sign } from "paso-sdk";
 import { isAddressEqual, recoverTypedDataAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it } from "vitest";

@@ -1,4 +1,4 @@
-import { NETWORKS, prepare, twinAddress, type OwnerCheck, type OwnerKind, type PrepareOptions, type RelayResult } from "@paso/sdk";
+import { NETWORKS, prepare, twinAddress, type OwnerCheck, type OwnerKind, type PrepareOptions, type RelayResult } from "paso-sdk";
 import type { Address } from "viem";
 import { describe, expect, it, vi } from "vitest";
 import { createActionController, type ActionDeps, type RecipientCheck } from "@/lib/client/action/controller";

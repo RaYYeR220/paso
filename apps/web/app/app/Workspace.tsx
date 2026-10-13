@@ -1,6 +1,6 @@
 "use client";
 
-import { formatEvmAmount, isEvmChainName, type EvmChainConfig, type EvmChainName, type NetworkName } from "@paso/sdk";
+import { formatEvmAmount, isEvmChainName, type EvmChainConfig, type EvmChainName, type NetworkName } from "paso-sdk";
 import Link from "next/link";
 import { useState, type ReactNode } from "react";
 import type { Address } from "viem";
