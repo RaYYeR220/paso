@@ -65,7 +65,10 @@ describe("parseRecipient", () => {
   it("catches a Stellar address with a typo, and muxed addresses", () => {
     const typo = `${RECIPIENT.slice(0, -1)}${RECIPIENT.endsWith("A") ? "B" : "A"}`;
     expect(parseRecipient(typo)).toMatchObject({ kind: "invalid", reason: expect.stringMatching(/typo/) });
-    expect(parseRecipient(`M${"A".repeat(68)}`)).toMatchObject({ kind: "invalid", reason: expect.stringMatching(/Muxed/) });
+    expect(parseRecipient(`M${"A".repeat(68)}`)).toMatchObject({
+      kind: "invalid",
+      reason: "A wallet can show a muxed address (M…) only as a hash, so it is not taken as a recipient. Enter the G… address it stands for",
+    });
   });
 
   it("says what it takes when it gets nothing useful", () => {

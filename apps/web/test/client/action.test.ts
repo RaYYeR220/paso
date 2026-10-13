@@ -1,4 +1,4 @@
-import { prepare, RelayError, SimulationError, type PrepareOptions, type RelayResult, type Signed } from "@paso/sdk";
+import { DEFAULT_VALIDITY_LEDGERS, networkId, prepare, RelayError, SimulationError, type PrepareOptions, type RelayResult, type Signed } from "@paso/sdk";
 import { nativeToScVal } from "@stellar/stellar-sdk";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it, vi } from "vitest";
@@ -61,19 +61,24 @@ const answer = (code: ConstructorParameters<typeof RelayError>[0], status: numbe
 const notSent = (code: ConstructorParameters<typeof RelayError>[0], detail: string) => answer(code, 422, detail, { sent: false });
 
 const fixtureMessage: SignedMessage = {
+  salt: networkId(network),
   account: twin,
   calls: [{ contract: USDC, fn: "transfer", args: [twin, RECIPIENT, "5"] }],
   payload: "0x01",
 };
 const reviewFixture: Review = {
   request: transferRequest,
+  network: "testnet",
   owner: owner.address,
   prepared: { calls: fixtureMessage.calls } as Review["prepared"],
   calls: fixtureMessage.calls,
   message: fixtureMessage,
   recipient: null,
   amount: 5n,
+  cautions: [],
   preparedAt: 1,
+  validUntilLedger: LATEST_LEDGER + DEFAULT_VALIDITY_LEDGERS,
+  expiresAt: 120_001,
 };
 
 describe("the outbound flow", () => {
@@ -87,13 +92,14 @@ describe("the outbound flow", () => {
     expect(review.calls).toEqual([{ contract: USDC, fn: "transfer", args: [twin, RECIPIENT, "50000000"] }]);
     expect(review.calls).toBe(review.prepared.calls);
     expect(review.message).toEqual({
+      salt: networkId(network),
       account: twin,
       calls: review.calls,
       payload: review.prepared.typedData.message.payload,
     });
     expect(review.amount).toBe(50_000_000n);
     expect(review.recipient).toEqual({ input: RECIPIENT, kind: "stellar", stellar: RECIPIENT });
-    expect(review.prepared.validUntilLedger).toBe(LATEST_LEDGER + 120);
+    expect(review.prepared.validUntilLedger).toBe(LATEST_LEDGER + DEFAULT_VALIDITY_LEDGERS);
     expect(panelsOf(review)).toMatchObject({ verdict: "unsigned", contract: null, differingLines: [] });
 
     await controller.sign(owner);
@@ -626,8 +632,8 @@ describe("a call whose outcome was never learned", () => {
       await controller.prepare(transferRequest);
       await controller.sign(owner);
 
-      // Eleven minutes from the preparation, one request a minute.
-      expect(calls).toHaveLength(11);
+      // The signature lasts two minutes and the network gets half a minute more to say so: one request a minute.
+      expect(calls).toHaveLength(3);
       expect(new Set(calls).size).toBe(1);
       expect(controller.getState()).toMatchObject(neutral);
       expect(phases).not.toContain("refused");
@@ -717,16 +723,25 @@ describe("leaving the review", () => {
 });
 
 describe("actionReducer", () => {
-  const message: SignedMessage = { account: twin, calls: [{ contract: USDC, fn: "transfer", args: [twin, RECIPIENT, "5"] }], payload: "0x01" };
+  const message: SignedMessage = {
+    salt: networkId(network),
+    account: twin,
+    calls: [{ contract: USDC, fn: "transfer", args: [twin, RECIPIENT, "5"] }],
+    payload: "0x01",
+  };
   const review = {
     request: transferRequest,
+    network: "testnet",
     owner: owner.address,
     prepared: { calls: message.calls } as Review["prepared"],
     calls: message.calls,
     message,
     recipient: null,
     amount: 5n,
+    cautions: [],
     preparedAt: 1,
+    validUntilLedger: LATEST_LEDGER + DEFAULT_VALIDITY_LEDGERS,
+    expiresAt: 120_001,
   } satisfies Review;
   const problem: ProblemError = { kind: "error", code: "unavailable", message: "down", retryable: true };
   const run = (events: ActionEvent[], from: ActionState = IDLE_ACTION) => events.reduce(actionReducer, from);
@@ -806,6 +821,7 @@ describe("actionReducer", () => {
 
 describe("panels", () => {
   const shown: SignedMessage = {
+    salt: networkId(network),
     account: twin,
     calls: [{ contract: USDC, fn: "transfer", args: [twin, RECIPIENT, "50000000"] }],
     payload: "0xaa",
@@ -813,6 +829,7 @@ describe("panels", () => {
 
   it("lists the message line by line, in the order the wallet shows it", () => {
     expect(messageLines(shown).map(({ id, label, value }) => [id, label, value])).toEqual([
+      ["salt", "salt", networkId(network)],
       ["account", "account", twin],
       ["call.0.contract", "contract", USDC],
       ["call.0.fn", "fn", "transfer"],
@@ -831,6 +848,7 @@ describe("panels", () => {
 
   it("marks a changed function, a changed contract and lines only one side has", () => {
     const attempted: SignedMessage = {
+      salt: networkId(network),
       account: twin,
       calls: [
         { contract: HUB, fn: "exit", args: [twin, RECIPIENT] },

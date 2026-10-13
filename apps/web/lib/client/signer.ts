@@ -1,6 +1,6 @@
 "use client";
 
-import type { AuthorizationTypedData } from "@paso/sdk";
+import type { AuthorizationTypedData, NetworkConfig, NetworkName } from "@paso/sdk";
 import { useMemo, useSyncExternalStore } from "react";
 import type { Address, Hex } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
@@ -18,10 +18,11 @@ import {
   watchConnectors,
 } from "wagmi/actions";
 import type { AppChainId } from "../wagmi";
-import { NETWORK } from "./config";
-import { DEMO_LABEL, ensureDemoKey, forgetDemoKey, loadDemoKey } from "./demoKey";
+import { networkConfig } from "./config";
+import { DEMO_LABEL, DEMO_TESTNET_ONLY, demoAvailable, ensureDemoKey, forgetDemoKey, loadDemoKey } from "./demoKey";
 import { describeError } from "./errors";
 import type { EvmClients } from "./funding/controller";
+import { isKeyProven, markKeyProven, proveKey } from "./keyProof";
 import { browserStorage, removeKey } from "./storage";
 import { createStore } from "./store";
 import { isDiscovered, pickConnector, walletOptions, type WalletOption } from "./wallets";
@@ -31,7 +32,11 @@ export type { WalletOption } from "./wallets";
 export type SignerKind = "wallet" | "demo";
 export type SignerStatus = "disconnected" | "connecting" | "connected";
 
-/** Whatever signs for the account: a connected wallet, or the demo key. Fits the SDK's `sign`. */
+/**
+ * Whatever signs for the account: a connected wallet, or the demo key. Fits
+ * the SDK's `sign`. A signer belongs to a network: the demo key exists on
+ * testnet only, and a wallet brings USDC from that network's Base.
+ */
 export interface Signer {
   kind: SignerKind;
   /** The Ethereum address that owns the account, once connected. */
@@ -53,14 +58,28 @@ export interface WalletSigner extends Signer {
   /** Name of the connected wallet. */
   walletName: string | null;
   chainId: number | null;
-  /** True when the wallet is on the Base network USDC is brought from. Signing for Stellar works on any network. */
+  /** True when the wallet is on the network's Base, where USDC is brought from. Signing for Stellar works on any chain. */
   onBase: boolean;
-  /** The wallet on Base, switched there if need be, with a reader for Base: what a burn needs. */
+  /** The wallet on the network's Base, switched there if need be, with a reader for it: what a burn or a mint needs. */
   evmClients(): Promise<EvmClients>;
+  /**
+   * True once this browser has seen the wallet sign with its own key on this
+   * network. Until then it is offered no way to bring USDC over: an address
+   * without a key has an account that can receive and never spend.
+   */
+  keyProven: boolean;
+  /**
+   * Asks the wallet to sign the key check, a message that moves nothing, and
+   * verifies the signature is the address's own. Rejects with the wallet's
+   * refusal, or with why the wallet cannot sign for an account.
+   */
+  proveKey(): Promise<void>;
 }
 
 export interface DemoSigner extends Signer {
   kind: "demo";
+  /** False on any network but testnet: there the throwaway key cannot be used, and `connect` only says so. */
+  available: boolean;
   /** Says what this key is, for display wherever its address is shown. */
   label: string;
   /** Throws the key away and makes a new one: a fresh account with nothing in it. */
@@ -84,29 +103,44 @@ export interface ActiveSigner extends Signer {
 }
 
 interface LocalState {
-  /** Which kind the visitor last chose. */
-  chosen: SignerKind | null;
+  /** Which kind the visitor last chose, on each network. */
+  chosen: Record<NetworkName, SignerKind | null>;
+  /** The throwaway key of this browser. It is testnet's and is never looked at for any other network. */
   demoKey: Hex | null;
   /** The connector being opened, while the wallet has not answered yet. */
   connectingId: string | null;
   error: string | null;
 }
 
-const CHOSEN_STORAGE = "paso.signer";
-const SERVER_STATE: LocalState = { chosen: null, demoKey: null, connectingId: null, error: null };
+/** Where the kind of signer last chosen on a network is kept. */
+export function chosenSignerKey(network: NetworkName): string {
+  return `paso.signer.${network}`;
+}
 
-function initialState(): LocalState {
-  const storage = browserStorage();
+const SERVER_STATE: LocalState = {
+  chosen: { testnet: null, mainnet: null },
+  demoKey: null,
+  connectingId: null,
+  error: null,
+};
+
+/** The kind remembered for a network. The demo key is no choice at all where it does not exist. */
+function storedChoice(network: NetworkName): SignerKind | null {
   let chosen: string | null = null;
   try {
-    chosen = storage?.getItem(CHOSEN_STORAGE) ?? null;
+    chosen = browserStorage()?.getItem(chosenSignerKey(network)) ?? null;
   } catch {
     chosen = null;
   }
+  if (chosen === "wallet") return "wallet";
+  return chosen === "demo" && demoAvailable(network) ? "demo" : null;
+}
+
+function initialState(): LocalState {
   return {
     ...SERVER_STATE,
-    chosen: chosen === "demo" || chosen === "wallet" ? chosen : null,
-    demoKey: loadDemoKey(storage),
+    chosen: { testnet: storedChoice("testnet"), mainnet: storedChoice("mainnet") },
+    demoKey: loadDemoKey("testnet", browserStorage()),
   };
 }
 
@@ -116,15 +150,15 @@ function update(change: Partial<LocalState>): void {
   local.set({ ...local.get(), ...change });
 }
 
-function choose(kind: SignerKind | null): void {
+function choose(network: NetworkName, kind: SignerKind | null): void {
   const storage = browserStorage();
   try {
-    if (kind) storage?.setItem(CHOSEN_STORAGE, kind);
-    else removeKey(storage, CHOSEN_STORAGE);
+    if (kind) storage?.setItem(chosenSignerKey(network), kind);
+    else removeKey(storage, chosenSignerKey(network));
   } catch {
     // The choice then lasts until the page is closed.
   }
-  update({ chosen: kind });
+  update({ chosen: { ...local.get().chosen, [network]: kind } });
 }
 
 const demoAccounts = new Map<Hex, PrivateKeyAccount>();
@@ -137,8 +171,6 @@ function demoAccount(key: Hex): PrivateKeyAccount {
   }
   return account;
 }
-
-const baseChainId = NETWORK.evm.chain.id as AppChainId;
 
 /** What the app needs to know about the wallet connection. */
 interface WalletSnapshot {
@@ -229,14 +261,14 @@ function walletStore(config: Config): WalletStore {
 }
 
 /**
- * Connects a wallet. While the wallet has not answered, `connectingId` names
- * it; a second call in that time is ignored. Declining in the wallet leaves
- * no error behind.
+ * Connects a wallet, as the signer for `network`. While the wallet has not
+ * answered, `connectingId` names it; a second call in that time is ignored.
+ * Declining in the wallet leaves no error behind.
  */
-export async function connectWallet(config: Config, connectorId?: string): Promise<void> {
+export async function connectWallet(config: Config, network: NetworkName, connectorId?: string): Promise<void> {
   if (local.get().connectingId !== null) return;
   if (getAccount(config).status === "connected") {
-    choose("wallet");
+    choose(network, "wallet");
     return;
   }
   const connector = pickConnector(getConnectors(config), connectorId);
@@ -247,11 +279,11 @@ export async function connectWallet(config: Config, connectorId?: string): Promi
   update({ connectingId: connector.id, error: null });
   try {
     await connect(config, { connector });
-    choose("wallet");
+    choose(network, "wallet");
   } catch (error) {
     const problem = describeError(error);
     if (problem.kind === "error" && /already connected/i.test(problem.detail ?? problem.message)) {
-      choose("wallet");
+      choose(network, "wallet");
     } else if (problem.kind === "error") {
       update({ error: problem.message });
     }
@@ -260,35 +292,97 @@ export async function connectWallet(config: Config, connectorId?: string): Promi
   }
 }
 
+const NO_KEYS: ReadonlySet<string> = new Set();
+/** The wallets seen to sign with their own key since the page was opened, as `network:address`. */
+const provenKeys = createStore<ReadonlySet<string>>(NO_KEYS);
+const provenKey = (network: NetworkName, wallet: Address): string => `${network}:${wallet.toLowerCase()}`;
+
+/** Whether this browser has seen `wallet` sign with its own key on `network`: just now, or before a reload. */
+export function keyProven(network: NetworkName, wallet: Address, seen: ReadonlySet<string> = provenKeys.get()): boolean {
+  return seen.has(provenKey(network, wallet)) || isKeyProven(browserStorage(), network, wallet);
+}
+
+/** Records that `wallet` signed with its own key on `network`: the key check, or a call it signed for its account. */
+export function rememberKeyProven(network: NetworkName, wallet: Address): void {
+  const key = provenKey(network, wallet);
+  if (provenKeys.get().has(key)) return;
+  markKeyProven(browserStorage(), network, wallet);
+  provenKeys.set(new Set([...provenKeys.get(), key]));
+}
+
 /** The signer's own state, for watching a connection from outside React. */
 export const signerState = { get: local.get, subscribe: local.subscribe };
 
-async function evmClients(config: Config): Promise<EvmClients> {
-  if (getAccount(config).chainId !== baseChainId) {
-    await switchChain(config, { chainId: baseChainId });
+/**
+ * What the demo key amounts to on a network, given what the browser holds.
+ * On testnet: the key, and whether it is the signer in use. On any other
+ * network: nothing, whatever is stored, so the throwaway key can never sign
+ * where the funds are real.
+ */
+export function demoState(
+  network: NetworkName,
+  state: Pick<LocalState, "chosen" | "demoKey">,
+): { available: boolean; key: Hex | null; chosen: boolean } {
+  const available = demoAvailable(network);
+  const key = available ? state.demoKey : null;
+  return { available, key, chosen: available && state.chosen[network] === "demo" && key !== null };
+}
+
+/**
+ * Starts the no-wallet demo: finds or makes the throwaway key and makes it
+ * the signer. On a network without a demo it does neither, and leaves the
+ * reason where the chooser shows it. Returns whether the demo started.
+ */
+export function startDemo(network: NetworkName, renew = false): boolean {
+  if (!demoAvailable(network)) {
+    update({ error: DEMO_TESTNET_ONLY });
+    return false;
   }
-  const walletClient = await getWalletClient(config, { chainId: baseChainId });
-  const publicClient = getPublicClient(config, { chainId: baseChainId });
-  if (!publicClient) throw new Error(`${NETWORK.evm.chain.name} is not configured`);
+  const storage = browserStorage();
+  if (renew) forgetDemoKey(storage);
+  const key = renew ? ensureDemoKey(network, storage) : (local.get().demoKey ?? ensureDemoKey(network, storage));
+  update({ demoKey: key, error: null });
+  choose(network, "demo");
+  return true;
+}
+
+/**
+ * The connected wallet on a network's Base, with a reader for that chain.
+ * The wallet is asked to switch when it is somewhere else; one that does not
+ * know the chain is offered it first. Nothing is sent from here.
+ */
+export async function evmClients(config: Config, network: NetworkConfig): Promise<EvmClients> {
+  const chainId = network.evm.chain.id as AppChainId;
+  if (getAccount(config).chainId !== chainId) {
+    await switchChain(config, { chainId });
+  }
+  const walletClient = await getWalletClient(config, { chainId });
+  const publicClient = getPublicClient(config, { chainId });
+  if (!publicClient) throw new Error(`${network.evm.chain.name} is not configured`);
   return { walletClient, publicClient };
 }
 
 const notConnected = (): Promise<never> => Promise.reject(new Error("Connect a wallet first"));
 
 /**
- * The signer in use: the connected wallet, or the demo key when the visitor
- * chose to try without a wallet. Both kinds share one interface, so the rest
- * of the app never asks which one it is holding.
+ * The signer in use on `network`: the connected wallet, or on testnet the
+ * demo key when the visitor chose to try without a wallet. Both kinds share
+ * one interface, so the rest of the app never asks which one it is holding.
+ *
+ * On mainnet there is only the wallet. The throwaway key is not offered, not
+ * restored and cannot be connected there, whatever the browser remembers.
  *
  * On the server, and in the browser's first render, nothing is connected:
  * what the browser remembers shows up right after hydration.
  */
-export function useSigner(): ActiveSigner {
+export function useSigner(name: NetworkName): ActiveSigner {
+  const network = networkConfig(name);
   const config = useConfig();
   const store = walletStore(config);
   const account = useSyncExternalStore(store.subscribe, store.getSnapshot, noWallet);
   const options = useSyncExternalStore(store.subscribeOptions, store.options, store.configuredOptions);
   const state = useSyncExternalStore(local.subscribe, local.get, () => SERVER_STATE);
+  const seenKeys = useSyncExternalStore(provenKeys.subscribe, provenKeys.get, () => NO_KEYS);
 
   const walletAddress = account.address;
   const connectingId = state.connectingId;
@@ -298,6 +392,8 @@ export function useSigner(): ActiveSigner {
       ? "connecting"
       : "disconnected";
   const { walletName, chainId } = account;
+  const networkName = network.name;
+  const baseChainId = network.evm.chain.id;
 
   const wallet = useMemo<WalletSigner>(
     () => ({
@@ -311,42 +407,43 @@ export function useSigner(): ActiveSigner {
       onBase: chainId === baseChainId,
       signTypedData: (typedData) =>
         walletAddress ? signTypedData(config, { ...typedData, account: walletAddress }) : notConnected(),
-      connect: (connectorId?: string) => connectWallet(config, connectorId),
+      connect: (connectorId?: string) => connectWallet(config, networkName, connectorId),
       async disconnect() {
         await disconnect(config);
-        if (local.get().chosen === "wallet") choose(null);
+        if (local.get().chosen[networkName] === "wallet") choose(networkName, null);
       },
-      evmClients: () => evmClients(config),
+      evmClients: () => evmClients(config, network),
+      keyProven: walletAddress !== null && keyProven(networkName, walletAddress, seenKeys),
+      async proveKey() {
+        if (!walletAddress) return notConnected();
+        await proveKey(walletAddress, (data) => signTypedData(config, { ...data, account: walletAddress }));
+        rememberKeyProven(networkName, walletAddress);
+      },
     }),
-    [config, options, connectingId, walletAddress, walletStatus, walletName, chainId],
+    [config, network, networkName, baseChainId, options, connectingId, walletAddress, walletStatus, walletName, chainId, seenKeys],
   );
-  const demoKey = state.demoKey;
-  const demoChosen = state.chosen === "demo" && demoKey !== null;
+  const { available, key: demoKey, chosen: demoChosen } = demoState(networkName, state);
   const demo = useMemo<DemoSigner>(() => {
     const signingAccount = demoKey ? demoAccount(demoKey) : null;
     return {
       kind: "demo",
       label: DEMO_LABEL,
+      available,
       address: demoChosen && signingAccount ? signingAccount.address : null,
       status: demoChosen ? "connected" : "disconnected",
-      signTypedData: (typedData) => (signingAccount ? signingAccount.signTypedData(typedData) : notConnected()),
+      signTypedData: (typedData) => (demoChosen && signingAccount ? signingAccount.signTypedData(typedData) : notConnected()),
       async connect() {
-        const key = ensureDemoKey(browserStorage());
-        update({ demoKey: key, error: null });
-        choose("demo");
+        startDemo(networkName);
       },
       async disconnect() {
         // The key stays in the browser, so the same account is there next time.
-        if (local.get().chosen === "demo") choose(null);
+        if (local.get().chosen[networkName] === "demo") choose(networkName, null);
       },
       async renew() {
-        const storage = browserStorage();
-        forgetDemoKey(storage);
-        update({ demoKey: ensureDemoKey(storage) });
-        choose("demo");
+        startDemo(networkName, true);
       },
     };
-  }, [demoKey, demoChosen]);
+  }, [available, networkName, demoKey, demoChosen]);
 
   const error = state.error;
   return useMemo<ActiveSigner>(() => {

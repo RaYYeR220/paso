@@ -12,10 +12,11 @@ import {
 } from "@paso/sdk";
 import type { Address, Hex, PublicClient, WalletClient } from "viem";
 import type { ActivityLog, LogStatus } from "../activity/log";
-import type { DeliverResponse, PasoApi } from "../api";
+import type { DeclineReason, DeliverResponse, PasoApi } from "../api";
 import { describeError, describeFailure, type ProblemError } from "../errors";
 import { readJson, removeKey, writeJson, type KeyValueStore } from "../storage";
 import { after, createStore, sleep, type Listener } from "../store";
+import { ceilingProblem } from "./limits";
 import {
   fundingReducer,
   IDLE_FUNDING,
@@ -41,9 +42,13 @@ export type FundingRequest =
   | { via: "wallet"; amount: bigint; clients: () => Promise<EvmClients> };
 
 export interface FundingDeps {
+  /** The network the transfer is on: its Base, its Stellar account, its relayer. */
   network: NetworkConfig;
+  /** The routes of that same network. */
   api: Pick<PasoApi, "demoFund" | "deliver">;
   storage: KeyValueStore | null;
+  /** The most one transfer from a wallet may bring over, in Base's 6-decimal units. `null` or absent for no ceiling. */
+  ceiling?: bigint | null;
   /** The session log of an account, so a transfer shows up in its activity. */
   log?: (twin: string) => Pick<ActivityLog, "put"> | null;
   now?: () => number;
@@ -105,6 +110,8 @@ const DEFAULTS = {
 };
 
 const MAX_BACKOFF_STEPS = 5;
+/** The longest wait between two questions, whatever the server asks for: a transfer that can move again is noticed within this. */
+const MAX_HELD_WAIT_MS = 60_000;
 
 export function fundingStorageKey(network: NetworkName, owner: Address): string {
   return `paso.funding.${network}.${owner.toLowerCase()}`;
@@ -181,8 +188,14 @@ function walletFailure(problem: ProblemError): FundingFailure {
   return failure(code, problem.message, problem.retryable, problem);
 }
 
+/** The server's reason for declining for now, when the refusal carries one. */
+function heldBy(error: unknown): DeclineReason | undefined {
+  const { reason } = (typeof error === "object" && error !== null ? error : {}) as { reason?: DeclineReason };
+  return reason;
+}
+
 /** What a failed question to the delivery route means for the transfer. */
-function deliveryFailure(error: unknown): { permanent: boolean; reason: FundingFailure; retryAfterMs?: number } {
+function deliveryFailure(error: unknown): { permanent: boolean; reason: FundingFailure; retryAfterMs?: number; held?: DeclineReason } {
   const problem = describeFailure(error);
   const said = problem.detail ?? problem.message;
   if (problem.code === "bad_request") {
@@ -198,6 +211,7 @@ function deliveryFailure(error: unknown): { permanent: boolean; reason: FundingF
     permanent: false,
     reason: failure("unavailable", "The delivery service is not answering. The burn is safe on Base.", true, problem),
     ...(problem.retryAfterSeconds ? { retryAfterMs: problem.retryAfterSeconds * 1000 } : {}),
+    ...(heldBy(error) ? { held: heldBy(error) } : {}),
   };
 }
 
@@ -222,7 +236,11 @@ function observeWrites(walletClient: WalletClient, report: (step: RequestStep, h
  *
  * A burn is money in transit, so it goes on record the moment its hash is
  * known and stays there until the USDC is delivered or the owner says to stop
- * tracking it. No outage, reload, second click or reset takes it off.
+ * tracking it. No outage, reload, second click or reset takes it off, and
+ * neither does a relayer that is not delivering for now.
+ *
+ * Everything here belongs to one network: the Base the USDC leaves, the
+ * account it is for, the routes that are asked and the record that is kept.
  */
 export function createFundingController(owner: Address, deps: FundingDeps): FundingController {
   const { network, api, storage } = deps;
@@ -304,16 +322,16 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
       } catch (error) {
         cancelSlow();
         if (!live()) return;
-        const { permanent, reason, retryAfterMs } = deliveryFailure(error);
+        const { permanent, reason, retryAfterMs, held } = deliveryFailure(error);
         errors += 1;
         if (permanent) {
           tracking = null;
           fail(reason, transfer);
           return;
         }
-        // An outage says nothing about the burn: keep waiting, more patiently each time.
-        dispatch({ type: "PENDING", attestation: "unreachable" });
-        await pause(retryAfterMs ?? pollIntervalMs * Math.min(errors, MAX_BACKOFF_STEPS));
+        // Neither an outage nor a relayer that is not paying says anything about the burn: keep waiting, more patiently each time.
+        dispatch({ type: "PENDING", attestation: "unreachable", ...(held ? { held } : {}) });
+        await pause(Math.min(retryAfterMs ?? pollIntervalMs * Math.min(errors, MAX_BACKOFF_STEPS), MAX_HELD_WAIT_MS));
         continue;
       }
       cancelSlow();
@@ -343,6 +361,10 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
   }
 
   async function askFaucet(): Promise<Transfer | null> {
+    if (network.name !== "testnet") {
+      dispatch({ type: "FAILED", reason: failure("faucet_off", "The faucet exists on testnet only.", false), at: now() });
+      return null;
+    }
     try {
       const funded = await api.demoFund(owner);
       const transfer: Transfer = {
@@ -383,6 +405,10 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
     const prompt: { step: RequestStep } = { step: "starting" };
     try {
       if (amount <= 0n) throw new Error("Enter an amount above zero");
+      if (deps.ceiling != null && amount > deps.ceiling) {
+        dispatch({ type: "FAILED", reason: failure("over_ceiling", ceilingProblem(deps.ceiling), false), at: now() });
+        return null;
+      }
       const { walletClient, publicClient } = await request.clients();
 
       const payer = walletClient.account?.address;

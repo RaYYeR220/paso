@@ -196,6 +196,9 @@ export function describeError(error: unknown): Problem {
   if (/reverted on Base/.test(all)) {
     return problem("reverted", "The transaction reverted on Base. Nothing was sent.", true, all);
   }
+  if (/execution reverted|exceeds allowance/i.test(all)) {
+    return problem("would_revert", "The wallet says this transaction would fail, so it was not sent. Nothing left the wallet.", true, all);
+  }
   if (/Iris answered|Iris lists no burn fee/.test(all)) {
     return problem("circle_unreachable", "Circle's attestation service did not answer. Try again in a moment.", true, all);
   }

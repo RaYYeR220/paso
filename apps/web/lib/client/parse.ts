@@ -55,7 +55,9 @@ export function parseRecipient(text: string): ParsedRecipient {
     if (StrKey.isValidEd25519PublicKey(input) || StrKey.isValidContract(input)) {
       return { kind: "stellar", address: input };
     }
-    if (input.startsWith("M")) return invalid("Muxed addresses (M…) are not supported; use the G… address");
+    if (input.startsWith("M")) {
+      return invalid("A wallet can show a muxed address (M…) only as a hash, so it is not taken as a recipient. Enter the G… address it stands for");
+    }
     return invalid("That Stellar address is not valid; check it for a typo");
   }
   const parsed = parseOwnerInput(input);

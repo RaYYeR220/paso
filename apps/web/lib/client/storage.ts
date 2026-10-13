@@ -5,6 +5,36 @@ export interface KeyValueStore {
   removeItem(key: string): void;
 }
 
+/**
+ * What was stored before each network had keys of its own, and where it
+ * belongs now. All of it was made on testnet: there was no other network.
+ */
+const LEGACY_KEYS: readonly (readonly [from: string, to: string])[] = [
+  ["paso.signer", "paso.signer.testnet"],
+  ["paso.demo.key", "paso.demo.key.testnet"],
+];
+
+/**
+ * Moves what an earlier version stored under keys that named no network to
+ * the testnet keys. A value stored since under the new key is left as it
+ * is; the old key goes either way, so this happens once.
+ */
+export function migrateStorage(storage: KeyValueStore | null): void {
+  if (!storage) return;
+  for (const [from, to] of LEGACY_KEYS) {
+    try {
+      const value = storage.getItem(from);
+      if (value === null) continue;
+      if (storage.getItem(to) === null) storage.setItem(to, value);
+      storage.removeItem(from);
+    } catch {
+      // A storage that cannot be written keeps the old key; nothing reads it any more.
+    }
+  }
+}
+
+let migrated = false;
+
 /** `localStorage`, or `null` on the server and in browsers that block it. */
 export function browserStorage(): KeyValueStore | null {
   if (typeof window === "undefined") return null;
@@ -13,6 +43,10 @@ export function browserStorage(): KeyValueStore | null {
     const probe = "paso.probe";
     storage.setItem(probe, "1");
     storage.removeItem(probe);
+    if (!migrated) {
+      migrated = true;
+      migrateStorage(storage);
+    }
     return storage;
   } catch {
     return null;

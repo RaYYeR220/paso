@@ -1,4 +1,4 @@
-import { NETWORKS, twinAddress } from "@paso/sdk";
+import { NETWORKS, twinAddress, type NetworkConfig } from "@paso/sdk";
 import { Address, xdr, type rpc, type TransactionBuilder } from "@stellar/stellar-sdk";
 import type { Address as EvmAddress, Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
@@ -80,8 +80,8 @@ export function recordingLog() {
 }
 
 /** Answers a simulation the way the network does in recording mode: one unsigned entry for the owner's account. */
-export function recordingServer(ownerAddress: EvmAddress = owner.address): rpc.Server {
-  const account = twinAddress(ownerAddress, network);
+export function recordingServer(ownerAddress: EvmAddress = owner.address, on: NetworkConfig = network): rpc.Server {
+  const account = twinAddress(ownerAddress, on);
   const simulateTransaction = async (tx: ReturnType<TransactionBuilder["build"]>) => {
     const envelope = tx.toEnvelope();
     if (envelope.type !== "envelopeTypeTx") throw new Error(`unexpected envelope ${envelope.type}`);

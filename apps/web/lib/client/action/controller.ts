@@ -1,24 +1,31 @@
 import {
+  DEFAULT_VALIDITY_LEDGERS,
+  describeCalls,
   entryTypedData,
+  LEDGER_SECONDS,
+  networkId,
   prepare,
   RelayError,
   relayRequest,
   sign,
   withArgument,
+  saltNetwork,
   type NetworkConfig,
+  type Prepared,
   type RelayErrorCode,
   type RelayResult,
   type Signed,
   type TypedDataSigner,
 } from "@paso/sdk";
 import { nativeToScVal, xdr } from "@stellar/stellar-sdk";
-import type { Address } from "viem";
+import { isAddressEqual, type Address } from "viem";
 import type { ActivityLog, LogEntry } from "../activity/log";
-import { describeError, describeFailure, refusalSummary, relayMessage } from "../errors";
+import { describeError, describeFailure, refusalSummary, relayMessage, type ProblemError } from "../errors";
 import { createStore, type Listener } from "../store";
 import { buildAction } from "./build";
 import {
   actionReducer,
+  cautionsFor,
   IDLE_ACTION,
   isActionBusy,
   reviewOf,
@@ -27,10 +34,14 @@ import {
   type ActionEvent,
   type ActionRequest,
   type ActionState,
+  type Caution,
+  type RecipientCheck,
   type RefusalCode,
   type Review,
 } from "./machine";
-import type { SignedMessage } from "./panels";
+
+export type { RecipientCheck } from "./machine";
+import { hasConcerns, type SignedMessage } from "./panels";
 
 /** One argument of the root call, replaced after signing. */
 export interface Tamper {
@@ -44,15 +55,32 @@ export interface SignOptions {
    * Alter the call after it is signed, the way a dishonest relayer or front
    * end would have to, and submit that. `true` changes the amount; a `Tamper`
    * names the argument and its new value. The account contract refuses.
+   *
+   * A demonstration, and testnet's only. Anywhere else nothing is signed
+   * when it is asked for: a signature given to watch a refusal must never be
+   * one that could move real funds.
    */
   tamper?: boolean | Tamper;
+  /**
+   * The cautions of the review that the owner has answered. While one is
+   * missing, nothing is signed: a transfer to a smart contract's account, to
+   * name the worst, never goes out because a button was pressed in passing.
+   */
+  confirmed?: readonly Caution[];
 }
 
 export interface ActionDeps {
+  /** The network every call is prepared for, signed for and relayed on. */
   network: NetworkConfig;
   /** Where signed calls are sent. */
   relayUrl: string;
   resolveName: (name: string) => Promise<Address | null>;
+  /**
+   * Looks at the Ethereum address whose Stellar account a transfer pays:
+   * whether it is a wallet or a contract, and whether its account exists.
+   * Without it nothing is known and nothing is asked.
+   */
+  inspectRecipient?: (address: Address) => Promise<RecipientCheck>;
   /** The session log of an account, so calls show up in its activity. */
   log?: (twin: string) => Pick<ActivityLog, "put"> | null;
   now?: () => number;
@@ -62,17 +90,18 @@ export interface ActionDeps {
   relay?: (signed: Signed, relayUrl: string) => Promise<RelayResult>;
   withArgument?: typeof withArgument;
   /**
-   * A prepared call older than this is prepared again instead of signed. A
-   * signature is valid for about ten minutes from preparation; asking the
-   * wallet for one that cannot be used any more wastes a prompt.
+   * A prepared call older than this is prepared again instead of signed.
+   * By default that is the call's own lifetime, about two minutes, less the
+   * time it takes to get a signed call through: asking the wallet for a
+   * signature that will have run out by the time it is used wastes a prompt.
    */
   staleAfterMs?: number;
   /** How long to wait before asking a relayer again that gave no answer. The wait doubles from there, up to a few seconds. */
   retryDelayMs?: number;
   /**
    * How long after a call was prepared the relayer is still asked about it.
-   * A signature lasts about ten minutes; past that, plus the time it takes
-   * the network to say so, no answer can change what happened.
+   * By default until the signature has run out, plus the time it takes the
+   * network to say so: past that no answer can change what happened.
    */
   giveUpAfterMs?: number;
 }
@@ -147,10 +176,12 @@ export interface ActionController {
   reset(): void;
 }
 
-const DEFAULT_STALE_AFTER_MS = 9 * 60_000;
+/** What is left of a signature's lifetime must cover the wallet prompt and the relay: with less, it is not asked for. */
+const SIGNING_MARGIN_MS = 40_000;
+/** How long past a signature's end the network may take to say that it has run out. */
+const SETTLE_MARGIN_MS = 30_000;
 const DEFAULT_RETRY_DELAY_MS = 1_500;
 const MAX_RETRY_DELAY_MS = 8_000;
-const DEFAULT_GIVE_UP_AFTER_MS = 11 * 60_000;
 const REFUSALS: readonly string[] = ["bad_signature", "simulation_failed", "bad_request"];
 /**
  * Answers that judge nothing: the relayer could not be reached, could not
@@ -159,11 +190,36 @@ const REFUSALS: readonly string[] = ["bad_signature", "simulation_failed", "bad_
  */
 const NOT_AN_ANSWER: readonly string[] = ["unavailable", "network", "relay_failed", "rate_limited"];
 
+/**
+ * Why a prepared call must not be shown for signing on `network`, or `null`
+ * when it is that network's. The wallet prompt names no network in words:
+ * the network id sits in the domain as 32 bytes of salt. So the salt is
+ * read here, and a call whose salt is another network's never reaches the
+ * review, whatever the call says about itself.
+ */
+export function wrongNetwork(prepared: Pick<Prepared, "network" | "typedData">, network: NetworkConfig): ProblemError | null {
+  const { salt } = prepared.typedData.domain;
+  if (prepared.network === network.name && salt.toLowerCase() === networkId(network).toLowerCase()) return null;
+  const actual = saltNetwork(salt) ?? "another network";
+  return {
+    kind: "error",
+    code: "wrong_network",
+    message: `This request was prepared for ${actual}, and the page is on ${network.name}. Nothing was signed.`,
+    retryable: false,
+  };
+}
+
 /** The message the account contract rebuilds from an authorisation entry: its account, its calls, its payload. */
 export function messageOfEntry(entry: string, network: NetworkConfig): SignedMessage {
   const decoded = xdr.SorobanAuthorizationEntry.fromXdr(entry, "base64");
-  const { account, calls, payload } = entryTypedData(decoded, network).message;
-  return { account, calls, payload };
+  const { domain, message } = entryTypedData(decoded, network);
+  return { salt: domain.salt, account: message.account, calls: message.calls, payload: message.payload };
+}
+
+/** About how long a prepared call's signature is accepted for, counted from its preparation. */
+function lifetimeMs(prepared: Pick<Prepared, "validUntilLedger" | "preparedAtLedger">): number {
+  const ledgers = prepared.preparedAtLedger === undefined ? DEFAULT_VALIDITY_LEDGERS : prepared.validUntilLedger - prepared.preparedAtLedger;
+  return Math.max(0, ledgers) * LEDGER_SECONDS * 1000;
 }
 
 /**
@@ -203,9 +259,13 @@ export function createActionController(owner: Address, deps: ActionDeps): Action
   const signCall = deps.sign ?? sign;
   const relayCall = deps.relay ?? postRelay;
   const alter = deps.withArgument ?? withArgument;
-  const staleAfterMs = deps.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
   const retryDelayMs = deps.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
-  const giveUpAfterMs = deps.giveUpAfterMs ?? DEFAULT_GIVE_UP_AFTER_MS;
+  /** When a prepared call is too old to be worth a wallet prompt. */
+  const staleAt = (review: Review): number =>
+    deps.staleAfterMs === undefined ? review.expiresAt - SIGNING_MARGIN_MS : review.preparedAt + deps.staleAfterMs;
+  /** When no answer about a signed call can change what happened any more. */
+  const giveUpAt = (review: Review): number =>
+    deps.giveUpAfterMs === undefined ? review.expiresAt + SETTLE_MARGIN_MS : review.preparedAt + deps.giveUpAfterMs;
 
   const store = createStore<ActionState>(IDLE_ACTION);
   /** Set from the first synchronous line of an operation to its last: two clicks cannot both get in. */
@@ -236,23 +296,46 @@ export function createActionController(owner: Address, deps: ActionDeps): Action
     dispatch({ type: "PREPARE", request });
     try {
       const built = await buildAction(request, { network, resolveName });
-      const prepared = await prepareCall(built.action, { owner, network });
+      // Only a transfer pays the Stellar account of an Ethereum address, and only someone else's needs looking at.
+      const payee = request.kind === "transfer" ? built.recipient?.evm : undefined;
+      const inspect = payee && !isAddressEqual(payee, owner) ? deps.inspectRecipient : undefined;
+      const [prepared, check] = await Promise.all([
+        prepareCall(built.action, { owner, network }),
+        inspect && payee ? inspect(payee).catch((): RecipientCheck => ({ kind: "unknown", deployed: null })) : null,
+      ]);
       if (ticket !== generation) return false;
+      const mismatch = wrongNetwork(prepared, network);
+      if (mismatch) {
+        dispatch({ type: "PREPARE_FAILED", error: mismatch });
+        return false;
+      }
+      // A call typed in by hand can carry anything: its arguments are described, and what can mislead is flagged.
+      const [entry] = prepared.entries;
+      const described =
+        request.kind === "invoke" && entry ? describeCalls(xdr.SorobanAuthorizationEntry.fromXdr(entry, "base64")) : undefined;
+      const cautions: Caution[] = [...cautionsFor(check), ...(described && hasConcerns(described) ? (["arguments"] as const) : [])];
+      const preparedAt = now();
       dispatch({
         type: "PREPARED",
         review: {
           request,
+          network: network.name,
           owner,
           prepared,
           calls: prepared.calls,
           message: {
+            salt: prepared.typedData.domain.salt,
             account: prepared.typedData.message.account,
             calls: prepared.typedData.message.calls,
             payload: prepared.typedData.message.payload,
           },
           recipient: built.recipient,
           amount: built.amount,
-          preparedAt: now(),
+          cautions,
+          ...(described ? { described } : {}),
+          preparedAt,
+          validUntilLedger: prepared.validUntilLedger,
+          expiresAt: preparedAt + lifetimeMs(prepared),
         },
       });
       return true;
@@ -266,7 +349,7 @@ export function createActionController(owner: Address, deps: ActionDeps): Action
     const ticket = generation;
     const current = () => ticket === generation;
 
-    if (now() - review.preparedAt > staleAfterMs) {
+    if (now() > staleAt(review)) {
       dispatch({ type: "EXPIRED", detail: "This request was prepared too long ago to be signed." });
       return;
     }
@@ -316,7 +399,7 @@ export function createActionController(owner: Address, deps: ActionDeps): Action
      */
     let uncertain = false;
     let delay = retryDelayMs;
-    const giveUpAt = review.preparedAt + giveUpAfterMs;
+    const lastAnswerAt = giveUpAt(review);
     let result: RelayResult | undefined;
     let failure: unknown;
     for (;;) {
@@ -333,7 +416,7 @@ export function createActionController(owner: Address, deps: ActionDeps): Action
         if (code !== "rate_limited" && facts.sent !== false) uncertain = true;
         if (!current()) return;
         const wait = facts.retryAfterSeconds === undefined ? delay : facts.retryAfterSeconds * 1000;
-        if (now() + wait >= giveUpAt) break;
+        if (now() + wait >= lastAnswerAt) break;
         dispatch({ type: "RELAY_RETRY" });
         await new Promise<void>((resolve) => setTimeout(resolve, wait));
         if (!current()) return;
@@ -414,17 +497,21 @@ export function createActionController(owner: Address, deps: ActionDeps): Action
     async sign(signer, options = {}) {
       const state = store.get();
       if (busy || state.phase !== "review") return;
+      if (options.tamper && network.name !== "testnet") return;
       const review = reviewOf(state)!;
+      if (review.cautions.some((caution) => !options.confirmed?.includes(caution))) return;
       await exclusive(() => signAndRelay(review, signer, options));
     },
 
     async signAgain(signer, options = {}) {
       const state = store.get();
       if (busy || state.phase !== "expired") return;
+      if (options.tamper && network.name !== "testnet") return;
       await exclusive(async () => {
         if (!(await prepareRequest(state.request))) return;
         const prepared = store.get();
-        if (prepared.phase === "review") await signAndRelay(reviewOf(prepared)!, signer, options);
+        // What was confirmed belonged to the request that ran out. One with cautions waits in the review to be answered again.
+        if (prepared.phase === "review" && prepared.cautions.length === 0) await signAndRelay(reviewOf(prepared)!, signer, options);
       });
     },
 

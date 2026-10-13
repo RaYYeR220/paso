@@ -8,7 +8,7 @@ const OTHER_EXIT = "7d".repeat(32);
 const BASE_MINT = `0x${"d8".repeat(32)}`;
 const key = exitStorageKey("testnet", owner.address);
 
-const transfer: ExitTransfer = { stellarTxHash: EXIT, startedAt: 1_000 };
+const transfer: ExitTransfer = { network: "testnet", stellarTxHash: EXIT, startedAt: 1_000 };
 const waiting = (attestation: "not_found" | "pending" | "unreachable" = "pending"): ExitAnswer => ({ status: "pending", attestation });
 const minted: ExitAnswer = { status: "minted", hash: BASE_MINT };
 
@@ -18,6 +18,7 @@ function harness(script: (ExitAnswer | Error)[], storage: KeyValueStore | null =
   const pendingRuns: (() => void)[] = [];
   const clock = { now: 1_000 };
   const watcher = createExitWatcher({
+    network: "testnet",
     ask,
     storage,
     storageKey: key,
@@ -94,7 +95,7 @@ describe("following USDC back to Base", () => {
   it("refuses a second burn while one is on record", async () => {
     const h = harness([waiting()]);
     expect(h.watcher.watch(transfer)).toBe(true);
-    expect(h.watcher.watch({ stellarTxHash: OTHER_EXIT, startedAt: 2_000 })).toBe(false);
+    expect(h.watcher.watch({ network: "testnet", stellarTxHash: OTHER_EXIT, startedAt: 2_000 })).toBe(false);
     expect(h.watcher.watch(transfer)).toBe(true);
     await settle(3);
     expect(h.watcher.getState()).toMatchObject({ transfer: { stellarTxHash: EXIT } });
@@ -126,7 +127,7 @@ describe("following USDC back to Base", () => {
     expect(h.watcher.getState()).toBe(IDLE_EXIT);
     expect(h.storage?.getItem(key)).toBeNull();
     expect(h.ask.calls).toHaveLength(1);
-    expect(h.watcher.watch({ stellarTxHash: OTHER_EXIT, startedAt: 2_000 })).toBe(true);
+    expect(h.watcher.watch({ network: "testnet", stellarTxHash: OTHER_EXIT, startedAt: 2_000 })).toBe(true);
   });
 
   it("keeps the record when the server cannot follow transfers, and asks again after a reload", async () => {
@@ -148,7 +149,7 @@ describe("following USDC back to Base", () => {
     const h = harness([waiting()], null);
     h.watcher.watch(transfer);
     expect(h.watcher.tracked()).toEqual({ transfer, saved: false });
-    expect(h.watcher.watch({ stellarTxHash: OTHER_EXIT, startedAt: 2_000 })).toBe(false);
+    expect(h.watcher.watch({ network: "testnet", stellarTxHash: OTHER_EXIT, startedAt: 2_000 })).toBe(false);
   });
 });
 

@@ -1,6 +1,6 @@
 import { RelayError, SimulationError } from "@paso/sdk";
 import { describe, expect, it } from "vitest";
-import { ApiFailure, faucetStatus, type HealthResponse } from "@/lib/client/api";
+import { ApiFailure, faucetStatus, relayerStatus, type HealthResponse, type RelayerReport } from "@/lib/client/api";
 import { NameNotFoundError } from "@/lib/client/ens";
 import { describeError, describeFailure, isUserRejection, refusalSummary, relayMessage } from "@/lib/client/errors";
 
@@ -138,25 +138,71 @@ describe("SDK and wallet errors", () => {
   });
 });
 
+describe("a transaction the wallet would not send", () => {
+  it("is told apart from one whose fate is unknown: the wallet's own check failed, so nothing was sent", () => {
+    const fromWallet = Object.assign(new Error("Execution reverted with reason: ERC20: transfer amount exceeds allowance."), { code: -32603 });
+    const fromViem = Object.assign(new Error("The contract function \"depositForBurnWithHook\" reverted."), {
+      name: "ContractFunctionExecutionError",
+      shortMessage: "execution reverted: ERC20: transfer amount exceeds allowance",
+    });
+
+    for (const error of [fromWallet, fromViem]) {
+      expect(describeError(error)).toMatchObject({
+        kind: "error",
+        code: "would_revert",
+        message: "The wallet says this transaction would fail, so it was not sent. Nothing left the wallet.",
+        retryable: true,
+      });
+    }
+    // A transaction that was included and reverted is another matter, and keeps its own words.
+    expect(describeError(new Error("The burn reverted on Base: 0xabc"))).toMatchObject({ code: "reverted" });
+  });
+});
+
 describe("faucetStatus", () => {
-  const health = (payer: HealthResponse["payer"], network: HealthResponse["network"] = "testnet"): HealthResponse => ({
+  type Payer = RelayerReport["payer"];
+  const report = (network: "testnet" | "mainnet", payer: Payer, paysFees = true): RelayerReport => ({
+    enabled: true,
     ok: true,
     network,
     hub: "C",
     latestLedger: 1,
     relayer: { address: "G", xlm: "10" },
     payer,
-    maxResourceFee: "5000000",
+    fees: { maxResourceFee: "5000000", inclusionFee: "1000", maxDailyFees: "500000000", spentToday: "0", remainingToday: "500000000", minBalance: "0" },
+    limits: {
+      relay: { perCallerPerHour: 120, perHour: 1200 },
+      deploy: { perCallerPerHour: 60, perHour: 600 },
+      deliver: { perCallerPerHour: 60, perHour: 600 },
+    },
+    paysFees,
+    paysBaseMints: true,
+    faucet: payer !== null,
+  });
+  const health = (testnet: HealthResponse["networks"]["testnet"], mainnet: HealthResponse["networks"]["mainnet"] = { enabled: false }): HealthResponse => ({
+    ok: true,
+    default: "testnet",
+    networks: { testnet, mainnet },
   });
   const payer = (usdc: string | null, eth: string | null) => ({ address: `0x${"11".repeat(20)}` as const, chain: "Base Sepolia", usdc, eth });
 
-  it("reads the faucet's state off the health report", () => {
+  it("reads the faucet's state off testnet's part of the health report, and nobody else's", () => {
     expect(faucetStatus(null)).toBe("unknown");
-    expect(faucetStatus(health(null))).toBe("off");
-    expect(faucetStatus(health(payer("25", "0.01"), "mainnet"))).toBe("off");
-    expect(faucetStatus(health(payer("0", "0.01")))).toBe("empty");
-    expect(faucetStatus(health(payer("25", "0")))).toBe("empty");
-    expect(faucetStatus(health(payer(null, "0.01")))).toBe("unknown");
-    expect(faucetStatus(health(payer("25", "0.01")))).toBe("ready");
+    expect(faucetStatus(health(report("testnet", null)))).toBe("off");
+    expect(faucetStatus(health({ enabled: false }, report("mainnet", payer("25", "0.01"))))).toBe("off");
+    expect(faucetStatus(health(report("testnet", payer("0", "0.01"))))).toBe("empty");
+    expect(faucetStatus(health(report("testnet", payer("25", "0"))))).toBe("empty");
+    expect(faucetStatus(health(report("testnet", payer(null, "0.01"))))).toBe("unknown");
+    expect(faucetStatus(health(report("testnet", payer("25", "0.01"))))).toBe("ready");
+  });
+
+  it("tells whether the hosted relayer is there to pay on a network", () => {
+    const both = health(report("testnet", null), report("mainnet", null, false));
+
+    expect(relayerStatus(null, "mainnet")).toBe("unknown");
+    expect(relayerStatus(health(report("testnet", null)), "mainnet")).toBe("not_serving");
+    expect(relayerStatus(both, "testnet")).toBe("serving");
+    expect(relayerStatus(both, "mainnet")).toBe("not_paying");
+    expect(relayerStatus(health(report("testnet", null), report("mainnet", null)), "mainnet")).toBe("serving");
   });
 });

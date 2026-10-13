@@ -1,6 +1,19 @@
 import type { InboundRoute, NetworkName } from "@paso/sdk";
 import type { Address, Hex } from "viem";
-import { NETWORK_NAME, ROUTES } from "./config";
+import { ROUTES } from "./config";
+
+/**
+ * Why a server is declining to pay for something for now, when it says:
+ * it does not work on the network, it has spent its day's fees, it has paid
+ * for all it pays for in an hour, or its account is down to its reserve.
+ */
+export type DeclineReason = "not_serving" | "daily_budget" | "hourly_limit" | "low_balance";
+
+const DECLINE_REASONS: readonly string[] = ["not_serving", "daily_budget", "hourly_limit", "low_balance"];
+
+export function declineReason(value: unknown): DeclineReason | undefined {
+  return typeof value === "string" && DECLINE_REASONS.includes(value) ? (value as DeclineReason) : undefined;
+}
 
 /** A refusal from one of the app's API routes: the route's `error` code and its `detail` sentence. */
 export class ApiFailure extends Error {
@@ -10,6 +23,8 @@ export class ApiFailure extends Error {
     readonly status: number,
     readonly detail: string,
     readonly retryAfterSeconds?: number,
+    /** Why the server is declining for now, when it gave a reason. */
+    readonly reason?: DeclineReason,
   ) {
     super(detail);
     this.name = "ApiFailure";
@@ -34,14 +49,45 @@ export interface DeployResponse {
   alreadyDeployed: boolean;
 }
 
-export interface HealthResponse {
+/** How many transactions of one kind the relayer pays for in an hour: from one caller, and from everyone. */
+export interface SpendLimit {
+  perCallerPerHour: number;
+  perHour: number;
+}
+
+/** What the relayer of one network reports about itself. Amounts under `fees` are stroops, as text. */
+export interface RelayerReport {
+  enabled: true;
   ok: boolean;
   network: NetworkName;
   hub: string;
   latestLedger: number | null;
   relayer: { address: string; xlm: string | null };
   payer: { address: Address; chain: string; usdc: string | null; eth: string | null } | null;
-  maxResourceFee: string;
+  fees: {
+    maxResourceFee: string;
+    inclusionFee: string;
+    maxDailyFees: string;
+    spentToday: string;
+    remainingToday: string;
+    minBalance: string;
+  };
+  limits: { relay: SpendLimit; deploy: SpendLimit; deliver: SpendLimit };
+  /** False while the relayer would decline to pay a fee: its day is spent, or its account is down to what it keeps. */
+  paysFees: boolean;
+  /** Whether the server submits the mint that finishes a transfer back to Base. Where it does not, the wallet does. */
+  paysBaseMints: boolean;
+  faucet: boolean;
+}
+
+/** A network's report, or word that the server does not work on that network. */
+export type NetworkHealth = RelayerReport | { enabled: false };
+
+export interface HealthResponse {
+  ok: boolean;
+  /** The network a request means when it names none. */
+  default: NetworkName;
+  networks: Record<NetworkName, NetworkHealth>;
 }
 
 export interface PasoApi {
@@ -54,10 +100,11 @@ export interface PasoApi {
 }
 
 export interface ApiOptions {
+  /** The network every request is for. It is named in each of them. */
+  network: NetworkName;
   /** Origin of the routes; empty for the page's own origin. */
   baseUrl?: string;
   fetch?: typeof fetch;
-  network?: NetworkName;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -89,11 +136,12 @@ async function request<T>(fetcher: typeof fetch, url: string, init: RequestInit)
     response.status,
     typeof record.detail === "string" ? record.detail : `The server answered ${response.status}`,
     Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined,
+    declineReason(record.reason),
   );
 }
 
-export function createApi(options: ApiOptions = {}): PasoApi {
-  const { baseUrl = "", network = NETWORK_NAME } = options;
+export function createApi(options: ApiOptions): PasoApi {
+  const { baseUrl = "", network } = options;
   const fetcher: typeof fetch = options.fetch ?? ((input, init) => fetch(input, init));
   const post = <T>(path: string, body: unknown, signal?: AbortSignal) =>
     request<T>(fetcher, `${baseUrl}${path}`, {
@@ -113,11 +161,31 @@ export function createApi(options: ApiOptions = {}): PasoApi {
 
 export type FaucetStatus = "ready" | "empty" | "off" | "unknown";
 
-/** Whether the testnet faucet can pay out, judged from the health report. */
+/** Whether the testnet faucet can pay out, judged from testnet's report. The faucet exists nowhere else. */
 export function faucetStatus(health: HealthResponse | null | undefined): FaucetStatus {
-  if (!health) return "unknown";
-  if (health.network !== "testnet" || health.payer === null) return "off";
-  const { usdc, eth } = health.payer;
+  const testnet = health?.networks.testnet;
+  if (!testnet) return "unknown";
+  if (!testnet.enabled || testnet.payer === null) return "off";
+  const { usdc, eth } = testnet.payer;
   if (usdc === null || eth === null) return "unknown";
   return Number(usdc) >= 1 && Number(eth) > 0 ? "ready" : "empty";
+}
+
+/**
+ * Whether the hosted relayer is there to pay fees on a network, as far as
+ * the health report tells.
+ *
+ * - `serving`: it works on the network and is paying.
+ * - `not_serving`: this server does not work on the network at all.
+ * - `not_paying`: it works there and is declining fees for now: its day's
+ *   budget is spent, or its account is down to what it keeps.
+ * - `unknown`: no report yet, or the report could not be read.
+ */
+export type RelayerStatus = "serving" | "not_serving" | "not_paying" | "unknown";
+
+export function relayerStatus(health: HealthResponse | null | undefined, network: NetworkName): RelayerStatus {
+  const report = health?.networks?.[network];
+  if (!report) return "unknown";
+  if (!report.enabled) return "not_serving";
+  return report.paysFees ? "serving" : "not_paying";
 }

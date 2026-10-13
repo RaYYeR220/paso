@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { parseArguments } from "@/lib/client/action/args";
 import { createActionController } from "@/lib/client/action/controller";
 import { panelsOf, type ActionRequest } from "@/lib/client/action/machine";
-import { NETWORK, ROUTES } from "@/lib/client/config";
+import { networkConfig, ROUTES } from "@/lib/client/config";
 import { ensureDemoKey } from "@/lib/client/demoKey";
 import { memoryStorage } from "@/lib/client/storage";
 import { recordingLog } from "./helpers";
@@ -20,10 +20,11 @@ import { recordingLog } from "./helpers";
  * when the address is given.
  */
 const baseUrl = process.env.PASO_SMOKE_URL?.replace(/\/$/, "");
+const NETWORK = networkConfig("testnet");
 
 describe.skipIf(!baseUrl)("live: a demo key against a running server", () => {
   it("relays a signed approval, then is refused when the same call is altered after signing", async () => {
-    const account = privateKeyToAccount(ensureDemoKey(memoryStorage()));
+    const account = privateKeyToAccount(ensureDemoKey("testnet", memoryStorage()));
     const signer = { signTypedData: account.signTypedData };
     const twin = twinAddress(account.address, NETWORK);
     const { usdc, hub, rpcUrl } = NETWORK.stellar;

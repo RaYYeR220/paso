@@ -1,5 +1,6 @@
 import type { InboundRoute, NetworkName } from "@paso/sdk";
 import type { Address, Hex } from "viem";
+import type { DeclineReason } from "../api";
 
 /** Who pays the burn on Base: the connected wallet, or the testnet faucet. */
 export type FundingVia = "wallet" | "demo";
@@ -46,6 +47,8 @@ export type FundingFailureCode =
   /** The faucet has given out its daily total. */
   | "faucet_daily_limit"
   | "insufficient_usdc"
+  /** More than the app brings over in one transfer on this network. */
+  | "over_ceiling"
   | "insufficient_gas"
   | "wrong_network"
   /** Circle never saw the burn: wrong hash, or the burn did not confirm. */
@@ -87,6 +90,13 @@ export type FundingState =
       attestation: AttestationProgress;
       /** Why Circle holds a fast transfer back, when it says. */
       delayReason?: string;
+      /**
+       * Why the relayer is not delivering for now, when it says: it is not
+       * serving the network, or has spent what it spends. The burn is not
+       * affected. Circle has attested it or will, and it can be delivered
+       * later, by this relayer or by anyone.
+       */
+      held?: DeclineReason;
     }
   | { phase: "delivering"; transfer: Transfer; startedAt: number }
   | {
@@ -105,7 +115,7 @@ export type FundingEvent =
   | { type: "BURNED"; transfer: Transfer }
   /** Tracking picked up again: after a reload, or for a burn made elsewhere. */
   | { type: "RESUMED"; transfer: Transfer }
-  | { type: "PENDING"; attestation: AttestationProgress; delayReason?: string }
+  | { type: "PENDING"; attestation: AttestationProgress; delayReason?: string; held?: DeclineReason }
   | { type: "DELIVERING" }
   | { type: "DELIVERED"; hash?: string; route: InboundRoute; at: number }
   | { type: "FAILED"; reason: FundingFailure; at: number }
@@ -169,6 +179,7 @@ export function fundingReducer(state: FundingState, event: FundingEvent): Fundin
         startedAt: state.phase === "burned" ? state.transfer.startedAt : state.startedAt,
         attestation: event.attestation,
         ...(event.delayReason ? { delayReason: event.delayReason } : {}),
+        ...(event.held ? { held: event.held } : {}),
       };
 
     case "DELIVERING":

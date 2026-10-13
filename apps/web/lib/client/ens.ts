@@ -3,7 +3,7 @@ import { mainnet } from "viem/chains";
 import { normalize } from "viem/ens";
 
 /** Public Ethereum mainnet endpoints. ENS lives on mainnet whichever network the app works on. */
-const MAINNET_RPC_URLS = [
+export const MAINNET_RPC_URLS = [
   "https://ethereum-rpc.publicnode.com",
   "https://eth.drpc.org",
   "https://eth.llamarpc.com",

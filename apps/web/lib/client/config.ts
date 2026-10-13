@@ -1,12 +1,24 @@
 import { NETWORKS, type NetworkConfig, type NetworkName } from "@paso/sdk";
 import { rpc } from "@stellar/stellar-sdk";
 
-/** The network the app works on. Only its name is public; everything else comes from the SDK. */
-export const NETWORK_NAME: NetworkName = process.env.NEXT_PUBLIC_PASO_NETWORK === "mainnet" ? "mainnet" : "testnet";
+/**
+ * Nothing in the client is tied to one network. The page chooses one, and
+ * everything that depends on it, from an account's address to an explorer
+ * link, is handed that choice: a `NetworkConfig`, or its name where the name
+ * is all that is needed.
+ */
 
-export const NETWORK: NetworkConfig = NETWORKS[NETWORK_NAME];
+/** Everything the SDK knows about a network: its contracts, its endpoints, its side of Base. */
+export function networkConfig(name: NetworkName): NetworkConfig {
+  return NETWORKS[name];
+}
 
-/** The app's own API routes. */
+/** A network's name as the app writes it. */
+export function networkLabel(name: NetworkName): "Testnet" | "Mainnet" {
+  return name === "mainnet" ? "Mainnet" : "Testnet";
+}
+
+/** The app's own API routes. The network a request is for goes in its body. */
 export const ROUTES = {
   relay: "/api/relay",
   deploy: "/api/deploy",
@@ -17,7 +29,7 @@ export const ROUTES = {
 } as const;
 
 /** Contracts worth naming next to their address. */
-export function contractName(address: string, network: NetworkConfig = NETWORK): string | undefined {
+export function contractName(address: string, network: NetworkConfig): string | undefined {
   const { usdc, hub, forwarder, tokenMessenger, messageTransmitter } = network.stellar;
   switch (address) {
     case usdc:
@@ -35,10 +47,15 @@ export function contractName(address: string, network: NetworkConfig = NETWORK):
   }
 }
 
-let server: rpc.Server | undefined;
+const servers = new Map<string, rpc.Server>();
 
-/** One Stellar RPC client for every read the browser makes. */
-export function stellarServer(): rpc.Server {
-  server ??= new rpc.Server(NETWORK.stellar.rpcUrl);
+/** One Stellar RPC client per network for every read the browser makes there. */
+export function stellarServer(network: NetworkConfig): rpc.Server {
+  const { rpcUrl } = network.stellar;
+  let server = servers.get(rpcUrl);
+  if (!server) {
+    server = new rpc.Server(rpcUrl);
+    servers.set(rpcUrl, server);
+  }
   return server;
 }

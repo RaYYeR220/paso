@@ -1,26 +1,17 @@
 "use client";
 
+import { receiveMessageOnEvm, type NetworkName } from "@paso/sdk";
 import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
-import type { Address } from "viem";
-import { NETWORK_NAME, ROUTES } from "./config";
-import {
-  askExit,
-  createExitWatcher,
-  exitStages,
-  exitStorageKey,
-  IDLE_EXIT,
-  type ExitStage,
-  type ExitState,
-  type ExitWatcher,
-} from "./exit";
+import { networkConfig } from "./config";
+import { exitStages, IDLE_EXIT, type ExitStage, type ExitState } from "./exit";
 import { baseTx, stellarTx } from "./explorer";
+import { exitWatcherFor } from "./registry";
 import { useSigner } from "./signer";
-import { browserStorage } from "./storage";
 import { noSubscription } from "./store";
 import { useAction } from "./useAction";
 import { useNow } from "./useNow";
 
-/** USDC sent back to Base, followed from the burn on Stellar to the mint on Base. */
+/** USDC sent back to Base, followed from the burn on Stellar to the mint on Base, on one network. */
 export interface Exit {
   state: ExitState;
   phase: ExitState["phase"];
@@ -35,6 +26,14 @@ export interface Exit {
     base: string | null;
   };
   /**
+   * True when the last step is the owner's to make: Circle has attested the
+   * burn, the server does not pay for mints on this network, and a wallet is
+   * connected that can submit one.
+   */
+  canMint: boolean;
+  /** Has the connected wallet submit the mint on Base. It pays the gas; the USDC goes to the recipient that was signed for. */
+  mint(): Promise<void>;
+  /**
    * The burn on record: followed until it is minted, whatever happens to the
    * page meanwhile. `saved` is false when the browser keeps no storage, so a
    * reload would forget the tracker (never the USDC).
@@ -44,35 +43,21 @@ export interface Exit {
   stopTracking(): void;
 }
 
-const watchers = new Map<string, ExitWatcher>();
-
-function watcherFor(owner: Address): ExitWatcher {
-  const key = owner.toLowerCase();
-  let watcher = watchers.get(key);
-  if (!watcher) {
-    watcher = createExitWatcher({
-      ask: (txHash, signal) => askExit(txHash, { url: ROUTES.complete, network: NETWORK_NAME, signal }),
-      storage: browserStorage(),
-      storageKey: exitStorageKey(NETWORK_NAME, owner),
-    });
-    watchers.set(key, watcher);
-  }
-  return watcher;
-}
-
 const idle = (): ExitState => IDLE_EXIT;
 
 /**
- * Follows the connected owner's transfer back to Base. One in flight survives
- * a reload: it is picked up again as soon as the same owner is connected.
+ * Follows the connected owner's transfer back to Base on `network`. One in
+ * flight survives a reload: it is picked up again as soon as the same owner
+ * is connected on the same network.
  */
-export function useExit(): Exit {
-  const signer = useSigner();
+export function useExit(network: NetworkName): Exit {
+  const signer = useSigner(network);
   const owner = signer.status === "connected" ? signer.address : null;
-  const watcher = owner ? watcherFor(owner) : null;
-  const action = useAction();
+  const watcher = owner ? exitWatcherFor(network, owner) : null;
+  const action = useAction(network);
   const state = useSyncExternalStore(watcher?.subscribe ?? noSubscription, watcher?.getState ?? idle, idle);
-  const now = useNow("second", state.phase === "attesting");
+  const waiting = state.phase === "attesting" || state.phase === "attested" || state.phase === "minting";
+  const now = useNow("second", waiting);
 
   useEffect(() => {
     watcher?.restore();
@@ -82,14 +67,25 @@ export function useExit(): Exit {
   const hash = done?.hash ?? null;
   const finishedAt = done?.finishedAt ?? null;
   useEffect(() => {
-    if (hash !== null && finishedAt !== null) watcher?.watch({ stellarTxHash: hash, startedAt: finishedAt });
-  }, [watcher, hash, finishedAt]);
+    if (hash !== null && finishedAt !== null) watcher?.watch({ network, stellarTxHash: hash, startedAt: finishedAt });
+  }, [watcher, network, hash, finishedAt]);
 
   const stopTracking = useCallback(() => watcher?.stopTracking(), [watcher]);
 
+  const hasWallet = !signer.isDemo && signer.wallet.address !== null;
+  const { evmClients } = signer.wallet;
+  const mint = useCallback(async () => {
+    if (!watcher || !hasWallet) return;
+    await watcher.mint(async ({ message, attestation, onSubmitted }) => {
+      const clients = await evmClients();
+      return receiveMessageOnEvm({ ...clients, message, attestation, network: networkConfig(network), onSubmitted });
+    });
+  }, [watcher, hasWallet, evmClients, network]);
+
   return useMemo(() => {
     const transfer = state.phase === "idle" ? null : state.transfer;
-    const until = state.phase === "minted" ? state.finishedAt : state.phase === "attesting" ? now : null;
+    const until = state.phase === "minted" ? state.finishedAt : waiting ? now : null;
+    const mintTxHash = state.phase === "minted" || state.phase === "minting" ? state.baseTxHash : undefined;
     // The record changes only together with the state, so reading it here keeps the two in step.
     const onRecord = watcher?.tracked() ?? null;
     return {
@@ -98,13 +94,19 @@ export function useExit(): Exit {
       stages: exitStages(state),
       elapsedSeconds: transfer && until !== null ? Math.max(0, Math.floor((until - transfer.startedAt) / 1000)) : null,
       links: {
-        stellar: transfer ? stellarTx(transfer.stellarTxHash) : null,
-        base: state.phase === "minted" && state.baseTxHash ? baseTx(state.baseTxHash) : null,
+        stellar: transfer ? stellarTx(transfer.stellarTxHash, network) : null,
+        base: mintTxHash ? baseTx(mintTxHash, network) : null,
       },
+      canMint: state.phase === "attested" && hasWallet,
+      mint,
       tracked: onRecord
-        ? { stellarTxHash: onRecord.transfer.stellarTxHash, link: stellarTx(onRecord.transfer.stellarTxHash), saved: onRecord.saved }
+        ? {
+            stellarTxHash: onRecord.transfer.stellarTxHash,
+            link: stellarTx(onRecord.transfer.stellarTxHash, network),
+            saved: onRecord.saved,
+          }
         : null,
       stopTracking,
     };
-  }, [state, now, watcher, stopTracking]);
+  }, [state, waiting, now, network, watcher, hasWallet, mint, stopTracking]);
 }

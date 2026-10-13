@@ -1,10 +1,11 @@
 "use client";
 
+import type { NetworkName } from "@paso/sdk";
 import { useCallback, useMemo, useSyncExternalStore } from "react";
 import type { ChainActivity } from "./activity/events";
 import type { LogEntry } from "./activity/log";
 import { mergeActivity, type ActivityItem } from "./activity/merge";
-import { NETWORK } from "./config";
+import { networkConfig } from "./config";
 import { activityLogFor, chainActivityFor } from "./registry";
 import { idleResource, type ResourceState } from "./resource";
 import { noSubscription } from "./store";
@@ -36,16 +37,16 @@ const NO_LOG: LogEntry[] = [];
 const idle = (): ResourceState<ChainActivity> => idleResource<ChainActivity>();
 const noLog = (): LogEntry[] => NO_LOG;
 
-/** The activity of the Stellar account `twin` (`C…`), kept fresh while the tab is visible. */
-export function useActivity(twin: string | null | undefined): Activity {
-  const resource = twin ? chainActivityFor(twin) : null;
-  const log = twin ? activityLogFor(twin) : null;
+/** The activity of the Stellar account `twin` (`C…`) on `network`, kept fresh while the tab is visible. */
+export function useActivity(twin: string | null | undefined, network: NetworkName): Activity {
+  const resource = twin ? chainActivityFor(network, twin) : null;
+  const log = twin ? activityLogFor(network, twin) : null;
   const chain = useSyncExternalStore(resource?.subscribe ?? noSubscription, resource?.getState ?? idle, idle);
   const entries = useSyncExternalStore(log?.subscribe ?? noSubscription, log?.list ?? noLog, noLog);
   const refresh = useCallback(() => resource?.refresh() ?? Promise.resolve(), [resource]);
 
   return useMemo(() => {
-    const items = twin ? mergeActivity(chain.data?.transfers ?? [], entries, { account: twin, network: NETWORK }) : [];
+    const items = twin ? mergeActivity(chain.data?.transfers ?? [], entries, { account: twin, network: networkConfig(network) }) : [];
     return {
       items,
       status: chain.status,
@@ -55,5 +56,5 @@ export function useActivity(twin: string | null | undefined): Activity {
       refreshing: chain.refreshing,
       refresh,
     };
-  }, [twin, chain, entries, refresh]);
+  }, [twin, network, chain, entries, refresh]);
 }

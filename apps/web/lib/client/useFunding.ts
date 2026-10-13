@@ -1,9 +1,10 @@
 "use client";
 
-import { parseEvmAmount } from "@paso/sdk";
+import { parseEvmAmount, type NetworkName } from "@paso/sdk";
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type { Hex } from "viem";
-import { NETWORK } from "./config";
+import { networkConfig } from "./config";
+import { describeError } from "./errors";
 import { baseTx, stellarAddress, stellarTx } from "./explorer";
 import { formatBaseUsdc } from "./format";
 import {
@@ -15,7 +16,7 @@ import {
   type FundingVia,
   type TrackerStage,
 } from "./funding/machine";
-import { burnAmountProblem, FAUCET_AMOUNT, WALLET_BURN_MIN } from "./funding/limits";
+import { burnAmountProblem, burnCeiling, FAUCET_AMOUNT, WALLET_BURN_MIN } from "./funding/limits";
 import { baseBalanceFor, fundingFor, refreshAccount } from "./registry";
 import { idleResource, type ResourceState } from "./resource";
 import { useSigner } from "./signer";
@@ -34,9 +35,19 @@ export interface FundingLimits {
   /** The most a wallet can burn: the USDC it holds on Base. `null` with the demo key, and until the balance is read. */
   max: bigint | null;
   maxFormatted: string | null;
+  /** The app's own ceiling on one transfer on this network; `null` where there is none. */
+  ceiling: bigint | null;
+  ceilingFormatted: string | null;
 }
 
-/** Bringing USDC from Base to the connected owner's Stellar account. */
+/** Where the check that a wallet signs with its own key stands. A wallet is offered no transfer before it has passed. */
+export type KeyCheck =
+  /** Not a wallet, or a wallet this browser has seen sign with its key. */
+  | { status: "passed" }
+  | { status: "needed"; notice?: "declined"; problem?: string }
+  | { status: "asking" };
+
+/** Bringing USDC from Base to the connected owner's Stellar account, on one network. */
 export interface Funding {
   /** The state machine: idle → requesting → burned → attesting → delivering → minted | failed. */
   state: FundingState;
@@ -61,6 +72,10 @@ export interface Funding {
   limits: FundingLimits;
   /** What was wrong with the amount typed, when `start` did not begin. */
   inputError: string | null;
+  /** Whether the connected wallet has shown that it signs with its own key. `start` does nothing for a wallet until it has. */
+  keyCheck: KeyCheck;
+  /** Asks the wallet for the key check: one message that moves nothing. */
+  checkKey(): Promise<void>;
   /**
    * Starts a transfer. With a wallet, `amount` is USDC as decimal text
    * (`"10"`) or in Base's 6-decimal units; with the demo key the faucet
@@ -87,15 +102,17 @@ const idle = (): FundingState => IDLE_FUNDING;
 const noBalance = (): ResourceState<bigint> => idleResource<bigint>();
 
 /**
- * The inbound flow for the connected owner. A transfer in flight survives a
- * reload: it is picked up again as soon as the same owner is connected.
+ * The inbound flow for the connected owner on `network`. A transfer in
+ * flight survives a reload: it is picked up again as soon as the same owner
+ * is connected on the same network.
  */
-export function useFunding(): Funding {
-  const signer = useSigner();
+export function useFunding(network: NetworkName): Funding {
+  const signer = useSigner(network);
   const owner = signer.status === "connected" ? signer.address : null;
-  const controller = owner ? fundingFor(owner) : null;
+  const controller = owner ? fundingFor(network, owner) : null;
   const state = useSyncExternalStore(controller?.subscribe ?? noSubscription, controller?.getState ?? idle, idle);
   const [inputError, setInputError] = useState<string | null>(null);
+  const [check, setCheck] = useState<{ asking: boolean; notice?: "declined"; problem?: string }>({ asking: false });
 
   useEffect(() => {
     controller?.restore();
@@ -103,14 +120,16 @@ export function useFunding(): Funding {
 
   const isDemo = signer.isDemo;
   // Only a wallet pays its own burn, so only a wallet's USDC on Base sets a ceiling.
-  const balance = owner && !isDemo ? baseBalanceFor(owner) : null;
+  const balance = owner && !isDemo ? baseBalanceFor(network, owner) : null;
   const held = useSyncExternalStore(balance?.subscribe ?? noSubscription, balance?.getState ?? noBalance, noBalance);
   const max = held.data;
+  const ceiling = isDemo ? null : burnCeiling(network);
+  const chainName = networkConfig(network).evm.chain.name;
 
   const minted = state.phase === "minted";
   useEffect(() => {
-    if (minted && owner) refreshAccount(owner);
-  }, [minted, owner]);
+    if (minted && owner) refreshAccount(network, owner);
+  }, [minted, owner, network]);
 
   const burnKnown = "transfer" in state;
   useEffect(() => {
@@ -120,7 +139,19 @@ export function useFunding(): Funding {
   const active = isFundingActive(state);
   const now = useNow("second", active);
 
-  const evmClients = signer.wallet.evmClients;
+  const { evmClients, keyProven, proveKey } = signer.wallet;
+  const proven = isDemo || keyProven;
+  const checkKey = useCallback(async () => {
+    setCheck({ asking: true });
+    try {
+      await proveKey();
+      setCheck({ asking: false });
+    } catch (error) {
+      const problem = describeError(error);
+      setCheck(problem.kind === "rejected" ? { asking: false, notice: "declined" } : { asking: false, problem: problem.message });
+    }
+  }, [proveKey]);
+
   const start = useCallback(
     async (amount?: string | bigint) => {
       if (!controller) return;
@@ -129,6 +160,7 @@ export function useFunding(): Funding {
         await controller.start({ via: "demo" });
         return;
       }
+      if (!proven) return;
       let units: bigint;
       try {
         units = typeof amount === "bigint" ? amount : parseEvmAmount(amount ?? "");
@@ -136,14 +168,14 @@ export function useFunding(): Funding {
         setInputError(error instanceof Error ? error.message : "Enter an amount");
         return;
       }
-      const problem = burnAmountProblem(units, { min: WALLET_BURN_MIN, max }, NETWORK.evm.chain.name);
+      const problem = burnAmountProblem(units, { min: WALLET_BURN_MIN, max, ceiling }, chainName);
       if (problem) {
         setInputError(problem);
         return;
       }
       await controller.start({ via: "wallet", amount: units, clients: evmClients });
     },
-    [controller, isDemo, evmClients, max],
+    [controller, isDemo, proven, evmClients, max, ceiling, chainName],
   );
   const resume = useCallback((burnTxHash: Hex) => controller?.resume(burnTxHash) ?? false, [controller]);
   const retry = useCallback(() => controller?.retry() ?? false, [controller]);
@@ -170,6 +202,11 @@ export function useFunding(): Funding {
 
     // The record changes only together with the state, so reading it here keeps the two in step.
     const onRecord = controller?.tracked() ?? null;
+    const keyCheck: KeyCheck = proven
+      ? { status: "passed" }
+      : check.asking
+        ? { status: "asking" }
+        : { status: "needed", ...(check.notice ? { notice: check.notice } : {}), ...(check.problem ? { problem: check.problem } : {}) };
 
     return {
       state,
@@ -180,12 +217,12 @@ export function useFunding(): Funding {
       elapsedSeconds,
       amountFormatted: amount ? formatBaseUsdc(BigInt(amount)) : null,
       links: {
-        base: burnTxHash ? baseTx(burnTxHash) : null,
+        base: burnTxHash ? baseTx(burnTxHash, network) : null,
         stellar:
           state.phase === "minted"
             ? state.stellarTxHash
-              ? stellarTx(state.stellarTxHash)
-              : stellarAddress(state.transfer.twin)
+              ? stellarTx(state.stellarTxHash, network)
+              : stellarAddress(state.transfer.twin, network)
             : null,
       },
       limits: {
@@ -195,16 +232,20 @@ export function useFunding(): Funding {
         minFormatted: formatBaseUsdc(WALLET_BURN_MIN),
         max,
         maxFormatted: max === null ? null : formatBaseUsdc(max),
+        ceiling,
+        ceilingFormatted: ceiling === null ? null : formatBaseUsdc(ceiling),
       },
       inputError,
+      keyCheck,
+      checkKey,
       start,
       resume,
       retry,
       reset,
       tracked: onRecord
-        ? { burnTxHash: onRecord.transfer.burnTxHash, link: baseTx(onRecord.transfer.burnTxHash), saved: onRecord.saved }
+        ? { burnTxHash: onRecord.transfer.burnTxHash, link: baseTx(onRecord.transfer.burnTxHash, network), saved: onRecord.saved }
         : null,
       stopTracking,
     };
-  }, [state, active, now, owner, isDemo, max, inputError, controller, start, resume, retry, reset, stopTracking]);
+  }, [state, active, now, owner, network, isDemo, max, ceiling, inputError, proven, check, checkKey, controller, start, resume, retry, reset, stopTracking]);
 }

@@ -1,5 +1,6 @@
 "use client";
 
+import type { NetworkName } from "@paso/sdk";
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type { Address } from "viem";
 import { resolveEnsName } from "./ens";
@@ -9,7 +10,7 @@ import { parseOwnerInput, type ParsedOwner } from "./parse";
 import { createStore, type Store } from "./store";
 import { useTwin, type Twin } from "./useTwin";
 
-/** The Stellar account behind whatever was typed: an Ethereum address or an ENS name. */
+/** The Stellar account, on one network, behind whatever was typed: an Ethereum address or an ENS name. */
 export interface Lookup {
   /** What the input is: nothing, an address, a name, or neither. Decided without the network. */
   parsed: ParsedOwner;
@@ -85,11 +86,12 @@ function useSettled<T>(value: T, ms: number): T {
 }
 
 /**
- * Looks up the Stellar account of an Ethereum address or ENS name as it is
- * typed. An address answers at once and offline; a name is resolved on
- * Ethereum mainnet after a short pause in typing.
+ * Looks up the Stellar account of an Ethereum address or ENS name on
+ * `network` as it is typed. An address answers at once and offline; a name is
+ * resolved on Ethereum mainnet, whichever network the account is on, after a
+ * short pause in typing.
  */
-export function useLookup(input: string): Lookup {
+export function useLookup(input: string, network: NetworkName): Lookup {
   const parsed = useMemo(() => parseOwnerInput(input), [input]);
   const typedName = parsed.kind === "ens" ? parsed.name : null;
   const settledName = useSettled(typedName, DEBOUNCE_MS);
@@ -107,7 +109,7 @@ export function useLookup(input: string): Lookup {
       : name && resolution.status === "resolved"
         ? resolution.address
         : null;
-  const twin = useTwin(owner);
+  const twin = useTwin(owner, network);
 
   return useMemo(() => {
     let status: Lookup["status"];
@@ -146,7 +148,7 @@ export function useLookup(input: string): Lookup {
       owner,
       twin,
       error,
-      ownerLink: owner ? baseAddress(owner) : null,
+      ownerLink: owner ? baseAddress(owner, network) : null,
     };
-  }, [parsed, name, typedName, resolution, owner, twin]);
+  }, [parsed, name, typedName, resolution, owner, twin, network]);
 }

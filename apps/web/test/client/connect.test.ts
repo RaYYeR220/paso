@@ -37,21 +37,21 @@ describe("connecting a wallet", () => {
   it("names the wallet being opened while it is pending, and clears it once connected", async () => {
     const config = configWith();
     expect(signerState.get().connectingId).toBeNull();
-    const seen = await watching(() => connectWallet(config, "mock"));
+    const seen = await watching(() => connectWallet(config, "testnet", "mock"));
     expect(seen).toEqual(["mock", null]);
     expect(getAccount(config)).toMatchObject({ status: "connected", address: owner.address });
-    expect(signerState.get()).toMatchObject({ chosen: "wallet", connectingId: null, error: null });
+    expect(signerState.get()).toMatchObject({ chosen: { testnet: "wallet", mainnet: null }, connectingId: null, error: null });
   });
 
   it("opens one wallet for two clicks", async () => {
     const config = configWith();
-    const seen = await watching(() => Promise.all([connectWallet(config, "mock"), connectWallet(config, "mock")]));
+    const seen = await watching(() => Promise.all([connectWallet(config, "testnet", "mock"), connectWallet(config, "testnet", "mock")]));
     expect(seen).toEqual(["mock", null]);
   });
 
   it("clears the pending wallet and reports nothing when the owner declines", async () => {
     const config = configWith({ connectError: Object.assign(new Error("User rejected the request."), { code: 4001 }) });
-    const seen = await watching(() => connectWallet(config, "mock"));
+    const seen = await watching(() => connectWallet(config, "testnet", "mock"));
     expect(seen).toEqual(["mock", null]);
     expect(getAccount(config).status).toBe("disconnected");
     expect(signerState.get()).toMatchObject({ connectingId: null, error: null });
@@ -59,13 +59,24 @@ describe("connecting a wallet", () => {
 
   it("clears the pending wallet and says why when the wallet fails", async () => {
     const config = configWith({ connectError: new Error("The wallet is locked") });
-    await connectWallet(config, "mock");
+    await connectWallet(config, "testnet", "mock");
     expect(signerState.get()).toMatchObject({ connectingId: null, error: "The wallet is locked" });
+  });
+
+  it("remembers the wallet for the network it was connected on, and for that one only", async () => {
+    const config = configWith();
+    await connectWallet(config, "mainnet", "mock");
+    expect(signerState.get().chosen.mainnet).toBe("wallet");
+
+    // Already connected: choosing it on the other network asks the wallet nothing.
+    const seen = await watching(() => connectWallet(config, "testnet", "mock"));
+    expect(seen).toEqual([]);
+    expect(signerState.get().chosen).toEqual({ testnet: "wallet", mainnet: "wallet" });
   });
 
   it("does not open some other wallet when the one asked for is not there", async () => {
     const config = configWith();
-    const seen = await watching(() => connectWallet(config, "io.not.installed"));
+    const seen = await watching(() => connectWallet(config, "testnet", "io.not.installed"));
     expect(seen).toEqual([]);
     expect(getAccount(config).status).toBe("disconnected");
     expect(signerState.get().error).toMatch(/No wallet is available/);

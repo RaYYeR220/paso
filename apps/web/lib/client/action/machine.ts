@@ -1,4 +1,4 @@
-import type { Call, Prepared } from "@paso/sdk";
+import type { Call, DescribedCall, NetworkName, OwnerKind, Prepared } from "@paso/sdk";
 import type { xdr } from "@stellar/stellar-sdk";
 import type { Address } from "viem";
 import type { ProblemError } from "../errors";
@@ -26,9 +26,44 @@ export interface Recipient {
   name?: string;
 }
 
+/** What is known about the Ethereum address whose Stellar account a transfer pays. */
+export interface RecipientCheck {
+  /** A wallet with a key, a contract without one, or not known. */
+  kind: OwnerKind;
+  /** Whether that address's Stellar account exists yet; `null` when that could not be read. */
+  deployed: boolean | null;
+}
+
+/**
+ * Something the owner has to read and answer before the wallet is asked.
+ *
+ * - `recipient_contract`: the recipient is a smart contract. It has no key,
+ *   so its Stellar account could never move what is sent. Blocked unless
+ *   overridden in so many words.
+ * - `recipient_unknown`: it could not be checked whether it is one.
+ * - `recipient_unproven`: no code was found, and the address has never used
+ *   its account. A smart wallet that is not deployed yet looks the same.
+ * - `arguments`: a generic call carries text that can mislead in a wallet, or
+ *   a value that is bound by its hash and cannot be read.
+ */
+export type Caution = "recipient_contract" | "recipient_unknown" | "recipient_unproven" | "arguments";
+
+/** The cautions a recipient calls for. An account that exists was deployed for a call its owner signed, or by someone who chose to. */
+export function cautionsFor(check: RecipientCheck | null): Caution[] {
+  if (!check) return [];
+  if (check.kind === "contract") return ["recipient_contract"];
+  if (check.kind === "unknown") return ["recipient_unknown"];
+  return check.deployed === true ? [] : ["recipient_unproven"];
+}
+
 /** A prepared call, ready for the owner to read and sign. */
 export interface Review {
   request: ActionRequest;
+  /**
+   * The network the call was prepared for, and the only one its signature is
+   * good on. The wallet prompt does not say it in words: the review does.
+   */
+  network: NetworkName;
   owner: Address;
   /** The SDK's prepared call: typed data, entry, expiry. */
   prepared: Prepared;
@@ -39,8 +74,25 @@ export interface Review {
   recipient: Recipient | null;
   /** USDC moved, in 7-decimal units; `null` for a generic call. */
   amount: bigint | null;
+  /** What has to be confirmed before the wallet is asked. Empty when nothing stands in the way. */
+  cautions: Caution[];
+  /**
+   * For a generic call: each call with the type of every argument and what
+   * to watch for in it. The signed text carries neither. Absent for the
+   * transfers and exits the app builds itself.
+   */
+  described?: DescribedCall[];
   /** When the call was prepared, in milliseconds. */
   preparedAt: number;
+  /** The last ledger at which the signature is accepted. */
+  validUntilLedger: number;
+  /**
+   * About when the signature stops being accepted, in milliseconds: the
+   * ledgers it has, at the pace ledgers close. Until then the signed request
+   * can be submitted by anyone who holds it, whether or not a first attempt
+   * went through; after it, by nobody.
+   */
+  expiresAt: number;
 }
 
 /** What was put in front of the account contract, next to what the wallet showed. */
@@ -143,8 +195,23 @@ export function reviewOf(state: ActionState): Review | undefined {
     case "failed":
       return state.review;
     default: {
-      const { request, owner, prepared, calls, message, recipient, amount, preparedAt } = state;
-      return { request, owner, prepared, calls, message, recipient, amount, preparedAt };
+      const { request, network, owner, prepared, calls, message, recipient, amount, cautions, described, preparedAt, validUntilLedger, expiresAt } =
+        state;
+      return {
+        request,
+        network,
+        owner,
+        prepared,
+        calls,
+        message,
+        recipient,
+        amount,
+        cautions,
+        ...(described ? { described } : {}),
+        preparedAt,
+        validUntilLedger,
+        expiresAt,
+      };
     }
   }
 }
@@ -254,14 +321,14 @@ export function panelsOf(state: ActionState, nameOf?: (address: string) => strin
     case "review":
     case "signing":
     case "expired":
-      return comparePanels(state.message, null, "unsigned", nameOf);
+      return comparePanels(state.message, null, "unsigned", nameOf, state.described);
     case "relaying":
-      return comparePanels(state.message, state.attempted, "checking", nameOf);
+      return comparePanels(state.message, state.attempted, "checking", nameOf, state.described);
     case "done":
-      return comparePanels(state.message, state.attempted, "match", nameOf);
+      return comparePanels(state.message, state.attempted, "match", nameOf, state.described);
     case "refused":
-      return comparePanels(state.message, state.attempted, "refused", nameOf);
+      return comparePanels(state.message, state.attempted, "refused", nameOf, state.described);
     case "failed":
-      return state.review ? comparePanels(state.review.message, null, "unsigned", nameOf) : NO_PANELS;
+      return state.review ? comparePanels(state.review.message, null, "unsigned", nameOf, state.review.described) : NO_PANELS;
   }
 }
