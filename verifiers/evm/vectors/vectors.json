@@ -1,10 +1,10 @@
 {
   "domain": {
     "name": "Paso verifier",
-    "version": "1"
+    "version": "2"
   },
   "domainType": "EIP712Domain(string name,string version,bytes32 salt)",
-  "authorizationType": "Authorization(bytes32 payload)",
+  "authorizationType": "Authorization(string account,bytes32 payload)",
   "vectors": [
     {
       "name": "testnet",
@@ -13,10 +13,12 @@
       "networkId": "0xcee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
       "signer": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
       "privateKey": "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "account": "CCQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2CNSG",
+      "keyData": "0xfcad0b19bb29d4674531d6f115237e16afce377ca1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
       "payload": "0x7214aeaad7675913a0fba208d96abb9e96fbe29511b720abc74f978d476dcdba",
-      "domainSeparator": "0x95dee67d2aa9eceb9b4e00a8efb9e6ae3a298da70a4917b74e25d9c916650bff",
-      "digest": "0x5c996f94348b947b8bf1312ceda0313588544a12654fafe459755cc050719b70",
-      "signature": "0x921fa6d7fe4d29d4c7b7d2cc5d9c3eadecd4ff8a59e9254907e2e8d2ba3579925c29e18045456a0b9bfabfc8673d67b942b9c23866af107421c49252417860da1c"
+      "domainSeparator": "0x68426afcc42851cbdb7e39d8ab1d4202e259bb4be9955a51794a6f7e3ae23788",
+      "digest": "0x8f641c3a6530e22caa6fb0967a9d6841ac14ec3a0f52f5acf7fd19db84bb7acf",
+      "signature": "0x4f8476c9137236c53f946a271c274d2a2e85868ecd7ce5414cbbc5f060f5ca81428a3f6b5b069732b727002f1325c38e7df53917c7ae9e37c93f742d7d852e131b"
     },
     {
       "name": "another_payload",
@@ -25,10 +27,12 @@
       "networkId": "0xcee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
       "signer": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
       "privateKey": "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "account": "CCQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2CNSG",
+      "keyData": "0xfcad0b19bb29d4674531d6f115237e16afce377ca1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
       "payload": "0x76dc254b51ed4bd9f2229a07320f8d6475968ca5328ac97fa929a989ec3ccd4e",
-      "domainSeparator": "0x95dee67d2aa9eceb9b4e00a8efb9e6ae3a298da70a4917b74e25d9c916650bff",
-      "digest": "0x95812a246695f18201a981e3d097f1b0ee26c879abc82f74ac5988b69368c302",
-      "signature": "0x61c42386e888462f107ae53462b09a43e888f3a6b7050e04b2b3c0e330f1acf17f16f054301768557e3964863479863dc7ef2a513fea7e5d9edb761b031b18181c"
+      "domainSeparator": "0x68426afcc42851cbdb7e39d8ab1d4202e259bb4be9955a51794a6f7e3ae23788",
+      "digest": "0xcfae8ae67572d7fafdfff4ba19f740263f90a43fd8f432eb710e51f9ca08914c",
+      "signature": "0x3aff2472a231c11f905fb18025f0cb57598aed876035d6740565a1cb90acbc641677aa2a15918de8f1cef277779094696a32403203eb5d2e73040dd20a6bc4571b"
     },
     {
       "name": "second_signer",
@@ -37,10 +41,26 @@
       "networkId": "0xcee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
       "signer": "0x6A9296CEb89D12e1F53b2Dd5Df45d3ADB3A814c2",
       "privateKey": "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      "account": "CCQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2CNSG",
+      "keyData": "0x6a9296ceb89d12e1f53b2dd5df45d3adb3a814c2a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
       "payload": "0x7214aeaad7675913a0fba208d96abb9e96fbe29511b720abc74f978d476dcdba",
-      "domainSeparator": "0x95dee67d2aa9eceb9b4e00a8efb9e6ae3a298da70a4917b74e25d9c916650bff",
-      "digest": "0x5c996f94348b947b8bf1312ceda0313588544a12654fafe459755cc050719b70",
-      "signature": "0x2a90c7af4e3769d348019c7a4dfb7dfd533c65157fcaa55b42a7b22f97bba9e41d8d0bbad67057dac40b8e53f6693225074461804a97e89a3043a3bfa2c122791c"
+      "domainSeparator": "0x68426afcc42851cbdb7e39d8ab1d4202e259bb4be9955a51794a6f7e3ae23788",
+      "digest": "0x8f641c3a6530e22caa6fb0967a9d6841ac14ec3a0f52f5acf7fd19db84bb7acf",
+      "signature": "0x787c79e2b18127a93288e559b48e0cfe4496ef7efffb25ac6f9ccff026c2ae41307cb007cb656c013da601c94bea734109af85e977909bc608bc0d939680eac31b"
+    },
+    {
+      "name": "another_account",
+      "network": "testnet",
+      "networkPassphrase": "Test SDF Network ; September 2015",
+      "networkId": "0xcee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
+      "signer": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+      "privateKey": "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "account": "CCZLFMVSWKZLFMVSWKZLFMVSWKZLFMVSWKZLFMVSWKZLFMVSWKZLEB3K",
+      "keyData": "0xfcad0b19bb29d4674531d6f115237e16afce377cb2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+      "payload": "0x7214aeaad7675913a0fba208d96abb9e96fbe29511b720abc74f978d476dcdba",
+      "domainSeparator": "0x68426afcc42851cbdb7e39d8ab1d4202e259bb4be9955a51794a6f7e3ae23788",
+      "digest": "0x3b2dba78a5d5b5e476c97d2c6a1f016d82e94276229805c2e560067915393e5f",
+      "signature": "0x51b7dcce7a83b878d40dd749da062c521c7d7292bfd989a0a578b47da6922f9276d369c4d726c261793060b31d387482dac3af18c726f08ae12cb6c3f9d144081c"
     },
     {
       "name": "mainnet",
@@ -49,10 +69,12 @@
       "networkId": "0x7ac33997544e3175d266bd022439b22cdb16508c01163f26e5cb2a3e1045a979",
       "signer": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
       "privateKey": "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "account": "CCQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2CNSG",
+      "keyData": "0xfcad0b19bb29d4674531d6f115237e16afce377ca1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
       "payload": "0x7214aeaad7675913a0fba208d96abb9e96fbe29511b720abc74f978d476dcdba",
-      "domainSeparator": "0x11855807d58ec536c5a942428d802e0258430c948b63a0a28018712794886e1a",
-      "digest": "0x54d594a0d8a07e8e10b746e33541f58a58f5f900a07c6123acf18d9883c310b8",
-      "signature": "0xa602d4a9964b4657250828d379b959ce26d55d69afcbcd307b3bd0c4797d6ff11b109a92a6a5d9f083e1e0aee480d02fa1aec31baa5765c7d361341f1432fd6c1c"
+      "domainSeparator": "0xdb8d598757156149bb9e0c43523ab79e4c02a140f9f3cfbccb533eaa7bc3c36e",
+      "digest": "0xd571b2241e587fb477dfb758364abee64a5cd1baecdb32d08e18c4447ef19e1c",
+      "signature": "0x22d5f85d25353e03d256e0baa3dff028b693bfc621cf8266c8f0657e6390e6bb320408a5dd1461c53e60a0dd0e0a1158465b3f5a0c8a8115b64e488579ee5cde1b"
     },
     {
       "name": "zero_payload",
@@ -61,10 +83,12 @@
       "networkId": "0xcee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
       "signer": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
       "privateKey": "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "account": "CCQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2CNSG",
+      "keyData": "0xfcad0b19bb29d4674531d6f115237e16afce377ca1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
       "payload": "0x0000000000000000000000000000000000000000000000000000000000000000",
-      "domainSeparator": "0x95dee67d2aa9eceb9b4e00a8efb9e6ae3a298da70a4917b74e25d9c916650bff",
-      "digest": "0xc26938d5edfa6cd912505529335f772adf6000c1eee9af08aae29e053eb61aff",
-      "signature": "0x14c277683a4bf9af7e945ea00165b54e909641964ff725f5badec2715fcbe958235e019e7a7c6c37ea0891ee802811b3103a0fdbd51f70920fd6a146b4e383821c"
+      "domainSeparator": "0x68426afcc42851cbdb7e39d8ab1d4202e259bb4be9955a51794a6f7e3ae23788",
+      "digest": "0xcc21b72713eeedf8ad06c3aff4422c32d7e0d4ae3fe4827e8622debe6da3410a",
+      "signature": "0x5935f8c14efc42cd7444ee995e8dd79bdc09f311d5f8c9611dc964144d5d9df278696cf7ab6edd03784d4834d6ff19c032cdeea95907261c7eb01a01684d0e771c"
     },
     {
       "name": "max_payload",
@@ -73,10 +97,12 @@
       "networkId": "0xcee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
       "signer": "0x6A9296CEb89D12e1F53b2Dd5Df45d3ADB3A814c2",
       "privateKey": "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      "account": "CCZLFMVSWKZLFMVSWKZLFMVSWKZLFMVSWKZLFMVSWKZLFMVSWKZLEB3K",
+      "keyData": "0x6a9296ceb89d12e1f53b2dd5df45d3adb3a814c2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
       "payload": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-      "domainSeparator": "0x95dee67d2aa9eceb9b4e00a8efb9e6ae3a298da70a4917b74e25d9c916650bff",
-      "digest": "0x1e3c94869b40c4bd893272c1dd8c212aad85a5063d4d01c39a39839713bc4fb0",
-      "signature": "0x391b035c8cf458736214cc9103f3645e5b780b3e7e81978251caa471d62cdf3406fd305db3a8e79fec4140ce7dd8aa4f65db9b9f1c66046c708dce132f8807691c"
+      "domainSeparator": "0x68426afcc42851cbdb7e39d8ab1d4202e259bb4be9955a51794a6f7e3ae23788",
+      "digest": "0xad02e3c69fcf6617521988a9fb1fb2d76d92b0c39b471fbdf756fb9ddb528bf7",
+      "signature": "0x1aedc4447ef1b6d09dfb9961f84fd98b1abbeb105a4c50045d3f6c344ecf768d3666af10fd0cf07d2106b3e32ee66d7ae71ddb3159a6425ec0c84e5fcf3e27da1c"
     },
     {
       "name": "openzeppelin_auth_digest",
@@ -85,6 +111,8 @@
       "networkId": "0xcee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
       "signer": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
       "privateKey": "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "account": "CCQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2CNSG",
+      "keyData": "0xfcad0b19bb29d4674531d6f115237e16afce377ca1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
       "payload": "0x93184c50b8aeaca7ce955f109614185df25ba4c826368d27e1d95e9cf923cd7e",
       "openZeppelin": {
         "signaturePayload": "0xbf26903a27b4e4b1a2fd3b9fca6685dfe09e60ad730ce4e1530dd7d3264e33a3",
@@ -92,9 +120,9 @@
           0
         ]
       },
-      "domainSeparator": "0x95dee67d2aa9eceb9b4e00a8efb9e6ae3a298da70a4917b74e25d9c916650bff",
-      "digest": "0x6d1e76ec5b4b1b438b4185de2b387160fb38ffa29daae60e43610663d611feed",
-      "signature": "0x7f451fc0d325327375d32c6ce18c254b93f8b1281d2aa4fad8fcecee681c40f255ffe485ddf0970ec4f7e1121f82371eb152f93820ddfeb814298c72e375ddd01c"
+      "domainSeparator": "0x68426afcc42851cbdb7e39d8ab1d4202e259bb4be9955a51794a6f7e3ae23788",
+      "digest": "0x11c79dbfeac469a32a6f07594e120c63d11c586ee1289862a5995614b50b247d",
+      "signature": "0x482f86acb6af05b9d58df48fbab0cbacdffa8fe3afbee7a2f2319d2fecea4ffb433ac6ecf5b0207eca026b34b9265f2f42af6e5eea0d44a700df928a948269f11c"
     },
     {
       "name": "openzeppelin_auth_digest_two_rules",
@@ -103,6 +131,8 @@
       "networkId": "0xcee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
       "signer": "0x6A9296CEb89D12e1F53b2Dd5Df45d3ADB3A814c2",
       "privateKey": "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      "account": "CCZLFMVSWKZLFMVSWKZLFMVSWKZLFMVSWKZLFMVSWKZLFMVSWKZLEB3K",
+      "keyData": "0x6a9296ceb89d12e1f53b2dd5df45d3adb3a814c2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
       "payload": "0xe94fb5a6151e36f742843af681b8b51efd581029ae92b2786a1243801421152c",
       "openZeppelin": {
         "signaturePayload": "0xbef52472b84b15367610f3a4306cb2bf2e6a8e0f48f05e366320ca69fc2bfdeb",
@@ -111,9 +141,45 @@
           0
         ]
       },
-      "domainSeparator": "0x95dee67d2aa9eceb9b4e00a8efb9e6ae3a298da70a4917b74e25d9c916650bff",
-      "digest": "0xf2fb0b2d1883c1eba4139ed874bd33211da5c2b861a456394c79c85893c3aacf",
-      "signature": "0xbfcd7f19ec5868f3c33a8430b3840aa4ae3ea8be3386c79de34130aa45d7086178af541f0a08f2b44a712f3dd40f70a74a9ff4d07fcbd212e193fae084f318741b"
+      "domainSeparator": "0x68426afcc42851cbdb7e39d8ab1d4202e259bb4be9955a51794a6f7e3ae23788",
+      "digest": "0x36445b8b981a4b3a8b54a8daabc57fdbae2eb9ed32133366fe20368bcec5825f",
+      "signature": "0xe4e3dac556dac31edecbff29cd74db54bb26a32847ff0ced0cd42a430e83e4a218385501fa032159e94b9e6aaa67c7c711998e8f84a6ddc9f2abef071fe8811f1c"
+    }
+  ],
+  "authPayloads": [
+    {
+      "name": "one_signer",
+      "verifier": "CDB4HQ6DYPB4HQ6DYPB4HQ6DYPB4HQ6DYPB4HQ6DYPB4HQ6DYPB4G2F3",
+      "account": "CCQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2CNSG",
+      "contextRuleIds": [
+        0
+      ],
+      "signers": [
+        {
+          "address": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+          "signature": "0x4f8476c9137236c53f946a271c274d2a2e85868ecd7ce5414cbbc5f060f5ca81428a3f6b5b069732b727002f1325c38e7df53917c7ae9e37c93f742d7d852e131b"
+        }
+      ],
+      "xdr": "0x0000001100000001000000020000000f00000010636f6e746578745f72756c655f69647300000010000000010000000100000003000000000000000f000000077369676e657273000000001100000001000000010000001000000001000000030000000f0000000845787465726e616c0000001200000001c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c30000000d00000034fcad0b19bb29d4674531d6f115237e16afce377ca1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a10000000d000000414f8476c9137236c53f946a271c274d2a2e85868ecd7ce5414cbbc5f060f5ca81428a3f6b5b069732b727002f1325c38e7df53917c7ae9e37c93f742d7d852e131b000000"
+    },
+    {
+      "name": "two_signers",
+      "verifier": "CDB4HQ6DYPB4HQ6DYPB4HQ6DYPB4HQ6DYPB4HQ6DYPB4HQ6DYPB4G2F3",
+      "account": "CCQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2CNSG",
+      "contextRuleIds": [
+        0
+      ],
+      "signers": [
+        {
+          "address": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+          "signature": "0x4f8476c9137236c53f946a271c274d2a2e85868ecd7ce5414cbbc5f060f5ca81428a3f6b5b069732b727002f1325c38e7df53917c7ae9e37c93f742d7d852e131b"
+        },
+        {
+          "address": "0x6A9296CEb89D12e1F53b2Dd5Df45d3ADB3A814c2",
+          "signature": "0x787c79e2b18127a93288e559b48e0cfe4496ef7efffb25ac6f9ccff026c2ae41307cb007cb656c013da601c94bea734109af85e977909bc608bc0d939680eac31b"
+        }
+      ],
+      "xdr": "0x0000001100000001000000020000000f00000010636f6e746578745f72756c655f69647300000010000000010000000100000003000000000000000f000000077369676e657273000000001100000001000000020000001000000001000000030000000f0000000845787465726e616c0000001200000001c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c30000000d000000346a9296ceb89d12e1f53b2dd5df45d3adb3a814c2a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a10000000d00000041787c79e2b18127a93288e559b48e0cfe4496ef7efffb25ac6f9ccff026c2ae41307cb007cb656c013da601c94bea734109af85e977909bc608bc0d939680eac31b0000000000001000000001000000030000000f0000000845787465726e616c0000001200000001c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c30000000d00000034fcad0b19bb29d4674531d6f115237e16afce377ca1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a10000000d000000414f8476c9137236c53f946a271c274d2a2e85868ecd7ce5414cbbc5f060f5ca81428a3f6b5b069732b727002f1325c38e7df53917c7ae9e37c93f742d7d852e131b000000"
     }
   ]
 }

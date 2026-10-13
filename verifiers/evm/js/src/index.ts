@@ -1,14 +1,19 @@
 /**
  * What an Ethereum wallet signs for the Paso EVM verifier.
  *
- * The verifier checks a signature over 32 bytes. Those bytes go into one
- * EIP-712 message, `Authorization(bytes32 payload)`, under a domain that
- * names the verifier and the Stellar network. A wallet therefore shows a
- * hash: nothing in the message says which calls the hash stands for.
+ * The verifier checks a signature over two things: the smart account the
+ * signer was registered for, and 32 bytes that account wants approved. They
+ * go into one EIP-712 message, `Authorization(string account,bytes32
+ * payload)`, under a domain that names the verifier and the Stellar network.
+ * A wallet therefore shows which account it is signing for, and a hash:
+ * nothing in the message says which calls the hash stands for.
  */
+import { Address as StellarAddress, hash, StrKey, xdr } from "@stellar/stellar-sdk";
 import {
+  concat,
   hashTypedData,
   hexToBytes,
+  isAddress,
   isAddressEqual,
   recoverTypedDataAddress,
   sha256,
@@ -19,10 +24,13 @@ import {
 } from "viem";
 
 export const DOMAIN_NAME = "Paso verifier";
-export const DOMAIN_VERSION = "1";
+export const DOMAIN_VERSION = "2";
 
 export const TYPES = {
-  Authorization: [{ name: "payload", type: "bytes32" }],
+  Authorization: [
+    { name: "account", type: "string" },
+    { name: "payload", type: "bytes32" },
+  ],
 } as const;
 
 export const NETWORK_PASSPHRASES = {
@@ -44,14 +52,10 @@ export function networkId(network: Network): Hex {
   return sha256(toHex(networkPassphrase(network)));
 }
 
-/** What the wallet is asked to sign. Accepted as is by viem's `signTypedData` and `hashTypedData`. */
-export interface VerifierTypedData {
-  /** No chain id and no verifying contract: the network id in `salt` separates networks. */
-  domain: { name: typeof DOMAIN_NAME; version: typeof DOMAIN_VERSION; salt: Hex };
-  types: typeof TYPES;
-  primaryType: "Authorization";
-  /** The 32 bytes the smart account hands to the verifier. */
-  message: { payload: Hex };
+function assertAccount(account: string): void {
+  if (!StrKey.isValidContract(account)) {
+    throw new Error(`"${account}" is not the address of a contract (C…)`);
+  }
 }
 
 function assertPayload(payload: Hex): void {
@@ -60,20 +64,77 @@ function assertPayload(payload: Hex): void {
   }
 }
 
-/** The typed data for `payload`, the 32 bytes a smart account asks the verifier to check. */
-export function typedData(payload: Hex, network: Network): VerifierTypedData {
+/**
+ * The id of the contract that `deployer` creates with `salt`, as a strkey.
+ *
+ * A signer's key data names the account it belongs to, so the id of an
+ * account that is created with its signers has to be known before it exists.
+ * It depends only on the network, the deployer and the salt.
+ */
+export function contractId(deployer: string, salt: Uint8Array | Hex, network: Network): string {
+  const saltBytes = typeof salt === "string" ? hexToBytes(salt) : salt;
+  if (saltBytes.length !== 32) {
+    throw new Error(`Expected a salt of 32 bytes and got ${saltBytes.length}`);
+  }
+  const preimage = xdr.HashIdPreimage.envelopeTypeContractId(
+    new xdr.HashIdPreimageContractId({
+      networkId: hexToBytes(networkId(network)),
+      contractIdPreimage: xdr.ContractIdPreimage.contractIdPreimageFromAddress(
+        new xdr.ContractIdPreimageFromAddress({
+          address: StellarAddress.fromString(deployer).toScAddress(),
+          salt: saltBytes,
+        }),
+      ),
+    }),
+  );
+  return StrKey.encodeContract(hash(preimage.toXDR()));
+}
+
+/**
+ * The key data of a signer, as the verifier reads it: the 20-byte Ethereum
+ * address followed by the 32-byte contract id of the smart account the
+ * signer is registered for.
+ */
+export function keyData(address: Address, account: string): Hex {
+  if (!isAddress(address, { strict: false })) {
+    throw new Error(`"${address}" is not an Ethereum address`);
+  }
+  assertAccount(account);
+  return concat([address.toLowerCase() as Hex, toHex(StrKey.decodeContract(account))]);
+}
+
+/** What the wallet is asked to sign. Accepted as is by viem's `signTypedData` and `hashTypedData`. */
+export interface VerifierTypedData {
+  /** No chain id and no verifying contract: the network id in `salt` separates networks. */
+  domain: { name: typeof DOMAIN_NAME; version: typeof DOMAIN_VERSION; salt: Hex };
+  types: typeof TYPES;
+  primaryType: "Authorization";
+  message: {
+    /** Strkey (`C…`) of the smart account the signature is for. */
+    account: string;
+    /** The 32 bytes that account hands to the verifier. */
+    payload: Hex;
+  };
+}
+
+/**
+ * The typed data for `payload`, the 32 bytes the smart account `account`
+ * asks the verifier to check.
+ */
+export function typedData(account: string, payload: Hex, network: Network): VerifierTypedData {
+  assertAccount(account);
   assertPayload(payload);
   return {
     domain: { name: DOMAIN_NAME, version: DOMAIN_VERSION, salt: networkId(network) },
     types: TYPES,
     primaryType: "Authorization",
-    message: { payload },
+    message: { account, payload },
   };
 }
 
 /** The EIP-712 digest the wallet signs and the verifier recomputes. */
-export function digest(payload: Hex, network: Network): Hex {
-  return hashTypedData(typedData(payload, network));
+export function digest(account: string, payload: Hex, network: Network): Hex {
+  return hashTypedData(typedData(account, payload, network));
 }
 
 /**
@@ -108,21 +169,27 @@ export function assertUsableSignature(signature: Hex): void {
   }
 }
 
-/** The Ethereum address whose key made `signature` over `payload` on `network`. */
-export function recoverSigner(payload: Hex, network: Network, signature: Hex): Promise<Address> {
+/** The Ethereum address whose key made `signature` over `payload` for `account` on `network`. */
+export function recoverSigner(account: string, payload: Hex, network: Network, signature: Hex): Promise<Address> {
   assertUsableSignature(signature);
-  return recoverTypedDataAddress({ ...typedData(payload, network), signature });
+  return recoverTypedDataAddress({ ...typedData(account, payload, network), signature });
 }
 
 /**
- * Asks `account` to sign `payload` for `network` and returns the signature
- * as the verifier reads it: `r ‖ s ‖ v`, 65 bytes.
+ * Asks `signer` to sign `payload` for the smart account `account` on
+ * `network` and returns the signature as the verifier reads it:
+ * `r ‖ s ‖ v`, 65 bytes.
  */
-export async function signPayload(account: TypedDataSigner, payload: Hex, network: Network): Promise<Hex> {
-  const signature = await account.signTypedData(typedData(payload, network));
-  const signer = await recoverSigner(payload, network, signature);
-  if (account.address && !isAddressEqual(signer, account.address)) {
-    throw new Error(`The signature was made by ${signer}, not by ${account.address}`);
+export async function signPayload(
+  signer: TypedDataSigner,
+  account: string,
+  payload: Hex,
+  network: Network,
+): Promise<Hex> {
+  const signature = await signer.signTypedData(typedData(account, payload, network));
+  const recovered = await recoverSigner(account, payload, network, signature);
+  if (signer.address && !isAddressEqual(recovered, signer.address)) {
+    throw new Error(`The signature was made by ${recovered}, not by ${signer.address}`);
   }
   return signature;
 }

@@ -26,16 +26,17 @@ pub(crate) const VERIFIER_WASM: &[u8] =
 
 const DOMAIN_TYPE: &str = "EIP712Domain(string name,string version,bytes32 salt)";
 const DOMAIN_NAME: &str = "Paso verifier";
-const DOMAIN_VERSION: &str = "1";
-const AUTHORIZATION_TYPE: &str = "Authorization(bytes32 payload)";
+const DOMAIN_VERSION: &str = "2";
+const AUTHORIZATION_TYPE: &str = "Authorization(string account,bytes32 payload)";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Fixture {
+pub(crate) struct Fixture {
     domain: Domain,
     domain_type: String,
     authorization_type: String,
-    vectors: StdVec<Vector>,
+    pub vectors: StdVec<Vector>,
+    pub auth_payloads: StdVec<AuthPayloadVector>,
 }
 
 #[derive(Deserialize)]
@@ -51,6 +52,8 @@ pub(crate) struct Vector {
     pub network_id: String,
     pub signer: String,
     pub private_key: String,
+    pub account: String,
+    pub key_data: String,
     pub payload: String,
     pub open_zeppelin: Option<OpenZeppelin>,
     pub domain_separator: String,
@@ -65,6 +68,24 @@ pub(crate) struct OpenZeppelin {
     pub context_rule_ids: StdVec<u32>,
 }
 
+/// An account's signature value for one or more signers, as XDR.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AuthPayloadVector {
+    pub name: String,
+    pub verifier: String,
+    pub account: String,
+    pub context_rule_ids: StdVec<u32>,
+    pub signers: StdVec<SignerSignature>,
+    pub xdr: String,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct SignerSignature {
+    pub address: String,
+    pub signature: String,
+}
+
 /// What a call to `verify` came to: the boolean, or the error it failed with.
 type Outcome = Result<bool, Result<Error, InvokeError>>;
 
@@ -75,7 +96,7 @@ fn failed(error: EvmVerifierError) -> Outcome {
     Err(Ok(error.into()))
 }
 
-fn fixture() -> Fixture {
+pub(crate) fn fixture() -> Fixture {
     serde_json::from_str(include_str!("../vectors/vectors.json")).unwrap()
 }
 
@@ -113,6 +134,24 @@ pub(crate) fn sign(key: &SigningKey, digest: &[u8; 32]) -> [u8; 65] {
     out
 }
 
+/// Contract id behind a contract strkey (`C…`), decoded without the host.
+pub(crate) fn contract_id(strkey: &str) -> [u8; 32] {
+    stellar_strkey::Contract::from_string(strkey).unwrap().0
+}
+
+/// Strkey (`C…`) of a contract id, encoded without the host.
+pub(crate) fn contract_strkey(id: &[u8; 32]) -> String {
+    stellar_strkey::Contract(*id).to_string()
+}
+
+/// The key data of a signer: its address, then the contract id of its account.
+pub(crate) fn key_data(address: &[u8; 20], account: &[u8; 32]) -> [u8; 52] {
+    let mut out = [0u8; 52];
+    out[..20].copy_from_slice(address);
+    out[20..].copy_from_slice(account);
+    out
+}
+
 /// `order - s`, the other valid `s` for the same signature.
 fn mirrored_s(s: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -129,6 +168,33 @@ fn mirrored_s(s: &[u8]) -> [u8; 32] {
     out
 }
 
+/// EIP-712 digest for any domain and message type, computed without any
+/// contract code. `fields` are the encoded members of the message.
+fn typed_digest(
+    name: &str,
+    version: &str,
+    network_id: &[u8; 32],
+    message_type: &str,
+    fields: &[[u8; 32]],
+) -> [u8; 32] {
+    let domain = keccak(
+        &[
+            keccak(DOMAIN_TYPE.as_bytes()),
+            keccak(name.as_bytes()),
+            keccak(version.as_bytes()),
+            *network_id,
+        ]
+        .concat(),
+    );
+    let mut message = keccak(message_type.as_bytes()).to_vec();
+    message.extend_from_slice(&fields.concat());
+
+    let mut preimage = std::vec![0x19, 0x01];
+    preimage.extend_from_slice(&domain);
+    preimage.extend_from_slice(&keccak(&message));
+    keccak(&preimage)
+}
+
 fn reference_domain_separator(network_id: &[u8; 32]) -> [u8; 32] {
     keccak(
         &[
@@ -141,14 +207,19 @@ fn reference_domain_separator(network_id: &[u8; 32]) -> [u8; 32] {
     )
 }
 
-/// EIP-712 digest computed without any contract code.
-pub(crate) fn reference_digest(network_id: &[u8; 32], payload: &[u8; 32]) -> [u8; 32] {
-    let message = keccak(&[keccak(AUTHORIZATION_TYPE.as_bytes()), *payload].concat());
-
-    let mut preimage = std::vec![0x19, 0x01];
-    preimage.extend_from_slice(&reference_domain_separator(network_id));
-    preimage.extend_from_slice(&message);
-    keccak(&preimage)
+/// The digest a signer of `account` (a strkey) signs over `payload`.
+pub(crate) fn reference_digest(
+    network_id: &[u8; 32],
+    account: &str,
+    payload: &[u8; 32],
+) -> [u8; 32] {
+    typed_digest(
+        DOMAIN_NAME,
+        DOMAIN_VERSION,
+        network_id,
+        AUTHORIZATION_TYPE,
+        &[keccak(account.as_bytes()), *payload],
+    )
 }
 
 /// An environment on one network with both builds of the verifier.
@@ -171,21 +242,23 @@ fn setup_for(v: &Vector) -> Setup {
 }
 
 impl Setup {
-    /// Calls `verify` with raw values on both builds and returns what they
-    /// agree on.
-    fn verify_raw(&self, payload: &[u8], key: &[u8], signature: &[u8]) -> Outcome {
-        let call = |verifier: &Address| -> Outcome {
-            let args: soroban_sdk::Vec<Val> = vec![
-                &self.env,
-                Bytes::from_slice(&self.env, payload).into_val(&self.env),
-                Bytes::from_slice(&self.env, key).into_val(&self.env),
-                Bytes::from_slice(&self.env, signature).into_val(&self.env),
-            ];
+    /// Calls a function of both builds with raw byte strings and returns
+    /// what they agree on.
+    fn call<T>(&self, function: &str, args: &[&[u8]]) -> Result<T, Result<Error, InvokeError>>
+    where
+        T: soroban_sdk::TryFromVal<Env, Val> + PartialEq + core::fmt::Debug,
+        T::Error: core::fmt::Debug,
+    {
+        let call = |verifier: &Address| {
+            let mut values: soroban_sdk::Vec<Val> = vec![&self.env];
+            for arg in args {
+                values.push_back(Bytes::from_slice(&self.env, arg).into_val(&self.env));
+            }
             self.env
-                .try_invoke_contract::<bool, Error>(
+                .try_invoke_contract::<T, Error>(
                     verifier,
-                    &Symbol::new(&self.env, "verify"),
-                    args,
+                    &Symbol::new(&self.env, function),
+                    values,
                 )
                 .map(|value| value.unwrap())
         };
@@ -196,12 +269,20 @@ impl Setup {
         native
     }
 
-    fn verify(&self, payload: &[u8; 32], key: &[u8; 20], signature: &[u8; 65]) -> Outcome {
+    fn verify_raw(&self, payload: &[u8], key: &[u8], signature: &[u8]) -> Outcome {
+        self.call("verify", &[payload, key, signature])
+    }
+
+    fn verify(&self, payload: &[u8; 32], key: &[u8; 52], signature: &[u8; 65]) -> Outcome {
         self.verify_raw(payload, key, signature)
     }
 
     fn verify_vector(&self, v: &Vector) -> Outcome {
-        self.verify(&unhex(&v.payload), &unhex(&v.signer), &unhex(&v.signature))
+        self.verify(
+            &unhex(&v.payload),
+            &unhex(&v.key_data),
+            &unhex(&v.signature),
+        )
     }
 }
 
@@ -237,6 +318,34 @@ fn half_curve_order_is_half_the_curve_order() {
 }
 
 #[test]
+fn key_data_is_the_address_then_the_contract_id() {
+    for v in vectors() {
+        let id = contract_id(&v.account);
+        assert_eq!(contract_strkey(&id), v.account, "{}", v.name);
+        assert_eq!(
+            key_data(&unhex(&v.signer), &id),
+            unhex::<52>(&v.key_data),
+            "{}",
+            v.name
+        );
+    }
+}
+
+#[test]
+fn account_is_rendered_as_its_strkey() {
+    let s = setup([0; 32]);
+    let mut ids: StdVec<[u8; 32]> = vectors().iter().map(|v| contract_id(&v.account)).collect();
+    ids.extend([[0x00; 32], [0xff; 32], core::array::from_fn(|i| i as u8)]);
+    for id in ids {
+        let text = s.env.as_contract(&s.native, || {
+            eip712::account_text(&s.env, &BytesN::from_array(&s.env, &id))
+        });
+        let text: StdVec<u8> = text.iter().collect();
+        assert_eq!(String::from_utf8(text).unwrap(), contract_strkey(&id));
+    }
+}
+
+#[test]
 fn digest_matches_every_vector() {
     for v in vectors() {
         let network_id: [u8; 32] = unhex(&v.network_id);
@@ -250,7 +359,7 @@ fn digest_matches_every_vector() {
             v.name
         );
         assert_eq!(
-            reference_digest(&network_id, &payload),
+            reference_digest(&network_id, &v.account, &payload),
             expected,
             "{}",
             v.name
@@ -258,7 +367,12 @@ fn digest_matches_every_vector() {
 
         let s = setup_for(&v);
         let digest = s.env.as_contract(&s.native, || {
-            eip712::digest(&s.env, &BytesN::from_array(&s.env, &payload)).to_array()
+            eip712::digest(
+                &s.env,
+                &BytesN::from_array(&s.env, &contract_id(&v.account)),
+                &BytesN::from_array(&s.env, &payload),
+            )
+            .to_array()
         });
         assert_eq!(digest, expected, "{}", v.name);
     }
@@ -281,7 +395,7 @@ fn vectors_are_signed_by_their_keys() {
 #[test]
 fn accepts_every_vector() {
     let vectors = vectors();
-    assert_eq!(vectors.len(), 8);
+    assert_eq!(vectors.len(), 9);
     for v in vectors {
         assert_eq!(setup_for(&v).verify_vector(&v), ACCEPTED, "{}", v.name);
     }
@@ -295,7 +409,7 @@ fn accepts_through_the_generated_client() {
         let client = EvmVerifierClient::new(&s.env, verifier);
         assert!(client.verify(
             &Bytes::from_array(&s.env, &unhex::<32>(&v.payload)),
-            &BytesN::from_array(&s.env, &unhex(&v.signer)),
+            &Bytes::from_array(&s.env, &unhex::<52>(&v.key_data)),
             &BytesN::from_array(&s.env, &unhex(&v.signature)),
         ));
     }
@@ -306,50 +420,67 @@ fn refuses_wrong_signer() {
     let v = vector("testnet");
     let other = vector("second_signer");
     assert_eq!(v.payload, other.payload);
+    assert_eq!(v.account, other.account);
     assert_ne!(v.signer, other.signer);
 
     let s = setup_for(&v);
     let payload = unhex(&v.payload);
     // Each signature under the other signer's address.
     assert_eq!(
-        s.verify(&payload, &unhex(&other.signer), &unhex(&v.signature)),
+        s.verify(&payload, &unhex(&other.key_data), &unhex(&v.signature)),
         REFUSED
     );
     assert_eq!(
-        s.verify(&payload, &unhex(&v.signer), &unhex(&other.signature)),
+        s.verify(&payload, &unhex(&v.key_data), &unhex(&other.signature)),
         REFUSED
     );
     // And a key that appears in no vector.
     let stranger = SigningKey::from_slice(&[0x42; 32]).unwrap();
+    let account = contract_id(&v.account);
     let signature = sign(&stranger, &unhex(&v.digest));
-    assert_eq!(s.verify(&payload, &unhex(&v.signer), &signature), REFUSED);
+    assert_eq!(s.verify(&payload, &unhex(&v.key_data), &signature), REFUSED);
     assert_eq!(
-        s.verify(&payload, &eth_address(&stranger), &signature),
+        s.verify(
+            &payload,
+            &key_data(&eth_address(&stranger), &account),
+            &signature
+        ),
         ACCEPTED
     );
 }
 
 #[test]
-fn refuses_wrong_payload() {
+fn refuses_another_account() {
+    // The same key signs the same payload for two accounts. Neither
+    // signature passes under key data that names the other account.
     let v = vector("testnet");
-    let other = vector("another_payload");
+    let other = vector("another_account");
     assert_eq!(v.signer, other.signer);
+    assert_eq!(v.payload, other.payload);
+    assert_eq!(v.network_id, other.network_id);
+    assert_ne!(v.account, other.account);
+    assert_ne!(v.digest, other.digest);
 
     let s = setup_for(&v);
-    let signer = unhex(&v.signer);
-    let signature = unhex(&v.signature);
+    let payload = unhex(&v.payload);
+    assert_eq!(s.verify_vector(&v), ACCEPTED);
+    assert_eq!(s.verify_vector(&other), ACCEPTED);
     assert_eq!(
-        s.verify(&unhex(&other.payload), &signer, &signature),
+        s.verify(&payload, &unhex(&other.key_data), &unhex(&v.signature)),
+        REFUSED
+    );
+    assert_eq!(
+        s.verify(&payload, &unhex(&v.key_data), &unhex(&other.signature)),
         REFUSED
     );
 
-    // Any single flipped bit of the payload.
-    let payload: [u8; 32] = unhex(&v.payload);
+    // Any single flipped bit of the account id.
+    let key: [u8; 52] = unhex(&v.key_data);
     for bit in 0..256 {
-        let mut changed = payload;
-        changed[bit / 8] ^= 1 << (bit % 8);
+        let mut changed = key;
+        changed[20 + bit / 8] ^= 1 << (bit % 8);
         assert_eq!(
-            s.verify(&changed, &signer, &signature),
+            s.verify(&payload, &changed, &unhex(&v.signature)),
             REFUSED,
             "bit {bit}"
         );
@@ -357,10 +488,31 @@ fn refuses_wrong_payload() {
 }
 
 #[test]
+fn refuses_wrong_payload() {
+    let v = vector("testnet");
+    let other = vector("another_payload");
+    assert_eq!(v.signer, other.signer);
+    assert_eq!(v.account, other.account);
+
+    let s = setup_for(&v);
+    let key = unhex(&v.key_data);
+    let signature = unhex(&v.signature);
+    assert_eq!(s.verify(&unhex(&other.payload), &key, &signature), REFUSED);
+
+    // Any single flipped bit of the payload.
+    let payload: [u8; 32] = unhex(&v.payload);
+    for bit in 0..256 {
+        let mut changed = payload;
+        changed[bit / 8] ^= 1 << (bit % 8);
+        assert_eq!(s.verify(&changed, &key, &signature), REFUSED, "bit {bit}");
+    }
+}
+
+#[test]
 fn refuses_wrong_network() {
     let testnet = vector("testnet");
     let mainnet = vector("mainnet");
-    assert_eq!(testnet.signer, mainnet.signer);
+    assert_eq!(testnet.key_data, mainnet.key_data);
     assert_eq!(testnet.payload, mainnet.payload);
     assert_ne!(testnet.network_id, mainnet.network_id);
     assert_ne!(testnet.digest, mainnet.digest);
@@ -379,45 +531,73 @@ fn refuses_wrong_network() {
 }
 
 #[test]
-fn refuses_signature_made_for_a_paso_account_domain() {
-    // The same payload signed under the domain name of Paso's own account.
+fn refuses_signatures_made_under_other_domains_and_message_types() {
     let v = vector("testnet");
     let key = SigningKey::from_slice(&unhex::<32>(&v.private_key)).unwrap();
     let network_id: [u8; 32] = unhex(&v.network_id);
     let payload: [u8; 32] = unhex(&v.payload);
-
-    let domain = keccak(
-        &[
-            keccak(DOMAIN_TYPE.as_bytes()),
-            keccak(b"Paso"),
-            keccak(DOMAIN_VERSION.as_bytes()),
-            network_id,
-        ]
-        .concat(),
-    );
-    let message = keccak(&[keccak(AUTHORIZATION_TYPE.as_bytes()), payload].concat());
-    let mut preimage = std::vec![0x19, 0x01];
-    preimage.extend_from_slice(&domain);
-    preimage.extend_from_slice(&message);
-
+    let account = keccak(v.account.as_bytes());
     let s = setup_for(&v);
-    assert_eq!(
-        s.verify(&payload, &unhex(&v.signer), &sign(&key, &keccak(&preimage))),
-        REFUSED
-    );
-}
 
-#[test]
-fn refuses_signature_over_the_bare_payload() {
-    // No EIP-712 envelope: the payload signed as if it were the digest.
-    let v = vector("testnet");
-    let key = SigningKey::from_slice(&unhex::<32>(&v.private_key)).unwrap();
-    let payload: [u8; 32] = unhex(&v.payload);
-    let s = setup_for(&v);
-    assert_eq!(
-        s.verify(&payload, &unhex(&v.signer), &sign(&key, &payload)),
-        REFUSED
+    let own = typed_digest(
+        DOMAIN_NAME,
+        DOMAIN_VERSION,
+        &network_id,
+        AUTHORIZATION_TYPE,
+        &[account, payload],
     );
+    assert_eq!(own, unhex::<32>(&v.digest));
+
+    let others = [
+        // The domain name of Paso's own account.
+        typed_digest(
+            "Paso",
+            DOMAIN_VERSION,
+            &network_id,
+            AUTHORIZATION_TYPE,
+            &[account, payload],
+        ),
+        // Version 1 of this verifier, whose message named no account.
+        typed_digest(
+            DOMAIN_NAME,
+            "1",
+            &network_id,
+            "Authorization(bytes32 payload)",
+            &[payload],
+        ),
+        // The current message under the version 1 domain, and the reverse.
+        typed_digest(
+            DOMAIN_NAME,
+            "1",
+            &network_id,
+            AUTHORIZATION_TYPE,
+            &[account, payload],
+        ),
+        typed_digest(
+            DOMAIN_NAME,
+            DOMAIN_VERSION,
+            &network_id,
+            "Authorization(bytes32 payload)",
+            &[payload],
+        ),
+        // The fields in the other order.
+        typed_digest(
+            DOMAIN_NAME,
+            DOMAIN_VERSION,
+            &network_id,
+            "Authorization(bytes32 payload,string account)",
+            &[payload, account],
+        ),
+        // No EIP-712 envelope: the payload signed as if it were the digest.
+        payload,
+    ];
+    for digest in others {
+        assert_ne!(digest, own);
+        assert_eq!(
+            s.verify(&payload, &unhex(&v.key_data), &sign(&key, &digest)),
+            REFUSED
+        );
+    }
 }
 
 #[test]
@@ -433,7 +613,7 @@ fn accepts_v_0_1_and_27_28() {
         for recovery in [parity, parity + 27] {
             signature[64] = recovery;
             assert_eq!(
-                s.verify(&unhex(&v.payload), &unhex(&v.signer), &signature),
+                s.verify(&unhex(&v.payload), &unhex(&v.key_data), &signature),
                 ACCEPTED,
                 "{} with v = {}",
                 v.name,
@@ -452,7 +632,7 @@ fn rejects_v_out_of_range() {
     for recovery in [2, 3, 4, 26, 29, 35, 36, 255] {
         signature[64] = recovery;
         assert_eq!(
-            s.verify(&unhex(&v.payload), &unhex(&v.signer), &signature),
+            s.verify(&unhex(&v.payload), &unhex(&v.key_data), &signature),
             failed(EvmVerifierError::BadRecoveryId),
             "v = {recovery}"
         );
@@ -466,7 +646,7 @@ fn refuses_flipped_recovery_id() {
         let mut signature: [u8; 65] = unhex(&v.signature);
         signature[64] = if signature[64] == 27 { 28 } else { 27 };
         assert_eq!(
-            s.verify(&unhex(&v.payload), &unhex(&v.signer), &signature),
+            s.verify(&unhex(&v.payload), &unhex(&v.key_data), &signature),
             REFUSED,
             "{}",
             v.name
@@ -491,7 +671,7 @@ fn rejects_high_s() {
         for recovery in [27, 28] {
             signature[64] = recovery;
             assert_eq!(
-                s.verify(&unhex(&v.payload), &unhex(&v.signer), &signature),
+                s.verify(&unhex(&v.payload), &unhex(&v.key_data), &signature),
                 failed(EvmVerifierError::BadSignature),
                 "{}",
                 v.name
@@ -510,7 +690,7 @@ fn accepts_s_up_to_half_the_order_and_rejects_the_next() {
 
     signature[32..64].copy_from_slice(&HALF_CURVE_ORDER);
     assert_eq!(
-        s.verify(&unhex(&v.payload), &unhex(&v.signer), &signature),
+        s.verify(&unhex(&v.payload), &unhex(&v.key_data), &signature),
         REFUSED
     );
 
@@ -518,7 +698,7 @@ fn accepts_s_up_to_half_the_order_and_rejects_the_next() {
     above[31] += 1;
     signature[32..64].copy_from_slice(&above);
     assert_eq!(
-        s.verify(&unhex(&v.payload), &unhex(&v.signer), &signature),
+        s.verify(&unhex(&v.payload), &unhex(&v.key_data), &signature),
         failed(EvmVerifierError::BadSignature)
     );
 }
@@ -528,7 +708,7 @@ fn rejects_zero_and_out_of_range_r_and_s() {
     let v = vector("testnet");
     let s = setup_for(&v);
     let payload = unhex(&v.payload);
-    let signer = unhex(&v.signer);
+    let key = unhex(&v.key_data);
     let good: [u8; 65] = unhex(&v.signature);
 
     let mut above_order = CURVE_ORDER;
@@ -537,20 +717,20 @@ fn rejects_zero_and_out_of_range_r_and_s() {
         let mut bad_r = good;
         bad_r[..32].copy_from_slice(&scalar);
         assert_eq!(
-            s.verify(&payload, &signer, &bad_r),
+            s.verify(&payload, &key, &bad_r),
             failed(EvmVerifierError::BadSignature)
         );
 
         let mut bad_s = good;
         bad_s[32..64].copy_from_slice(&scalar);
         assert_eq!(
-            s.verify(&payload, &signer, &bad_s),
+            s.verify(&payload, &key, &bad_s),
             failed(EvmVerifierError::BadSignature)
         );
     }
 
     assert_eq!(
-        s.verify(&payload, &signer, &[0u8; 65]),
+        s.verify(&payload, &key, &[0u8; 65]),
         failed(EvmVerifierError::BadSignature)
     );
 }
@@ -568,7 +748,7 @@ fn never_accepts_an_arbitrary_r() {
         signature[..32].copy_from_slice(&[r; 32]);
         for recovery in [27, 28] {
             signature[64] = recovery;
-            match s.verify(&unhex(&v.payload), &unhex(&v.signer), &signature) {
+            match s.verify(&unhex(&v.payload), &unhex(&v.key_data), &signature) {
                 Ok(false) => refused += 1,
                 Err(Ok(error)) if !error.is_type(ScErrorType::Contract) => host_errors += 1,
                 other => panic!("r = {r:#04x} repeated, v = {recovery}: {other:?}"),
@@ -584,69 +764,100 @@ fn rejects_payload_of_the_wrong_length() {
     let v = vector("testnet");
     let s = setup_for(&v);
     let payload: [u8; 32] = unhex(&v.payload);
-    let signer: [u8; 20] = unhex(&v.signer);
+    let key: [u8; 52] = unhex(&v.key_data);
     let signature: [u8; 65] = unhex(&v.signature);
 
     let mut longer = payload.to_vec();
     longer.push(0);
     for bad in [&payload[..31], &payload[..0], &longer[..]] {
         assert_eq!(
-            s.verify_raw(bad, &signer, &signature),
+            s.verify_raw(bad, &key, &signature),
             failed(EvmVerifierError::BadPayloadLength)
         );
     }
 }
 
 #[test]
-fn rejects_key_and_signature_of_the_wrong_length() {
+fn rejects_key_data_of_the_wrong_length() {
     let v = vector("testnet");
     let s = setup_for(&v);
     let payload: [u8; 32] = unhex(&v.payload);
-    let signer: [u8; 20] = unhex(&v.signer);
+    let key: [u8; 52] = unhex(&v.key_data);
     let signature: [u8; 65] = unhex(&v.signature);
 
-    // A 32-byte key: the address left-padded the way EVM words carry it.
-    let mut padded = [0u8; 32];
-    padded[12..].copy_from_slice(&signer);
-    for bad_key in [&signer[..19], &padded[..], &[][..]] {
-        assert!(s.verify_raw(&payload, bad_key, &signature).is_err());
-    }
-
-    // 64 bytes is the compact form (EIP-2098), which is not accepted.
-    let mut longer = signature.to_vec();
-    longer.push(27);
-    for bad_signature in [&signature[..64], &longer[..], &[][..]] {
-        assert!(s.verify_raw(&payload, &signer, bad_signature).is_err());
+    let mut longer = key.to_vec();
+    longer.push(0);
+    // Among them the bare address, and the account id with no address.
+    for bad in [
+        &key[..0],
+        &key[..19],
+        &key[..20],
+        &key[20..],
+        &key[..51],
+        &longer[..],
+    ] {
+        assert_eq!(
+            s.verify_raw(&payload, bad, &signature),
+            failed(EvmVerifierError::BadKeyLength),
+            "{} bytes",
+            bad.len()
+        );
     }
 }
 
 #[test]
-fn canonical_key_is_the_address() {
+fn rejects_signature_of_the_wrong_length() {
     let v = vector("testnet");
     let s = setup_for(&v);
-    let a: [u8; 20] = unhex(&v.signer);
-    let b: [u8; 20] = unhex(&vector("second_signer").signer);
+    let payload: [u8; 32] = unhex(&v.payload);
+    let key: [u8; 52] = unhex(&v.key_data);
+    let signature: [u8; 65] = unhex(&v.signature);
+
+    // 64 bytes is the compact form (EIP-2098), which is not accepted.
+    let mut longer = signature.to_vec();
+    longer.push(27);
+    for bad in [&signature[..64], &longer[..], &[][..]] {
+        assert!(s.verify_raw(&payload, &key, bad).is_err());
+    }
+}
+
+#[test]
+fn canonical_key_is_the_address_alone() {
+    let v = vector("testnet");
+    let same_address_elsewhere = vector("another_account");
+    let other = vector("second_signer");
+    let s = setup_for(&v);
+
+    let canonical = |key_data: &str| -> StdVec<u8> {
+        s.call::<Bytes>("canonicalize_key", &[&unhex::<52>(key_data)])
+            .unwrap()
+            .iter()
+            .collect()
+    };
+    assert_eq!(canonical(&v.key_data), unhex::<20>(&v.signer));
+    assert_eq!(canonical(&other.key_data), unhex::<20>(&other.signer));
+    // One address under two account ids is one signer.
+    assert_ne!(v.key_data, same_address_elsewhere.key_data);
+    assert_eq!(
+        canonical(&v.key_data),
+        canonical(&same_address_elsewhere.key_data)
+    );
 
     for verifier in [&s.native, &s.wasm] {
         let client = EvmVerifierClient::new(&s.env, verifier);
-        assert_eq!(
-            client.canonicalize_key(&BytesN::from_array(&s.env, &a)),
-            Bytes::from_array(&s.env, &a)
-        );
-
         let keys = vec![
             &s.env,
-            BytesN::from_array(&s.env, &b),
-            BytesN::from_array(&s.env, &a),
-            BytesN::from_array(&s.env, &b),
+            Bytes::from_array(&s.env, &unhex::<52>(&other.key_data)),
+            Bytes::from_array(&s.env, &unhex::<52>(&v.key_data)),
+            Bytes::from_array(&s.env, &unhex::<52>(&same_address_elsewhere.key_data)),
         ];
         assert_eq!(
             client.batch_canonicalize_key(&keys),
             vec![
                 &s.env,
-                Bytes::from_array(&s.env, &b),
-                Bytes::from_array(&s.env, &a),
-                Bytes::from_array(&s.env, &b),
+                Bytes::from_array(&s.env, &unhex::<20>(&other.signer)),
+                Bytes::from_array(&s.env, &unhex::<20>(&v.signer)),
+                Bytes::from_array(&s.env, &unhex::<20>(&v.signer)),
             ]
         );
         assert_eq!(
@@ -659,26 +870,26 @@ fn canonical_key_is_the_address() {
 #[test]
 fn canonical_key_of_the_wrong_length_is_an_error() {
     let s = setup([0; 32]);
-    for verifier in [&s.native, &s.wasm] {
-        for length in [0usize, 19, 21, 32] {
-            let key: Val = Bytes::from_slice(&s.env, &std::vec![7u8; length]).into_val(&s.env);
-            assert!(s
-                .env
-                .try_invoke_contract::<Bytes, Error>(
-                    verifier,
-                    &Symbol::new(&s.env, "canonicalize_key"),
-                    vec![&s.env, key],
-                )
-                .is_err());
-            let keys: Val = vec![&s.env, key].into_val(&s.env);
-            assert!(s
-                .env
-                .try_invoke_contract::<soroban_sdk::Vec<Bytes>, Error>(
-                    verifier,
-                    &Symbol::new(&s.env, "batch_canonicalize_key"),
-                    vec![&s.env, keys],
-                )
-                .is_err());
+    let good = [7u8; 52];
+    for length in [0usize, 19, 20, 32, 51, 53] {
+        let bad = std::vec![7u8; length];
+        assert_eq!(
+            s.call::<Bytes>("canonicalize_key", &[&bad]),
+            Err(Ok(EvmVerifierError::BadKeyLength.into())),
+            "{length} bytes"
+        );
+
+        for verifier in [&s.native, &s.wasm] {
+            let keys = vec![
+                &s.env,
+                Bytes::from_array(&s.env, &good),
+                Bytes::from_slice(&s.env, &bad),
+            ];
+            assert_eq!(
+                EvmVerifierClient::new(&s.env, verifier).try_batch_canonicalize_key(&keys),
+                Err(Ok(EvmVerifierError::BadKeyLength.into())),
+                "{length} bytes"
+            );
         }
     }
 }

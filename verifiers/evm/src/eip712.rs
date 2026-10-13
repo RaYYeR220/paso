@@ -2,18 +2,23 @@
 //!
 //! ```text
 //! EIP712Domain(string name,string version,bytes32 salt)
-//!     name = "Paso verifier", version = "1", salt = network id
+//!     name = "Paso verifier", version = "2", salt = network id
 //!
-//! Authorization(bytes32 payload)
+//! Authorization(string account,bytes32 payload)
 //! ```
 //!
+//! `account` is the strkey (`C…`) of the smart account the signer was
+//! registered for, rendered here from the contract id in the key data.
 //! `payload` is the 32 bytes the smart account asks the verifier to check.
 //!
 //! There is no chain id and no verifying contract in the domain. The network
-//! is bound by the salt. The domain name differs from the one Paso's own
-//! account uses, so a signature made for one is never valid for the other.
+//! is bound by the salt and the account by the `account` field. The domain
+//! name differs from the one Paso's own account uses, so a signature made for
+//! one is never valid for the other.
 
-use soroban_sdk::{crypto::Hash, Bytes, BytesN, Env};
+use soroban_sdk::{
+    crypto::Hash, unwrap::UnwrapOptimized, xdr::FromXdr, Address, Bytes, BytesN, Env,
+};
 
 /// keccak256("EIP712Domain(string name,string version,bytes32 salt)")
 pub const DOMAIN_TYPE_HASH: [u8; 32] = [
@@ -27,26 +32,43 @@ pub const NAME_HASH: [u8; 32] = [
     0x03, 0xce, 0xa6, 0x60, 0x03, 0xe7, 0xef, 0x74, 0xf9, 0xa2, 0x4c, 0x30, 0x96, 0xe2, 0x4c, 0x12,
 ];
 
-/// keccak256("1")
+/// keccak256("2")
 pub const VERSION_HASH: [u8; 32] = [
-    0xc8, 0x9e, 0xfd, 0xaa, 0x54, 0xc0, 0xf2, 0x0c, 0x7a, 0xdf, 0x61, 0x28, 0x82, 0xdf, 0x09, 0x50,
-    0xf5, 0xa9, 0x51, 0x63, 0x7e, 0x03, 0x07, 0xcd, 0xcb, 0x4c, 0x67, 0x2f, 0x29, 0x8b, 0x8b, 0xc6,
+    0xad, 0x7c, 0x5b, 0xef, 0x02, 0x78, 0x16, 0xa8, 0x00, 0xda, 0x17, 0x36, 0x44, 0x4f, 0xb5, 0x8a,
+    0x80, 0x7e, 0xf4, 0xc9, 0x60, 0x3b, 0x78, 0x48, 0x67, 0x3f, 0x7e, 0x3a, 0x68, 0xeb, 0x14, 0xa5,
 ];
 
-/// keccak256("Authorization(bytes32 payload)")
+/// keccak256("Authorization(string account,bytes32 payload)")
 pub const AUTHORIZATION_TYPE_HASH: [u8; 32] = [
-    0x36, 0x87, 0x5b, 0x33, 0x06, 0x47, 0xb1, 0x6b, 0x56, 0xb4, 0x2a, 0xc1, 0xaf, 0x99, 0xcc, 0x28,
-    0x2d, 0x8b, 0xfe, 0xb1, 0xba, 0x91, 0xac, 0x00, 0x0d, 0x59, 0xdd, 0x91, 0xa6, 0x1b, 0x7e, 0x7d,
+    0xd6, 0x62, 0x61, 0x7b, 0x89, 0xa7, 0xa4, 0xef, 0x5f, 0x9e, 0x73, 0x91, 0x36, 0x43, 0xf1, 0x86,
+    0xba, 0xbe, 0xa9, 0xb7, 0x10, 0x1d, 0xb8, 0xe2, 0x80, 0xf6, 0x59, 0x66, 0xce, 0x8d, 0x31, 0x68,
 ];
 
-/// The digest a signer signs to approve `payload` on the current network.
-pub fn digest(env: &Env, payload: &BytesN<32>) -> Hash<32> {
+/// The XDR of a contract address up to the contract id: the tags of
+/// `ScVal::Address` and `ScAddress::Contract`.
+const CONTRACT_ADDRESS_XDR_HEAD: [u8; 8] = [0, 0, 0, 18, 0, 0, 0, 1];
+
+/// Strkey (`C…`) of the contract with this id, as a wallet displays it.
+pub fn account_text(env: &Env, account: &BytesN<32>) -> Bytes {
+    // Every 32 bytes are the id of some contract address, so this cannot fail.
+    let mut xdr = Bytes::from_array(env, &CONTRACT_ADDRESS_XDR_HEAD);
+    xdr.append(account.as_ref());
+    Address::from_xdr(env, &xdr)
+        .unwrap_optimized()
+        .to_string()
+        .to_bytes()
+}
+
+/// The digest a signer signs to approve `payload` for the account with the
+/// contract id `account`, on the current network.
+pub fn digest(env: &Env, account: &BytesN<32>, payload: &BytesN<32>) -> Hash<32> {
     let mut domain = Bytes::from_array(env, &DOMAIN_TYPE_HASH);
     domain.extend_from_array(&NAME_HASH);
     domain.extend_from_array(&VERSION_HASH);
     domain.append(env.ledger().network_id().as_ref());
 
     let mut message = Bytes::from_array(env, &AUTHORIZATION_TYPE_HASH);
+    message.append(&keccak(env, &account_text(env, account)));
     message.append(payload.as_ref());
 
     let mut preimage = Bytes::from_array(env, &[0x19, 0x01]);

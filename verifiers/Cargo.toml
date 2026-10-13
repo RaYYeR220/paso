@@ -1,9 +1,13 @@
 # A workspace of its own: OpenZeppelin's `stellar-accounts` 0.7.2 needs
 # soroban-sdk 26, while the contracts in `../contracts` build with a newer one.
+#
+# `evm` is the verifier contract. `host29` holds tests only: it runs the built
+# verifier on the host of soroban-sdk 29, which knows address-bound
+# credentials, and depends on that SDK on its own.
 
 [workspace]
 resolver = "2"
-members = ["evm"]
+members = ["evm", "host29"]
 
 [workspace.package]
 version = "0.1.0"

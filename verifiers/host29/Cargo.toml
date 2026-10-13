@@ -1,0 +1,21 @@
+[package]
+name = "paso-evm-verifier-host29"
+description = "The verifier wasm behind the published OpenZeppelin account on a protocol 29 host, with both credential encodings."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+doctest = false
+
+# Tests only. They need a host that knows address-bound credentials, which the
+# soroban-sdk 26 host behind `../evm` does not.
+[dev-dependencies]
+soroban-sdk = { version = "29.0.0", features = ["testutils"] }
+hex = "0.4"
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha2 = "0.10"
+sha3 = "0.10"
+stellar-strkey = "0.0.13"

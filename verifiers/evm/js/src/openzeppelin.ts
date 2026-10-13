@@ -10,9 +10,9 @@
  * 0.7.2.
  */
 import { Address, buildAuthorizationEntryPreimage, hash, xdr } from "@stellar/stellar-sdk";
-import { concat, hexToBytes, isAddress, sha256, toHex, type Address as EvmAddress, type Hex } from "viem";
+import { concat, hexToBytes, sha256, toHex, type Address as EvmAddress, type Hex } from "viem";
 
-import { networkPassphrase, type Network } from "./index";
+import { assertUsableSignature, keyData, networkPassphrase, type Network } from "./index";
 
 /** The rule the example account's constructor creates. */
 export const DEFAULT_CONTEXT_RULE = 0;
@@ -20,15 +20,19 @@ export const DEFAULT_CONTEXT_RULE = 0;
 const ruleIdsValue = (contextRuleIds: number[]): xdr.ScVal =>
   xdr.ScVal.scvVec(contextRuleIds.map((id) => xdr.ScVal.scvU32(id)));
 
-/** `Signer::External(verifier, address)`: an Ethereum address as a signer of the account. */
-export function ethereumSigner(verifier: string, address: EvmAddress): xdr.ScVal {
-  if (!isAddress(address, { strict: false })) {
-    throw new Error(`"${address}" is not an Ethereum address`);
-  }
+/**
+ * `Signer::External(verifier, key data)`: the Ethereum address `address` as
+ * a signer of the smart account `account`.
+ *
+ * The key data names the account, so the value is only good for that
+ * account. For an account that does not exist yet, compute its address
+ * first with `contractId`.
+ */
+export function ethereumSigner(verifier: string, address: EvmAddress, account: string): xdr.ScVal {
   return xdr.ScVal.scvVec([
     xdr.ScVal.scvSymbol("External"),
     Address.fromString(verifier).toScVal(),
-    xdr.ScVal.scvBytes(hexToBytes(address)),
+    xdr.ScVal.scvBytes(hexToBytes(keyData(address, account))),
   ]);
 }
 
@@ -40,18 +44,53 @@ export function authDigest(signaturePayload: Hex, contextRuleIds: number[]): Hex
   return sha256(concat([signaturePayload, toHex(ruleIdsValue(contextRuleIds).toXDR())]));
 }
 
+/** The signature of one Ethereum signer of an account. */
+export interface EthereumSignature {
+  address: EvmAddress;
+  /** `r ‖ s ‖ v`, as `signPayload` returns it. */
+  signature: Hex;
+}
+
 /**
- * The account's signature value, `AuthPayload`, carrying the signature of
- * one signer. An account whose rule needs several signatures takes a map
- * with one entry per signer, in the key order Soroban requires; that case is
- * not built here.
+ * The account's signature value, `AuthPayload`, carrying the signatures of
+ * Ethereum signers of `account` that `verifier` checks.
+ *
+ * Soroban reads a map only when its keys are in order. For signers of one
+ * verifier that is the order of their key data, which is applied here.
+ * Signers checked by other verifiers are not covered.
  */
-export function authPayload(signer: xdr.ScVal, signature: Hex, contextRuleIds: number[]): xdr.ScVal {
+export function authPayload(
+  verifier: string,
+  account: string,
+  signatures: EthereumSignature[],
+  contextRuleIds: number[],
+): xdr.ScVal {
+  const entries = signatures
+    .map(({ address, signature }) => {
+      assertUsableSignature(signature);
+      return { key: Buffer.from(hexToBytes(keyData(address, account))), signature };
+    })
+    .sort((left, right) => Buffer.compare(left.key, right.key));
+  entries.forEach(({ key }, index) => {
+    if (index > 0 && key.equals(entries[index - 1]!.key)) {
+      throw new Error(`Two signatures for the signer 0x${key.subarray(0, 20).toString("hex")}`);
+    }
+  });
+
+  const verifierValue = Address.fromString(verifier).toScVal();
   return xdr.ScVal.scvMap([
     new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol("context_rule_ids"), val: ruleIdsValue(contextRuleIds) }),
     new xdr.ScMapEntry({
       key: xdr.ScVal.scvSymbol("signers"),
-      val: xdr.ScVal.scvMap([new xdr.ScMapEntry({ key: signer, val: xdr.ScVal.scvBytes(hexToBytes(signature)) })]),
+      val: xdr.ScVal.scvMap(
+        entries.map(
+          ({ key, signature }) =>
+            new xdr.ScMapEntry({
+              key: xdr.ScVal.scvVec([xdr.ScVal.scvSymbol("External"), verifierValue, xdr.ScVal.scvBytes(key)]),
+              val: xdr.ScVal.scvBytes(hexToBytes(signature)),
+            }),
+        ),
+      ),
     }),
   ]);
 }
@@ -87,25 +126,11 @@ export function signaturePayload(
   return toHex(hash(buildAuthorizationEntryPreimage(entry, validUntilLedger, networkPassphrase(network)).toXdr()));
 }
 
-export interface EntrySigner {
-  /** Contract id of the Paso EVM verifier the account lists for this signer. */
-  verifier: string;
-  /** The Ethereum address the account lists. */
-  address: EvmAddress;
-  /** One rule id per call the entry authorises, root first. Defaults to the default rule for a single call. */
-  contextRuleIds?: number[];
-}
-
 /**
- * The 32 bytes an Ethereum signer of the account signs, through
- * `typedData`, to approve `entry` until `validUntilLedger`.
- *
- * Only for entries with address-bound credentials, whose Soroban payload
- * names the account. The legacy encoding leaves the account out, and a 0.7.2
- * account adds nothing in its place: the signature would also be good for
- * any other account that lists the same signer and is asked for the same
- * call under the same nonce. Such an entry is refused here; `authDigest` and
- * `signaturePayload` remain for whoever needs one signed regardless.
+ * The 32 bytes the Ethereum signers of the account sign, through
+ * `typedData(entryAddress(entry), …)`, to approve `entry` until
+ * `validUntilLedger`. `contextRuleIds` holds one rule id per call the entry
+ * authorises, root first; it defaults to the default rule for a single call.
  */
 export function entryPayload(
   entry: xdr.SorobanAuthorizationEntry,
@@ -113,31 +138,28 @@ export function entryPayload(
   network: Network,
   contextRuleIds: number[] = [DEFAULT_CONTEXT_RULE],
 ): Hex {
-  if (entry.credentials.type !== "sorobanCredentialsAddressV2") {
-    throw new Error(
-      `Expected an entry with address-bound credentials, got ${entry.credentials.type}: ` +
-        "its payload would not tie the signature to this account",
-    );
-  }
   return authDigest(signaturePayload(entry, validUntilLedger, network), contextRuleIds);
 }
 
 /**
- * Returns `entry` carrying `signature` as the account's only signature and
- * expiring at `validUntilLedger`, the ledger the signature was made for.
+ * Returns `entry` carrying the signatures of Ethereum signers that
+ * `verifier` checks, and expiring at `validUntilLedger`, the ledger the
+ * signatures were made for. The signers are those of the account the entry
+ * is for.
  */
-export function attachSignature(
+export function attachSignatures(
   entry: xdr.SorobanAuthorizationEntry,
   validUntilLedger: number,
-  signature: Hex,
-  { verifier, address, contextRuleIds = [DEFAULT_CONTEXT_RULE] }: EntrySigner,
+  verifier: string,
+  signatures: EthereumSignature[],
+  contextRuleIds: number[] = [DEFAULT_CONTEXT_RULE],
 ): xdr.SorobanAuthorizationEntry {
   const current = addressCredentials(entry);
   const signed = new xdr.SorobanAddressCredentials({
     address: current.address,
     nonce: current.nonce,
     signatureExpirationLedger: validUntilLedger,
-    signature: authPayload(ethereumSigner(verifier, address), signature, contextRuleIds),
+    signature: authPayload(verifier, entryAddress(entry), signatures, contextRuleIds),
   });
   return new xdr.SorobanAuthorizationEntry({
     credentials:

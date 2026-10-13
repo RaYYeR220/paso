@@ -1,12 +1,21 @@
 //! Paso EVM verifier.
 //!
 //! A signature verifier for OpenZeppelin's Stellar smart accounts. An account
-//! that lists `External(<this contract>, <20-byte Ethereum address>)` among
-//! its signers accepts secp256k1 signatures made by that address.
+//! that lists `External(<this contract>, <key data>)` among its signers
+//! accepts secp256k1 signatures made by an Ethereum address.
 //!
-//! The account hands the verifier 32 bytes and nothing else, so that is all a
-//! signature covers: the wallet shows an EIP-712 message holding one hash, not
-//! the calls behind it. What the hash commits to is decided by the account.
+//! The key data is that address followed by the contract id of the account
+//! the signer belongs to. Both go into what is signed: the wallet shows an
+//! EIP-712 message naming the account and holding the 32 bytes the account
+//! wants checked, so a signature made for one account does not verify under
+//! key data that names another.
+//!
+//! The account hands the verifier those 32 bytes and nothing else about the
+//! calls. The wallet shows a hash, not the calls behind it. What the hash
+//! commits to is decided by the account.
+//!
+//! The verifier cannot see who calls it. The account in the message is the
+//! one in the key data, as it was registered, not the caller.
 //!
 //! The contract keeps no state and has no constructor and no privileged
 //! function. One deployment serves any number of accounts.
@@ -37,7 +46,16 @@ pub enum EvmVerifierError {
     BadSignature = 2,
     /// The last signature byte must be 0, 1, 27 or 28.
     BadRecoveryId = 3,
+    /// The key data is not 52 bytes long: a 20-byte Ethereum address
+    /// followed by the 32-byte contract id of the account.
+    BadKeyLength = 4,
 }
+
+/// Length of an Ethereum address, the first part of the key data.
+const ADDRESS_LENGTH: u32 = 20;
+
+/// Length of the key data: the address, then a 32-byte contract id.
+const KEY_LENGTH: u32 = 52;
 
 /// Order of the secp256k1 group.
 const CURVE_ORDER: [u8; 32] = [
@@ -51,31 +69,43 @@ const HALF_CURVE_ORDER: [u8; 32] = [
     0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d, 0xdf, 0xe9, 0x2f, 0x46, 0x68, 0x1b, 0x20, 0xa0,
 ];
 
+/// The Ethereum address and the account's contract id that `key_data` holds.
+fn split(e: &Env, key_data: &Bytes) -> (Bytes, BytesN<32>) {
+    if key_data.len() != KEY_LENGTH {
+        panic_with_error!(e, EvmVerifierError::BadKeyLength)
+    }
+    let account = BytesN::try_from(key_data.slice(ADDRESS_LENGTH..)).unwrap_optimized();
+    (key_data.slice(..ADDRESS_LENGTH), account)
+}
+
 #[contract]
 pub struct EvmVerifier;
 
 #[contractimpl]
 impl Verifier for EvmVerifier {
-    /// An Ethereum address.
-    type KeyData = BytesN<20>;
+    /// An Ethereum address followed by the contract id of the smart account
+    /// the signer was registered for: 20 bytes, then 32.
+    type KeyData = Bytes;
     /// `r ‖ s ‖ v`, with `s` in the lower half of the curve order and `v`
     /// one of 0, 1, 27 or 28.
     type SigData = BytesN<65>;
 
-    /// Whether `sig_data` is the signature of the address `key_data` over the
-    /// EIP-712 message that carries `hash` on this network.
+    /// Whether `sig_data` is the signature of the address in `key_data` over
+    /// the EIP-712 message that names the account in `key_data` and carries
+    /// `hash`, on this network.
     ///
     /// Returns `false` for a well-formed signature made by any other key, or
-    /// over any other payload or network. A malformed input is an error
-    /// instead: [`EvmVerifierError`] for a payload that is not 32 bytes, a
-    /// bad recovery byte and `r` or `s` out of range; a host error for key
-    /// data that is not 20 bytes, signature data that is not 65 bytes and an
-    /// `r` that is not the x-coordinate of a curve point.
-    fn verify(e: &Env, hash: Bytes, key_data: BytesN<20>, sig_data: BytesN<65>) -> bool {
+    /// for any other account, payload or network. A malformed input is an
+    /// error instead: [`EvmVerifierError`] for a payload that is not 32
+    /// bytes, key data that is not 52 bytes, a bad recovery byte and `r` or
+    /// `s` out of range; a host error for signature data that is not 65
+    /// bytes and an `r` that is not the x-coordinate of a curve point.
+    fn verify(e: &Env, hash: Bytes, key_data: Bytes, sig_data: BytesN<65>) -> bool {
         let Ok(payload) = BytesN::<32>::try_from(hash) else {
             panic_with_error!(e, EvmVerifierError::BadPayloadLength)
         };
-        let digest = eip712::digest(e, &payload);
+        let (address, account) = split(e, &key_data);
+        let digest = eip712::digest(e, &account, &payload);
 
         let signature = Bytes::from(sig_data);
         let recovery_id = match signature.get_unchecked(64) {
@@ -105,17 +135,20 @@ impl Verifier for EvmVerifier {
         // An Ethereum address is the last 20 bytes of the keccak hash of the
         // public key, taken without its leading 0x04 byte.
         let key_hash = e.crypto().keccak256(&Bytes::from(public_key).slice(1..));
-        Bytes::from(key_hash.to_bytes()).slice(12..) == Bytes::from(key_data)
+        Bytes::from(key_hash.to_bytes()).slice(12..) == address
     }
 
-    /// The address itself: 20 bytes name one address and no other 20 bytes
-    /// name the same one.
-    fn canonicalize_key(_e: &Env, key_data: BytesN<20>) -> Bytes {
-        key_data.into()
+    /// The Ethereum address alone, without the account id.
+    ///
+    /// The address is who signs. Two key data values with the same address
+    /// are the same signer whatever account id follows, and an account must
+    /// not count them as two: one key could then meet a threshold of two.
+    fn canonicalize_key(e: &Env, key_data: Bytes) -> Bytes {
+        split(e, &key_data).0
     }
 
     /// [`Verifier::canonicalize_key`] for each key, in the order given.
-    fn batch_canonicalize_key(e: &Env, key_data: Vec<BytesN<20>>) -> Vec<Bytes> {
-        Vec::from_iter(e, key_data.iter().map(Bytes::from))
+    fn batch_canonicalize_key(e: &Env, key_data: Vec<Bytes>) -> Vec<Bytes> {
+        Vec::from_iter(e, key_data.iter().map(|key| split(e, &key).0))
     }
 }

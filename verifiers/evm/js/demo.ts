@@ -1,5 +1,5 @@
 /**
- * An Ethereum key spends from an OpenZeppelin smart account, on Stellar testnet.
+ * Ethereum keys sign for an OpenZeppelin smart account, on Stellar testnet.
  *
  *   npm run demo
  *
@@ -7,19 +7,26 @@
  *
  * 1. uploads and deploys the verifier built by `stellar contract build`, or
  *    finds the instance an earlier run deployed from the same wasm;
- * 2. deploys a fresh OpenZeppelin smart account whose only signer is
- *    `External(verifier, <Ethereum address>)`. The account code is the wasm
- *    `stellar/smart-account-kit` publishes on testnet; the Ethereum key is
- *    generated here, lives for this run only and is never printed;
+ * 2. creates an OpenZeppelin smart account with an Ethereum signer from the
+ *    start. A signer's key data names its account, so the account's address
+ *    is computed from the deployer and a salt before anything is deployed.
+ *    The account code is the wasm `stellar/smart-account-kit` publishes on
+ *    testnet;
  * 3. sends the account 10 XLM;
  * 4. has the Ethereum key authorise a transfer of 1 XLM out of the account.
- *    The same entry signed by another key is simulated first and has to be
- *    refused.
+ *    Two wrong signatures are simulated first and have to be refused: one by
+ *    another key, and one by the right key made for another account;
+ * 5. adds a second Ethereum signer to the account, which now exists. The
+ *    first key authorises the call;
+ * 6. has both keys authorise another transfer. One signature alone is
+ *    simulated first and has to be refused.
  *
- * Every transaction is sent and paid by a stellar-cli identity, which signs
- * the envelopes itself: `PASO_DEPLOYER`, default `paso-deployer`. Create one
- * with `stellar keys generate <name> --network testnet --fund`. This script
- * reads no key from disk. Testnet only.
+ * The Ethereum keys are generated here, live for this run only and are
+ * never printed. Every transaction is sent and paid by a stellar-cli
+ * identity, which signs the envelopes itself: `PASO_DEPLOYER`, default
+ * `paso-deployer`. Create one with
+ * `stellar keys generate <name> --network testnet --fund`. This script reads
+ * no key from disk. Testnet only.
  */
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -37,17 +44,16 @@ import {
   Operation,
   rpc,
   scValToNative,
-  StrKey,
   TransactionBuilder,
   xdr,
   type Transaction,
 } from "@stellar/stellar-sdk";
-import { hashTypedData, toHex } from "viem";
-import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
+import { hashTypedData, toHex, type Hex } from "viem";
+import { generatePrivateKey, privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 
-import { NETWORK_PASSPHRASES, signPayload, typedData } from "./src/index";
+import { contractId, keyData, NETWORK_PASSPHRASES, signPayload, typedData } from "./src/index";
 import {
-  attachSignature,
+  attachSignatures,
   DEFAULT_CONTEXT_RULE,
   entryAddress,
   entryPayload,
@@ -80,6 +86,10 @@ const PAYMENT = 1n * STROOPS_PER_XLM;
 const VALIDITY_SECONDS = 60;
 const SIGNATURE_VALIDITY_LEDGERS = 120;
 const SUBMISSIONS = 3;
+
+/** The account's errors a refusal is expected to carry. */
+const EXTERNAL_VERIFICATION_FAILED = 3003;
+const UNVALIDATED_CONTEXT = 3002;
 
 const server = new rpc.Server(RPC_URL);
 
@@ -159,22 +169,7 @@ async function exists(key: xdr.LedgerKey): Promise<boolean> {
 const codeKey = (wasmHash: Uint8Array) =>
   xdr.LedgerKey.contractCode(new xdr.LedgerKeyContractCode({ hash: Buffer.from(wasmHash) }));
 
-/** Id of the contract `deployer` creates with `salt`. */
-function contractId(deployer: string, salt: Uint8Array): string {
-  const preimage = xdr.HashIdPreimage.envelopeTypeContractId(
-    new xdr.HashIdPreimageContractId({
-      networkId: hash(Buffer.from(PASSPHRASE)),
-      contractIdPreimage: xdr.ContractIdPreimage.contractIdPreimageFromAddress(
-        new xdr.ContractIdPreimageFromAddress({
-          address: Address.fromString(deployer).toScAddress(),
-          salt: Buffer.from(salt),
-        }),
-      ),
-    }),
-  );
-  return StrKey.encodeContract(hash(preimage.toXDR()));
-}
-
+/** Deploys `wasmHash` with `salt` from the fee payer and checks it landed where `contractId` said. */
 async function deploy(
   payer: string,
   what: string,
@@ -182,6 +177,7 @@ async function deploy(
   salt: Uint8Array,
   constructorArgs: xdr.ScVal[],
 ): Promise<string> {
+  const expected = contractId(payer, salt, NETWORK);
   const result = await send(
     payer,
     what,
@@ -193,8 +189,8 @@ async function deploy(
     }),
   );
   const id = Address.fromScVal(result.returnValue!).toString();
-  if (id !== contractId(payer, salt)) {
-    throw new Error(`Deployed ${id}, expected ${contractId(payer, salt)}`);
+  if (id !== expected) {
+    throw new Error(`Deployed ${id}, expected ${expected}`);
   }
   return id;
 }
@@ -211,6 +207,59 @@ function transfer(from: string, to: string, amount: bigint, auth?: xdr.SorobanAu
 
 async function balance(payer: string, of: string): Promise<bigint> {
   return scValToNative(await read(payer, XLM, "balance", address(of))) as bigint;
+}
+
+type ListedSigner = [kind: string, verifier: string, keyData: Uint8Array];
+
+/** Reads the account's default rule and checks it holds exactly these Ethereum signers, in this order. */
+async function showRule(payer: string, account: string, verifier: string, signers: PrivateKeyAccount[]): Promise<void> {
+  const rule = scValToNative(
+    await read(payer, account, "get_context_rule", xdr.ScVal.scvU32(DEFAULT_CONTEXT_RULE)),
+  ) as { name: string; context_type: unknown[]; signers: ListedSigner[]; policies: string[] };
+  const expected = signers.map((signer) => keyData(signer.address, account));
+  const listed = rule.signers.map(([, , data]) => toHex(data));
+  if (
+    rule.policies.length !== 0 ||
+    rule.signers.some(([kind, by]) => kind !== "External" || by !== verifier) ||
+    listed.length !== expected.length ||
+    listed.some((data, index) => data !== expected[index])
+  ) {
+    throw new Error("The account does not hold the signers it was given");
+  }
+  line(`rule ${DEFAULT_CONTEXT_RULE}`, `"${rule.name}", ${String(rule.context_type[0])}, no policies, signers:`);
+  for (const data of listed) {
+    line("", `External(verifier, ${data.slice(0, 42)} ‖ ${data.slice(42)})`);
+  }
+}
+
+/**
+ * The one entry simulation asks `account` to sign for `operation`, and the
+ * ledger its signatures will be valid until.
+ */
+async function entryFor(
+  payer: string,
+  account: string,
+  operation: xdr.Operation,
+): Promise<{ entry: xdr.SorobanAuthorizationEntry; validUntilLedger: number }> {
+  const simulation = await server.simulateTransaction(transaction(await server.getAccount(payer), operation));
+  if (!rpc.Api.isSimulationSuccess(simulation)) {
+    throw new Error("Could not simulate the call the account is to authorise");
+  }
+  const entries = simulation.result?.auth ?? [];
+  const [entry] = entries;
+  if (!entry || entries.length !== 1 || entryAddress(entry) !== account) {
+    throw new Error("Expected exactly one authorisation entry, for the account");
+  }
+  return { entry, validUntilLedger: simulation.latestLedger + SIGNATURE_VALIDITY_LEDGERS };
+}
+
+/** Simulates `operation` and requires the account to refuse it with `code`. Nothing is sent. */
+async function expectRefusal(payer: string, operation: xdr.Operation, code: number, what: string): Promise<void> {
+  const simulation = await server.simulateTransaction(transaction(await server.getAccount(payer), operation));
+  if (!rpc.Api.isSimulationError(simulation) || !simulation.error.includes(`Error(Contract, #${code})`)) {
+    throw new Error(`Not refused by the account with error ${code}: ${what}`);
+  }
+  line("refused", `${what}: account error #${code} in simulation, nothing sent`);
 }
 
 async function main(): Promise<void> {
@@ -233,98 +282,139 @@ async function main(): Promise<void> {
     await send(payer, "upload", Operation.uploadContractWasm({ wasm }));
   }
   // One instance per deployer and build: the salt is the wasm hash.
-  let verifier = contractId(payer, wasmHash);
+  const verifier = contractId(payer, wasmHash, NETWORK);
   if (await exists(new Contract(verifier).getFootprint())) {
     line("deploy", "already deployed by this identity from this wasm");
   } else {
-    verifier = await deploy(payer, "deploy", wasmHash, wasmHash, []);
+    await deploy(payer, "deploy", wasmHash, wasmHash, []);
   }
   line("contract", verifier);
   line("", contractUrl(verifier));
 
-  console.log("\n2. OpenZeppelin smart account");
-  const ethereum = privateKeyToAccount(generatePrivateKey());
-  line("Ethereum signer", `${ethereum.address} (key generated for this run)`);
+  console.log("\n2. Account created with its signer");
+  const first = privateKeyToAccount(generatePrivateKey());
+  line("Ethereum signer", `${first.address} (key generated for this run)`);
   line("account wasm", OZ_ACCOUNT_WASM_HASH);
   if (!(await exists(codeKey(Buffer.from(OZ_ACCOUNT_WASM_HASH, "hex"))))) {
     throw new Error(`The OpenZeppelin account wasm ${OZ_ACCOUNT_WASM_HASH} is not on testnet`);
   }
-  const signer = ethereumSigner(verifier, ethereum.address);
-  const account = await deploy(payer, "deploy", Buffer.from(OZ_ACCOUNT_WASM_HASH, "hex"), randomBytes(32), [
-    xdr.ScVal.scvVec([signer]),
+  const salt = randomBytes(32);
+  const account = contractId(payer, salt, NETWORK);
+  line("account", `${account} (computed from the deployer and a salt; not deployed yet)`);
+  line("key data", `${first.address.toLowerCase()} ‖ ${keyData(first.address, account).slice(42)}`);
+  const deployed = await deploy(payer, "deploy", Buffer.from(OZ_ACCOUNT_WASM_HASH, "hex"), salt, [
+    xdr.ScVal.scvVec([ethereumSigner(verifier, first.address, account)]),
     xdr.ScVal.scvMap([]),
   ]);
-  line("contract", account);
-  line("", contractUrl(account));
-
-  const rule = scValToNative(
-    await read(payer, account, "get_context_rule", xdr.ScVal.scvU32(DEFAULT_CONTEXT_RULE)),
-  ) as { name: string; context_type: unknown[]; signers: [string, string, Uint8Array][]; policies: string[] };
-  const [listed] = rule.signers;
-  if (
-    rule.signers.length !== 1 ||
-    rule.policies.length !== 0 ||
-    listed?.[0] !== "External" ||
-    listed[1] !== verifier ||
-    toHex(listed[2]) !== ethereum.address.toLowerCase()
-  ) {
-    throw new Error("The account does not hold the signer it was deployed with");
-  }
-  line(
-    `rule ${DEFAULT_CONTEXT_RULE}`,
-    `"${rule.name}", ${String(rule.context_type[0])}, no policies, one signer: ` +
-      `${listed[0]}(${listed[1]}, ${toHex(listed[2])})`,
-  );
+  line("contract", `${deployed}, as computed`);
+  line("", contractUrl(deployed));
+  await showRule(payer, account, verifier, [first]);
 
   console.log("\n3. Funding");
   await send(payer, `${xlm(FUNDING)} in`, transfer(payer, account, FUNDING));
   line("account holds", xlm(await balance(payer, account)));
 
+  /** The signature of each key over `payload`, made for this account. */
+  const signatures = (payload: Hex, keys: PrivateKeyAccount[], madeFor = account) =>
+    Promise.all(
+      keys.map(async (key) => ({ address: key.address, signature: await signPayload(key, madeFor, payload, NETWORK) })),
+    );
+
   console.log("\n4. Transfer authorised by the Ethereum key");
-  const unsigned = await server.simulateTransaction(
-    transaction(await server.getAccount(payer), transfer(account, payer, PAYMENT)),
-  );
-  if (!rpc.Api.isSimulationSuccess(unsigned)) {
-    throw new Error("Could not simulate the transfer out of the account");
-  }
-  const entries = unsigned.result?.auth ?? [];
-  const [entry] = entries;
-  if (!entry || entries.length !== 1 || entryAddress(entry) !== account) {
-    throw new Error("Expected exactly one authorisation entry, for the account");
-  }
-  const validUntilLedger = unsigned.latestLedger + SIGNATURE_VALIDITY_LEDGERS;
-  const payload = entryPayload(entry, validUntilLedger, NETWORK);
-  const message = typedData(payload, NETWORK);
-  line("call", `transfer(${account}, ${payer}, ${PAYMENT}) on ${XLM}`);
-  line("entry", `${entry.credentials.type}, valid until ledger ${validUntilLedger}`);
-  line("Soroban payload", signaturePayload(entry, validUntilLedger, NETWORK));
-  line("account digest", `${payload} (what the account hands the verifier)`);
-  line("wallet is shown", JSON.stringify({ domain: message.domain, message: message.message }));
-  line("EIP-712 digest", hashTypedData(message));
+  {
+    const { entry, validUntilLedger } = await entryFor(payer, account, transfer(account, payer, PAYMENT));
+    const payload = entryPayload(entry, validUntilLedger, NETWORK);
+    const message = typedData(account, payload, NETWORK);
+    const attach = (signed: { address: `0x${string}`; signature: Hex }[]) =>
+      transfer(account, payer, PAYMENT, [attachSignatures(entry, validUntilLedger, verifier, signed)]);
+    line("call", `transfer(${account}, ${payer}, ${PAYMENT}) on ${XLM}`);
+    line("entry", `${entry.credentials.type}, valid until ledger ${validUntilLedger}`);
+    line("Soroban payload", signaturePayload(entry, validUntilLedger, NETWORK));
+    line("account digest", `${payload} (what the account hands the verifier)`);
+    line("wallet is shown", JSON.stringify({ domain: message.domain, message: message.message }));
+    line("EIP-712 digest", hashTypedData(message));
 
-  const as = { verifier, address: ethereum.address };
-  const stranger = privateKeyToAccount(generatePrivateKey());
-  const forged = attachSignature(entry, validUntilLedger, await signPayload(stranger, payload, NETWORK), as);
-  const refusal = await server.simulateTransaction(
-    transaction(await server.getAccount(payer), transfer(account, payer, PAYMENT, [forged])),
-  );
-  // 3003 is the account's ExternalVerificationFailed: its verifier answered no.
-  if (!rpc.Api.isSimulationError(refusal) || !refusal.error.includes("Error(Contract, #3003)")) {
-    throw new Error("A signature by another key was not refused by the account's signature check");
-  }
-  line("another key", "refused in simulation with the account's error #3003, nothing sent");
+    const stranger = privateKeyToAccount(generatePrivateKey());
+    const [byStranger] = await signatures(payload, [stranger]);
+    await expectRefusal(
+      payer,
+      attach([{ address: first.address, signature: byStranger!.signature }]),
+      EXTERNAL_VERIFICATION_FAILED,
+      "the same message signed by another key",
+    );
+    const elsewhere = contractId(payer, randomBytes(32), NETWORK);
+    await expectRefusal(
+      payer,
+      attach(await signatures(payload, [first], elsewhere)),
+      EXTERNAL_VERIFICATION_FAILED,
+      `the same payload signed by the right key for another account, ${elsewhere}`,
+    );
 
-  const signature = await signPayload(ethereum, payload, NETWORK);
-  line("signature", signature);
-  const signed = attachSignature(entry, validUntilLedger, signature, as);
-
-  const before = await balance(payer, account);
-  await send(payer, `${xlm(PAYMENT)} out`, transfer(account, payer, PAYMENT, [signed]));
-  const after = await balance(payer, account);
-  if (before - after !== PAYMENT) {
-    throw new Error(`The account's balance moved by ${before - after}, expected ${PAYMENT}`);
+    const signed = await signatures(payload, [first]);
+    line("signature", signed[0]!.signature);
+    const before = await balance(payer, account);
+    await send(payer, `${xlm(PAYMENT)} out`, attach(signed));
+    const after = await balance(payer, account);
+    if (before - after !== PAYMENT) {
+      throw new Error(`The account's balance moved by ${before - after}, expected ${PAYMENT}`);
+    }
+    line("account holds", `${xlm(after)}, was ${xlm(before)}`);
   }
-  line("account holds", `${xlm(after)}, was ${xlm(before)}`);
+
+  console.log("\n5. Second signer added to the existing account");
+  const second = privateKeyToAccount(generatePrivateKey());
+  {
+    line("Ethereum signer", `${second.address} (key generated for this run)`);
+    line("key data", `${second.address.toLowerCase()} ‖ ${keyData(second.address, account).slice(42)}`);
+    const addSigner = (auth?: xdr.SorobanAuthorizationEntry[]) =>
+      Operation.invokeContractFunction({
+        contract: account,
+        function: "add_signer",
+        args: [xdr.ScVal.scvU32(DEFAULT_CONTEXT_RULE), ethereumSigner(verifier, second.address, account)],
+        auth,
+      });
+    const { entry, validUntilLedger } = await entryFor(payer, account, addSigner());
+    const payload = entryPayload(entry, validUntilLedger, NETWORK);
+    line("call", `add_signer(${DEFAULT_CONTEXT_RULE}, External(verifier, key data)) on the account itself`);
+    line("account digest", payload);
+    const attach = (signed: { address: `0x${string}`; signature: Hex }[]) =>
+      addSigner([attachSignatures(entry, validUntilLedger, verifier, signed)]);
+
+    // The key being added cannot let itself in.
+    const [bySecond] = await signatures(payload, [second]);
+    await expectRefusal(
+      payer,
+      attach([{ address: first.address, signature: bySecond!.signature }]),
+      EXTERNAL_VERIFICATION_FAILED,
+      "signed by the key being added",
+    );
+    await send(payer, "add_signer", attach(await signatures(payload, [first])));
+    await showRule(payer, account, verifier, [first, second]);
+  }
+
+  console.log("\n6. Transfer authorised by both keys");
+  {
+    const { entry, validUntilLedger } = await entryFor(payer, account, transfer(account, payer, PAYMENT));
+    const payload = entryPayload(entry, validUntilLedger, NETWORK);
+    const attach = (signed: { address: `0x${string}`; signature: Hex }[]) =>
+      transfer(account, payer, PAYMENT, [attachSignatures(entry, validUntilLedger, verifier, signed)]);
+    line("account digest", payload);
+
+    // The rule has no policy, so it takes every signer it lists.
+    await expectRefusal(
+      payer,
+      attach(await signatures(payload, [first])),
+      UNVALIDATED_CONTEXT,
+      "signed by the first key alone",
+    );
+    const before = await balance(payer, account);
+    await send(payer, `${xlm(PAYMENT)} out`, attach(await signatures(payload, [first, second])));
+    const after = await balance(payer, account);
+    if (before - after !== PAYMENT) {
+      throw new Error(`The account's balance moved by ${before - after}, expected ${PAYMENT}`);
+    }
+    line("account holds", `${xlm(after)}, was ${xlm(before)}`);
+  }
 }
 
 main().catch((error: unknown) => {
