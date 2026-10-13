@@ -7,7 +7,7 @@ Two implementations exist and must agree byte for byte:
 - On chain: [`contracts/account/src/eip712.rs`](../contracts/account/src/eip712.rs) and [`contracts/account/src/render.rs`](../contracts/account/src/render.rs).
 - Off chain: [`packages/sdk/src/typedData.ts`](../packages/sdk/src/typedData.ts), [`packages/sdk/src/render.ts`](../packages/sdk/src/render.ts) and [`packages/sdk/src/auth.ts`](../packages/sdk/src/auth.ts).
 
-[`fixtures/vectors.json`](../fixtures/vectors.json) holds 11 vectors. Both test suites check the rendered text, the digest and the recovered signer of each one.
+[`fixtures/vectors.json`](../fixtures/vectors.json) holds 14 vectors. One of them, `string_with_byte_order_mark`, has a `String` that starts with a byte-order mark. Both test suites check the rendered text, the digest and the recovered signer of each one.
 
 ## 1. What is signed
 
@@ -344,4 +344,4 @@ The same exit on mainnet is [`fccc2318…`](https://stellar.expert/explorer/publ
 8. Check the result: 65 bytes, low `s`, `v` in `{0, 1, 27, 28}`. Recover the signer and compare it with the owner before sending anything.
 9. Attach the signature and submit, or hand the call and the entry to a relayer (section 10).
 
-Run the 11 vectors against your renderer and your hashing first. If your digest for `usdc_transfer` is `0x82240aca…4e14`, both match the contract.
+Run the 14 vectors against your renderer and your hashing first. If your digest for `usdc_transfer` is `0x82240aca…4e14`, both match the contract.

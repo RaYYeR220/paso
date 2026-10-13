@@ -1,6 +1,6 @@
 # Security
 
-Paso is unaudited: no external party has reviewed the code. The contracts are deployed on Stellar mainnet and on testnet; the web app and the relayer are set up for testnet only. This document says what the contracts guarantee, what each party can and cannot do, and what is out of scope.
+Paso is unaudited: no external party has reviewed the code. The contracts are deployed on Stellar mainnet and on testnet. The hosted app and its relayer serve both networks; on mainnet the app works with the user's own wallet only, with no demo key and no faucet. This document says what the contracts guarantee, what each party can and cannot do, and what is out of scope.
 
 The project reviewed its own contracts adversarially and published everything it found, with tests that reproduce it, in [AUDIT.md](AUDIT.md). That review is not a third-party audit and not formal verification. Ids such as F-01 below refer to its findings. The deployed contracts cannot be changed, so none of those findings can be patched.
 
@@ -20,7 +20,12 @@ The contracts cannot tell the two kinds of address apart: `deploy` and `address_
 - No code is not proof of a key. A smart-contract wallet that has not been deployed yet has no code on any chain and cannot be detected in advance.
 - The proof that works is a signature: the holder signs typed data, and the 65 bytes recover to the address.
 
-The SDK exports `ownerKind` for the code check; it has the limit in the second point. Do not send to the account of an address unless you know its holder can sign EIP-712 typed data with a plain key. Test: `f01_account_of_a_keyless_address_accepts_funds_it_can_never_spend`.
+What this project's code does about it:
+
+- **The SDK** exports `ownerKind(address)`. It asks Ethereum, Base and Base Sepolia for the code at the address and answers `contract`, `wallet` (no code found) or `unknown` (a chain did not answer). An EIP-7702 delegation counts as a key. `prepare` does not call it; code that uses the SDK has to.
+- **The app** runs that check before a transfer to the account of an Ethereum address. For a contract it blocks the send. The send goes ahead only if the sender ticks "Send anyway. I understand this USDC can never be moved again." An address that could not be checked, or that has never used its Stellar account, needs a tick on "I know this address is a regular wallet." A connected wallet that is a contract is refused. Before a wallet can bring USDC over, it signs one message that moves nothing, and the signature has to recover to its address.
+
+None of this detects a smart-contract wallet that is not deployed yet, and none of it applies to code that does not go through the app or that skips `ownerKind`. Do not send to the account of an address unless you know its holder can sign EIP-712 typed data with a plain key. Test: `f01_account_of_a_keyless_address_accepts_funds_it_can_never_spend`.
 
 ## Parties
 
@@ -95,7 +100,8 @@ What the relayer checks before it signs:
 4. A simulation that enforces the entry succeeds. The account contract verifies the signature for this exact call, as it will on chain.
 5. A second simulation with no entry attached records what the call asks for. It must be that same single invocation by that same account. A call that also wants the relayer's own authorisation, or that does not use the signed entry, stops here.
 6. The final simulation, made when the transaction is built, reports no authorisation other than the entry.
-7. The resource fee is at most `RELAYER_MAX_RESOURCE_FEE`, 0.5 XLM by default, and the day's total stays under `RELAYER_MAX_DAILY_FEES`, 50 XLM by default.
+7. The signature expires within 120 ledgers, about ten minutes, of the latest ledger. A signature made to last longer is not passed on.
+8. The resource fee is at most `RELAYER_MAX_RESOURCE_FEE`, and the day's total stays under `RELAYER_MAX_DAILY_FEES`: by default 0.5 XLM and 50 XLM on testnet, 0.3 XLM and 2 XLM on mainnet. On mainnet nothing is sent that would take the relayer's balance below 2 XLM.
 
 The transaction it sends has one operation and one entry. The live example is [`5a6cf2ec…`](https://stellar.expert/explorer/testnet/tx/5a6cf2ece6050bcd5d96d59b71162f1de514119ae8acbc99adbcbc37158bb890).
 
@@ -107,10 +113,10 @@ Relayer tests for this rule, in [`apps/web/test/relay.test.ts`](../apps/web/test
 
 The relayer builds three kinds of transaction itself. Callers supply no entry for them.
 
-- **Deploying an account.** The call is `hub.deploy(owner)`. If the simulation asks for any authorisation, the transaction is not sent.
+- **Deploying an account.** The call is `hub.deploy(owner)`. If the simulation asks for any authorisation, the transaction is not sent. On testnet anyone can ask for it through `POST /api/deploy`. On mainnet only a relayed first call triggers it, once its signature has been checked.
 - **Delivering a CCTP message.** The caller supplies a burn transaction hash. The relayer fetches the message and the attestation from Circle and builds the call from those bytes. Circle's MessageTransmitter asks its caller to authorise the call when it is called directly; that one authorisation, for exactly the call being made with nothing nested under it, is the only authorisation the relayer account ever gives. Anything more is refused.
 
-- **Finishing an exit on Base.** The caller supplies the hash of an exit on Stellar. Once Circle has attested it, the server's account on Base submits Circle's `receiveMessage` and pays the gas. Circle's contract decides who receives the USDC: the recipient named in the signed exit. The server completes only exits made through the hub from Stellar to Base, simulates the mint first and sends nothing that does not simulate. Mints are limited per caller and per day, stop below an ETH floor and above a gas price cap, and are off on mainnet unless `PAY_BASE_MINTS_ON_MAINNET=true`. Anyone else can submit the same mint from any wallet.
+- **Finishing an exit on Base.** The caller supplies the hash of an exit on Stellar. Once Circle has attested it, the server's account on Base submits Circle's `receiveMessage` and pays the gas. Circle's contract decides who receives the USDC: the recipient named in the signed exit. The server completes only exits made through the hub from Stellar to Base, simulates the mint first and sends nothing that does not simulate. Mints are limited per caller and per day, stop below an ETH floor and above a gas price cap, and are off on mainnet unless `PAY_BASE_MINTS_ON_MAINNET=true`. Where the server does not pay, which is mainnet by default and on the hosted app, it checks the exit in the same way and returns the attested message; the owner's wallet submits the mint and pays its gas. Anyone else can submit the same mint from any wallet.
 
 The fee cap and the daily budget apply to the two Stellar kinds.
 
@@ -118,7 +124,9 @@ The fee cap and the daily budget apply to the two Stellar kinds.
 
 Requests are limited per caller and per route, per minute. Faucet payouts are also limited per caller per hour, per owner per day and in total per day. The counts are kept in memory: they reset when the server restarts, and each server instance counts on its own. The limiter fails closed. A caller is identified only by headers the hosting platform sets; elsewhere all callers share one bucket.
 
-`PASO_NETWORK=mainnet` is refused unless `PASO_ALLOW_MAINNET=true` is set.
+The server serves mainnet only when `PASO_ALLOW_MAINNET=true` and `RELAYER_SECRET_MAINNET` are both set. Mainnet reads only its own variables, those ending in `_MAINNET`, and its relayer must be a different Stellar account from the testnet relayer. Each network has its own queue, limits and daily budget. [ENVIRONMENT.md](ENVIRONMENT.md) lists them.
+
+On mainnet `POST /api/deploy` answers 404. The relayer deploys an account there only together with that account's first signed call, after it has checked off chain that the signature is the owner's: a bare request to deploy proves nothing about who asks, and would spend the relayer's XLM.
 
 ## A malicious dapp or front end
 
@@ -154,7 +162,8 @@ The binding is sound: a signature for one network does not verify on the other (
 
 - Do not sign Paso prompts on a site you do not trust with a key whose mainnet account holds funds. Try a demo with a key that holds nothing on mainnet.
 - Know your mainnet account address. It is the `account` of every mainnet prompt.
-- A front end has to state the network in words where the user reviews the call, build the typed data itself for that network, and refuse to pass on for signing any request whose salt is not that network's.
+- The app names the network in words where the user reviews the call ("for Stellar mainnet"), shows the salt next to its meaning, and refuses a prepared call whose salt is not the selected network's before it reaches the review. The SDK builds the typed data itself for the network it is given. Switching the app to mainnet asks once per browser for a confirmation that real funds are involved.
+- None of this changes the wallet prompt. A copy of the app, or a front end that does not use the SDK, can leave it all out.
 
 No wallet extension has been tested, so how a wallet shows the salt is not known.
 
@@ -162,15 +171,15 @@ No wallet extension has been tested, so how a wallet shows the salt is not known
 
 A signature is a bearer instrument until its expiry ledger. Three facts follow from how the Soroban host handles nonces and expiry (F-02).
 
-- **The expiry is not shown and has no upper bound.** It is inside `payload`. The host refuses an expiry more than `max_entry_ttl − 1` ledgers ahead of the ledger in which the entry is used; on mainnet `max_entry_ttl` is 3,110,400 ledgers, about 180 days. That limits how wide the usable window is, not how far away it lies. A signature with an expiry two years out is refused today and works in the 180 days before that date. Whoever builds the request chooses the expiry. The SDK's default is at most 120 ledgers, about ten minutes.
+- **The expiry is not shown and has no upper bound.** It is inside `payload`. The host refuses an expiry more than `max_entry_ttl − 1` ledgers ahead of the ledger in which the entry is used; on mainnet `max_entry_ttl` is 3,110,400 ledgers, about 180 days. That limits how wide the usable window is, not how far away it lies. A signature with an expiry two years out is refused today and works in the 180 days before that date. Whoever builds the request chooses the expiry. The SDK sets 24 ledgers, about two minutes, and refuses more than 120, about ten minutes. The hosted relayer refuses a signature that expires more than 120 ledgers ahead. A front end that does not use the SDK, and a fee payer other than the hosted relayer, are bound by neither.
 - **A failed transaction leaves the signature live.** The nonce is consumed inside the transaction. If the transaction fails after the signature check, for lack of balance for example, the nonce is rolled back with everything else, and the signed entry is public. Until its expiry anyone can submit it again. Signing a second request after a failure leaves two live signatures for the same payment.
 - **There is no revocation.** The only way to cancel is to use the same nonce in another signed entry, and that blocks the original only while the host keeps the nonce record: until the replacement's own expiry, and never less than 17,280 ledgers, about a day, on mainnet. A short-lived replacement cancels a long-lived signature for a while and no longer. The account has no key rotation.
 
 What to do:
 
 - Treat every signature as live until its expiry ledger, even if its transaction failed.
-- After a failure, submit the same signed call again. Do not sign a new one while the old one is live.
-- Keep validity short. A front end has to show the expiry where the user reviews the call.
+- After a failure, submit the same signed call again. Do not sign a new one while the old one is live. The app does this: when the relayer's answer is lost, it sends the same signed call again.
+- Keep validity short. The app shows how many seconds the signature will be good for at review, and after a call that did not go through it says until when the signature stays usable.
 - If you signed on a site you no longer trust, move the funds out of the account.
 
 Tests: `f02_far_expiry_signature_is_refused_today_and_accepted_later`, `f02_signature_is_live_through_its_expiry_ledger_and_dead_in_the_next`, `f02_failed_transaction_leaves_the_signature_usable_by_anyone`, `f02_cancelling_by_spending_the_nonce_wears_off`.
@@ -229,7 +238,7 @@ Nothing is lost when an entry is archived. No path was found by which archival l
 
 That is about 54 XLM a year for the two code entries. Restoring an entry after it has been archived costs about what creating it did; the two uploads were 9.37 XLM and 5.96 XLM. The restore figure is an estimate, and a restore has not been exercised.
 
-**Who pays.** Owners hold no XLM by design, and the hosted relayer does not cover this. It refuses a call whose simulation says entries have to be restored, and its cap on resource fees per transaction, at most 0.5 XLM by default, is far below the cost of restoring either code entry. After an expiry, the next person to act needs a funded Stellar account, their own or someone else's.
+**Who pays.** Owners hold no XLM by design, and the hosted relayer does not cover this. It refuses a call whose simulation says entries have to be restored, and its cap on resource fees per transaction, 0.3 XLM on mainnet and 0.5 XLM on testnet by default, is far below the cost of restoring either code entry. After an expiry, the next person to act needs a funded Stellar account, their own or someone else's.
 
 **The commands.** `PAYER` is a Stellar CLI identity, or the secret key, of an account with XLM on mainnet; it signs and pays. `3110399` is the network's `max_entry_ttl` minus one, the longest lifetime an extension can ask for.
 
@@ -270,11 +279,11 @@ Tests: `f05_account_code_never_extends_the_lifetime_of_anything`, `f05_hub_code_
 ## Known limits and non-goals
 
 - Unaudited. The project's own review is in [AUDIT.md](AUDIT.md). It is not a third-party audit and not formal verification.
-- Mainnet covers the contracts and one scripted run. The web app and the relayer have run on testnet only.
+- Mainnet has seen two journeys: one from the scripts and one through the hosted app, driven by a scripted wallet. On mainnet the app brings over at most 25 USDC at a time and its relayer spends at most 2 XLM of fees a day.
 - No key rotation, no recovery, no guardians, no spending limits, no session keys.
 - No upgrade path. A bug in the account code cannot be patched in place.
 - Externally owned accounts only. ERC-1271 smart-contract wallets cannot sign, and USDC sent to the account of a contract address is lost. See [Who can spend from an account](#who-can-spend-from-an-account).
-- Wallet extensions are untested. The signatures in the linked transactions were made by scripts, or by the web app's demo key in the browser, through viem's EIP-712 signer.
+- Wallet extensions are untested. The signatures in the linked transactions were made by scripts, by the web app's demo key, or by a scripted wallet that speaks the standard wallet interface (EIP-1193), all through viem's EIP-712 signer.
 - Nested arguments are bound by hash and are not readable. Neither are 256-bit integers, timepoints, durations and muxed addresses.
 - The message shows raw integers and addresses, carries no types, and does not show the signature's expiry or the name of the network.
 - A signature stays usable until its expiry even if its transaction failed, and it cannot be revoked. See [Lifetime of a signature](#lifetime-of-a-signature).
@@ -288,14 +297,14 @@ Tests: `f05_account_code_never_extends_the_lifetime_of_anything`, `f05_hub_code_
 
 From the project's own review. Each has a test named after its id in `contracts/account/src/audit.rs` or `contracts/hub/src/audit.rs`; [AUDIT.md](AUDIT.md) has the detail.
 
-- **F-04. A muxed recipient is shown as a hash.** A `transfer` to an `M…` address displays its destination as `xdr:<sha256>`. Do not sign a `transfer` whose recipient starts with `xdr:` unless you produced that address yourself. A front end should refuse muxed recipients or show the `M…` and `G…` forms next to the prompt.
-- **F-07. The displayed text is typeless, flat and unsanitised.** Values of different types can show the same text, the call list does not show nesting, and a `String` argument reaches the wallet with line breaks and direction overrides intact. None of this lets a signature authorise a call with different text; `payload` binds the exact values. It limits what reading the prompt can tell you. Refuse prompts with `xdr:` values you cannot account for.
+- **F-04. A muxed recipient is shown as a hash.** A `transfer` to an `M…` address displays its destination as `xdr:<sha256>`. Do not sign a `transfer` whose recipient starts with `xdr:` unless you produced that address yourself. The SDK's `prepare` and the app refuse a muxed recipient for a transfer; for a generic call the app marks a muxed argument as unreadable and asks for a confirmation.
+- **F-07. The displayed text is typeless, flat and unsanitised.** Values of different types can show the same text, the call list does not show nesting, and a `String` argument reaches the wallet with line breaks and direction overrides intact. None of this lets a signature authorise a call with different text; `payload` binds the exact values. It limits what reading the prompt can tell you. Refuse prompts with `xdr:` values you cannot account for. For a generic call the app shows each argument's type, marks text that can mislead and values bound by hash, and waits for the owner to confirm the marked lines; it warns and does not refuse.
 - **F-08. A `Bytes` argument above about 25 kB cannot be authorised.** The signature check then needs more memory than a transaction is allowed. Such a call is impossible for a Paso account. No funds are at risk.
 - **F-09. The hub cannot give anything back.** Never send anything to the hub's address.
 - **F-10. The hub validates amounts only.** A recipient that cannot be minted to on the chosen domain is burned on Stellar and lost. Use `exit` for EVM destinations only, and take the delivered amount from Circle, not from the hub's `Exit` event.
 - **F-11. Signature bytes are not unique, and the credential encoding is not signed.** Anyone can re-wrap a signed entry in the delegated credential encoding and it still verifies; the same call runs, once. Do not use the bytes of a signature or of a signed entry as an identifier.
 - **F-12. As a delegated signer, `account` names the signer.** If a Paso account is registered as a signer of another account, the prompt says `account: <the Paso account>` while the other account's authority is used. `account` means "the contract that checks the signature".
-- **F-13. A leading byte-order mark is part of a `String`.** The contract hashes `String` bytes as they are. A signer that drops the mark while decoding gets `BadSignature`. In JavaScript, decode with `ignoreBOM: true`.
+- **F-13. A leading byte-order mark is part of a `String`.** The contract hashes `String` bytes as they are. A signer that drops the mark while decoding gets `BadSignature`. In JavaScript, decode with `ignoreBOM: true`, as the SDK's renderer does.
 
 ## Reporting an issue
 
@@ -303,4 +312,4 @@ Open an issue at <https://github.com/RaYYeR220/paso/issues>. There is no private
 
 ## Limits of the hosted relayer
 
-Rate limits, daily budgets and the record of transactions in flight are kept in memory by each server instance, so on a host that runs several instances each one enforces its own, and a restart starts them over. The worst case is therefore bounded per instance and per day: the test USDC the faucet's payer holds above its reserve, the daily fee budget in test XLM, and the test ETH spent on gas for the daily number of mints on Base. The relayer never holds user funds: it cannot move or redirect them, and a call it relays can only do what its owner signed. Everything the relayer does (deploying an account, relaying a signed call, delivering a transfer to Stellar, completing one on Base) can be done by anyone with their own funded account, using the SDK or the scripts.
+Rate limits, daily budgets and the record of transactions in flight are kept in memory by each server instance, so on a host that runs several instances each one enforces its own, and a restart starts them over. The worst case is therefore bounded per instance and per day. On testnet: the test USDC the faucet's payer holds above its reserve, the daily fee budget in test XLM, and the test ETH spent on gas for the daily number of mints on Base. On mainnet, where there is no faucet and the server pays for no mints: 2 XLM of fees a day per instance, and never more than the relayer account holds above 2 XLM. The relayer never holds user funds: it cannot move or redirect them, and a call it relays can only do what its owner signed. Everything the relayer does (deploying an account, relaying a signed call, delivering a transfer to Stellar, completing one on Base) can be done by anyone with their own funded account, using the SDK or the scripts: `pnpm deliver` delivers a transfer from Base with any funded Stellar account, and `pnpm mint` completes one on Base with any Base account that has gas.

@@ -4,17 +4,34 @@
 
 **Every Ethereum address already has a Stellar account.**
 
-Live on testnet: **https://paso-stellar.vercel.app** — [try it without a wallet](https://paso-stellar.vercel.app/app?demo=1), or see [every claim with its transaction](https://paso-stellar.vercel.app/proof).
+Live on mainnet and testnet: **https://paso-stellar.vercel.app**. On [mainnet](https://paso-stellar.vercel.app/app?network=mainnet) it works with your own wallet and real USDC. On testnet you can [try it without a wallet](https://paso-stellar.vercel.app/app?demo=1). The [proof page](https://paso-stellar.vercel.app/proof) links every claim to its transaction.
 
 ## What and why
 
 The dollars are on EVM chains. A Stellar account asks for a new wallet, a new seed phrase, XLM for reserves and a trustline before the first dollar arrives, and MetaMask's native Stellar support still creates a classic account with those costs (1 XLM, plus 0.5 XLM per trustline). Paso derives a Soroban contract account from the 20-byte Ethereum address itself. That account accepts only an EIP-712 signature from that address, and it rebuilds the signed message on chain from the calls being authorised: what the wallet displays is exactly what executes, or nothing does. USDC arrives from Base over Circle CCTP and a relayer pays the Stellar fees, so there is no new wallet, no seed phrase and no XLM.
 
-Status: unaudited. The hub and the account code are deployed on Stellar mainnet and on testnet. The whole path has run on both: Base to the account, on to another account, and back to Base, with real USDC on mainnet. On mainnet that was one run from the scripts. The web app and the relayer are set up for testnet only. [Limits](#limits) lists everything that is not done.
+Status: unaudited. The hub and the account code are deployed on Stellar mainnet and on testnet. The whole path has run on both: Base to the account, on to another account, and back to Base, with real USDC on mainnet. On mainnet it has run twice: once from the scripts, and once through the hosted app, driven by a scripted wallet. The hosted app serves both networks; on mainnet it takes your own wallet only. No browser wallet extension has been exercised live. [Limits](#limits) lists everything that is not done.
 
 ## See it
 
-### Mainnet
+### Mainnet, through the hosted app
+
+On 2026-10-13 the hosted app, switched to mainnet, ran the whole path with real USDC for the owner `0x20806157d9607050204bbbCd37CE71498B35D46c` and its account [`CBWU43ND…XEZ7EPX`](https://stellar.expert/explorer/public/contract/CBWU43NDIBPC6SD2WKVNJH6A5ROHGMSDJWAVLCO3RITO5Q264XEZ7EPX). It was driven by a scripted wallet: a Playwright test opens the site in a browser and puts a wallet at `window.ethereum` that speaks the standard wallet interface (EIP-1193) and signs with a key the test holds. No browser extension was involved. Times are block and ledger close times, UTC.
+
+| Time | What happened | Transaction |
+|---|---|---|
+| 08:37:05 | USDC approval on Base, sent by the wallet | [`0xc51cb1bc…`](https://basescan.org/tx/0xc51cb1bc79348b5f23f368ef1030afd08cf07c926eec578335f37b9f83d79a52) |
+| 08:37:07 | 0.5 USDC burned on Base for the account, sent by the wallet | [`0xd235da18…`](https://basescan.org/tx/0xd235da188139aa7ab9539f2090010e542c5966b2f720703fe2459e7550d5f6db) |
+| 08:37:17 | Delivered on Stellar by the hosted relayer. The balance went from 0.39987 to 0.899805 USDC | [`d2cf5d62…`](https://stellar.expert/explorer/public/tx/d2cf5d6274c026fdfc01f36284f11e576d76d0ccd0c0f213c06bfffa351d2f0f) |
+| 08:37:27 | 0.1 USDC sent to `CDHTLX2766XMPFB5JT5T6UR3QIIAMP5PKMQHUS3PL5AAD6OUYVDG7JQT`, the account of `0x5BED629d44E4D76de7707b9Fd9d0Fe95B160B152`. Signed in the wallet, relayed | [`622c2279…`](https://stellar.expert/explorer/public/tx/622c2279221b2a4a6bce929cc0bdda595a07600e5dc0cf357888770f879e35cc) |
+| 08:37:37 | 0.2 USDC sent back to Base: `hub.exit` and its nested `transfer`, one signature, relayed | [`517fab23…`](https://stellar.expert/explorer/public/tx/517fab234609285ebb0f8afe9b138724b790b61f94207a663df2f127ba4a7e38) |
+| 08:37:53 | Minted on Base to the owner. The wallet submitted the mint and paid its gas | [`0x60865a32…`](https://basescan.org/tx/0x60865a32075866fa48437e9643976a59e6370f409b2f6bf3c04bcc0cf9d3be31) |
+
+48 seconds from the approval on Base to the mint on Base. The three Stellar transactions were paid by the hosted relayer's mainnet account, `GAS65I36DQSMBSEZRN5KXDJMRCNEWNEX2VANOQB2QZQX5JX2X6D4SQBM`: 0.0280702, 0.0398373 and 0.0044255 XLM. `pnpm verify 622c2279221b2a4a6bce929cc0bdda595a07600e5dc0cf357888770f879e35cc --network mainnet` exits 0.
+
+On mainnet the hosted app is wallet-only: there is no demo key and no faucet. Its relayer pays at most 0.3 XLM of resource fees for one transaction and 2 XLM of fees in a day, and pays nothing once its account holds less than 2 XLM. The app brings over at most 25 USDC in one transfer. The wallet submits its own mint on Base when USDC goes back. Deployment is not offered on its own: the deploy route answers 404 on mainnet, and the relayer deploys an account only when it relays that account's first signed call, after checking the signature off chain. The command for the scripted-wallet run is under [Scripts](#scripts).
+
+### Mainnet, from the scripts
 
 One run with real USDC on Base and Stellar mainnet on 2026-10-12, for the owner `0x20806157d9607050204bbbCd37CE71498B35D46c`. Times are block and ledger close times, UTC.
 
@@ -35,7 +52,7 @@ Circle attested the burn in 2 seconds and the exit in 7. The first delivery tran
 
 Every Stellar fee was paid by a separate account: 0.0658391 XLM for the delivery and 0.1124682 XLM for the five transactions after it. The owner's account paid none.
 
-This run was made by `scripts/e2e.ts`. The web app and the relayer were not involved; they are set up for testnet only.
+This run was made by `scripts/e2e.ts`, without the web app and without its relayer.
 
 ### Testnet
 
@@ -72,9 +89,9 @@ flowchart TD
 Solid arrows: executed live on Base and Stellar mainnet and on their testnets, transactions linked under [Proof](#proof). A dashed arrow would mark a path that is built but not yet run live; none is left in this diagram.
 
 1. **Derive.** The hub contract deploys accounts with the salt `12 zero bytes ‖ 20-byte Ethereum address`. The account address is the id of that contract, so it depends only on the network, the hub and the Ethereum address. `hub.address_of(owner)` returns it on chain; `twinAddress(owner, network)` in the SDK computes it with no network call. The address can receive USDC before anything is deployed. `hub.deploy(owner)` is open to anyone and repeating it changes nothing.
-2. **Fund.** USDC is burned on Base through Circle's CCTP contracts. Circle attests the burn. Anyone can deliver the attested message on Stellar: `deliverWith` in the SDK does it from any funded account, and the relayer has a route for it. Circle's contracts decide where the USDC goes.
+2. **Fund.** USDC is burned on Base through Circle's CCTP contracts. Circle attests the burn. Anyone can deliver the attested message on Stellar: `deliverWith` in the SDK and `pnpm deliver` do it from any funded account, and the relayer has a route for it. Circle's contracts decide where the USDC goes.
 3. **Act.** The SDK simulates a call and gets the one authorisation entry the account must sign. It renders the entry as EIP-712 typed data. The wallet signs. A fee payer wraps the call and the signed entry in its own transaction. The Soroban host calls the account's `__check_auth`, which renders every call to text, hashes it as EIP-712, recovers the signer and compares it with the stored owner.
-4. **Leave.** `hub.exit` sends USDC from the account back to Base over CCTP. One signature covers `exit` and the USDC `transfer` nested inside it.
+4. **Leave.** `hub.exit` sends USDC from the account back to Base over CCTP. One signature covers `exit` and the USDC `transfer` nested inside it. Once Circle has attested the exit, anyone can submit the mint on Base: the owner's wallet in the app, or `pnpm mint` from any Base account.
 
 The fee payer is the relayer (`POST /api/relay`) or any funded Stellar account (`submitWith` in the SDK). It pays and nothing else: it cannot change the call, and `pnpm e2e` runs without a relayer.
 
@@ -133,18 +150,29 @@ The account contract never sees the JSON. It receives the calls from the host an
 
 ## Proof
 
-2026-10-12. Every transaction of the two runs is linked under [See it](#see-it).
+2026-10-12 and 2026-10-13. Every transaction of the three runs is linked under [See it](#see-it).
+
+**The code on chain is this code, checked on every push.** The [CI workflow](.github/workflows/ci.yml) builds both contracts on Linux with Rust 1.99.0 and Stellar CLI 28.1.0, and fails unless their sha256 hashes equal the deployed code listed in [`.github/deployed-wasm.sha256`](.github/deployed-wasm.sha256). It also reads the code hashes from mainnet and testnet and fails if a network answers with another one. Locally, with the same two versions:
+
+```sh
+stellar contract build
+shasum -a 256 target/wasm32v1-none/release/paso_account.wasm target/wasm32v1-none/release/paso_hub.wasm
+# 2ee1ac08ca6407667db15bcffe75c8cbb4e41d95b2d047541b5dad133cfe75ee  target/wasm32v1-none/release/paso_account.wasm
+# aeaa1c72f607071fd1f383638fa0c850df1c15bd051b3e1061ac57bc0e46b045  target/wasm32v1-none/release/paso_hub.wasm
+```
+
+The contracts are not shown as verified on stellar.expert. That needs a `source_repo` entry inside the deployed code, which these builds do not have, and adding one changes the hash, so it means deploying again. The [release workflow](.github/workflows/release.yml) makes attested builds for future deployments; it has not been run.
 
 **Mainnet: Stellar public network and Base**
 
-- The deployed contract code is rebuilt byte for byte on every push: CI builds both contracts on Linux and fails unless their hashes equal the ones on chain ([hashes](.github/deployed-wasm.sha256), [workflow](.github/workflows/ci.yml)). They are not shown as verified on stellar.expert: the deployed code carries no `source_repo` entry, and adding one means redeploying.
 - Hub contract: [`CDZCHMNS…AB7LJK`](https://stellar.expert/explorer/public/contract/CDZCHMNSAAIST5K2DNP4DP6H3DE4UJISUOMDFQTKD7IK6CD477AB7LJK), deployed in [`9285fcdb…`](https://stellar.expert/explorer/public/tx/9285fcdb5d3f065c196816810ff6af1ff453ece88824e5775bd4602154082426).
 - Account code: wasm hash `2ee1ac08ca6407667db15bcffe75c8cbb4e41d95b2d047541b5dad133cfe75ee`, the same as on testnet, uploaded in [`eb90e5f9…`](https://stellar.expert/explorer/public/tx/eb90e5f911d097cbbaf724bed6ab670a7a2cf3843c4a1ffb89397ce34ce05135). Hub code uploaded in [`c3eca151…`](https://stellar.expert/explorer/public/tx/c3eca151541a5e66d2d7679a37492686cd5dd46a1c5f7c66c1f9f8bcb6139161).
 - Account of `0x20806157d9607050204bbbCd37CE71498B35D46c`: [`CBWU43ND…XEZ7EPX`](https://stellar.expert/explorer/public/contract/CBWU43NDIBPC6SD2WKVNJH6A5ROHGMSDJWAVLCO3RITO5Q264XEZ7EPX). It received USDC in [`a742bf77…`](https://stellar.expert/explorer/public/tx/a742bf77748cc1d2fb25347996dea79fa4e3827d7005cf6391588874a44fe1a0) and was deployed later, in [`8da9a459…`](https://stellar.expert/explorer/public/tx/8da9a45941d661070efbbf0c0276f7d483488ce2e5003e478dc1f0feef57b6ea).
 - Paid before it had an account, twice: the owner's own account above, and 0.1 USDC to `CCSLYO2GFX5G7STNB37YZ44KB7WLBB72UH5Z7CD3UUZ64RAU6AHT4LNX`, the never-deployed account of `0xEe67130Fa530c04b88D6Fd99fcc7D1D1494841f8`, in [`85cb7efa…`](https://stellar.expert/explorer/public/tx/85cb7efa882a1cc6cc54c294bd7d60e5c7b6e47c8221ff7625fb44f6623e2322).
 - On Base: USDC approval [`0x53eb5943…`](https://basescan.org/tx/0x53eb5943435834ca70659f5bf3715e5c7d7f82c10516955083260a316920f469), burn [`0x460008a2…`](https://basescan.org/tx/0x460008a250884ff32698bd849f2094f2217c8b613a3ce3c5041a44730194994c), mint [`0x5b713522…`](https://basescan.org/tx/0x5b713522befbbeeb702d9bb8d48e4fc13da7585b3222ec52e5e7296caf3e4776).
 - Refused on mainnet, amount changed after signing, submitted on purpose: [`eb945398…`](https://stellar.expert/explorer/public/tx/eb94539839cba10012c01cea9453410d740d89194c2e99c4b33958aec144b6a3), FAILED, result `txFailed, invokeHostFunctionTrapped`. Host log: `["failed account authentication with error", CBWU43ND…XEZ7EPX, Error(Contract, #2)]`. Error 2 is `BadSignature`.
-- Scope: the contracts and one scripted run. The web app and the relayer have not run on mainnet.
+- Through the hosted app: the six transactions in the [first table](#mainnet-through-the-hosted-app). `POST /api/cctp/deliver` and `POST /api/relay` ran on mainnet; the mint on Base was submitted by the wallet.
+- Scope: the contracts, one scripted run and one run through the hosted app with a scripted wallet. No browser wallet extension has been used.
 
 **Testnet: deployment**
 
@@ -160,12 +188,13 @@ The account contract never sees the JSON. It receives the calls from the host an
 
 **Testnet: through the web app and the relayer**
 
-The app's transactions were signed in the browser with its demo key, not with a wallet extension.
+These transactions were signed in the browser with the app's demo key, or by the scripted wallet. No wallet extension was used.
 
 - `POST /api/relay`: from the end-to-end script, an account deployed in [`0ec43de4…`](https://stellar.expert/explorer/testnet/tx/0ec43de437e650f7db5aa8bf942bf2f7460a168020f17ddfceae7c9f51febda9) and its call relayed in [`5a6cf2ec…`](https://stellar.expert/explorer/testnet/tx/5a6cf2ece6050bcd5d96d59b71162f1de514119ae8acbc99adbcbc37158bb890). From the app, a 0.1 USDC send relayed in [`ee5ca8c9…`](https://stellar.expert/explorer/testnet/tx/ee5ca8c9244c23c942ff2f2a8a280130bae2c58b66a67e272c40857909f70a0d).
 - `POST /api/demo/fund` and `POST /api/cctp/deliver`: faucet burn on Base Sepolia [`0xb3474363…`](https://sepolia.basescan.org/tx/0xb3474363c81c3f1458423a1003f38c24deba51a17b5700cb71b386262b5854dd), delivered by the relayer in [`0e906ad1…`](https://stellar.expert/explorer/testnet/tx/0e906ad1652c2f5c2635d0082085d7b13bbfe309856944bf7a062239987d6669).
 - `POST /api/cctp/complete`: exit from the app [`f568145f…`](https://stellar.expert/explorer/testnet/tx/f568145fef34bceac94cfd5286c8a461c3315462f548fb451606434d122a035a), minted on Base Sepolia by the relayer in [`0x126161a9…`](https://sepolia.basescan.org/tx/0x126161a91176872959d8141ee6d449c93f0f0ae33d82dfc3d62377acf7467f94).
 - A send changed after signing was refused by the relayer's simulation with `bad_signature` (HTTP 422). Nothing was sent, so there is no transaction to link.
+- The scripted wallet on testnet, 2026-10-13: approval [`0xb81b129d…`](https://sepolia.basescan.org/tx/0xb81b129dbda737f45aa416e82b4edacaddbeaf392ddec01e39ed3a8b12d2ee98), burn [`0x9b9718aa…`](https://sepolia.basescan.org/tx/0x9b9718aab40bac451ccf0adaf9c7cc15f6cd2625399322690ff8136c000cfb7b), delivery [`f6a76878…`](https://stellar.expert/explorer/testnet/tx/f6a7687847e19e6ac812cf10d0f0522361dcf4ecc1ab56ebade166ad18c87cb8), transfer [`e7861ada…`](https://stellar.expert/explorer/testnet/tx/e7861ada2da8a3e3d336bd4707c6a09dd99124f4a69dfbc41d1f5385d3ce8a45), exit [`6d223692…`](https://stellar.expert/explorer/testnet/tx/6d223692392bef017fb3bab59771f252f6f5be7c8eb49d79671f732ef7525720), mint paid by the relayer [`0x4985af35…`](https://sepolia.basescan.org/tx/0x4985af3543657d886403fcb65b37a400a2a816af3eb843fc72a77625de6cf11d). With the wallet submitting the mint itself: exit [`77e63f5f…`](https://stellar.expert/explorer/testnet/tx/77e63f5f07c819b5c9f2cae3c4d43f32e7c669fbc086d237d6938a2f693c0b0b), mint [`0xc005d89c…`](https://sepolia.basescan.org/tx/0xc005d89c638905d3d030c42ec20539bb59fba82421d8aa76b3f93672c832e8a9).
 
 **Fees charged on mainnet**
 
@@ -180,17 +209,22 @@ The app's transactions were signed in the browser with its demo key, not with a 
 | Exit to Base ([`fccc2318…`](https://stellar.expert/explorer/public/tx/fccc2318b8322cc020fd0d6c0a84f05dea45a36725ae9ba24f36a6a7287d76c6)) | 0.0426572 |
 | `approve` ([`9f7172de…`](https://stellar.expert/explorer/public/tx/9f7172de421fe48032130cf76432432a4a1a3298e0003ff3763e759d3b0ba8a2)) | 0.0022547 |
 | The refused transaction ([`eb945398…`](https://stellar.expert/explorer/public/tx/eb94539839cba10012c01cea9453410d740d89194c2e99c4b33958aec144b6a3)) | 0.0014289 |
+| Deliver a CCTP message, hosted relayer ([`d2cf5d62…`](https://stellar.expert/explorer/public/tx/d2cf5d6274c026fdfc01f36284f11e576d76d0ccd0c0f213c06bfffa351d2f0f)) | 0.0280702 |
+| USDC transfer, hosted relayer ([`622c2279…`](https://stellar.expert/explorer/public/tx/622c2279221b2a4a6bce929cc0bdda595a07600e5dc0cf357888770f879e35cc)) | 0.0398373 |
+| Exit to Base, hosted relayer ([`517fab23…`](https://stellar.expert/explorer/public/tx/517fab234609285ebb0f8afe9b138724b790b61f94207a663df2f127ba4a7e38)) | 0.0044255 |
 
 All of it was paid by `GAS65I36DQSMBSEZRN5KXDJMRCNEWNEX2VANOQB2QZQX5JX2X6D4SQBM`. The uploads and the hub deployment are paid once per network. On Base the owner paid the gas of the burn and of the mint.
 
-The relayer refuses any transaction whose resource fee is above 0.5 XLM, and stops at 50 XLM of fees in 24 hours. Both limits are settings.
+The hosted relayer's limits are settings. By default it refuses a transaction whose resource fee is above 0.5 XLM on testnet and 0.3 XLM on mainnet, and stops at 50 XLM of fees in 24 hours on testnet and 2 XLM on mainnet. On mainnet it also stops paying once its account holds less than 2 XLM.
 
 **Tests**
 
 - 50 for the account contract and 28 for the hub: `pnpm test:contracts`. 21 and 13 of them are the tests of the project's own security review, [docs/AUDIT.md](docs/AUDIT.md). They demonstrate each limit it found and each attack that was refused, so a pass there does not mean "safe".
-- 200 for the SDK offline: `PASO_OFFLINE=1 pnpm test:sdk`. Without the flag, 8 more read testnet.
-- 321 for the web app and the relayer offline: `PASO_OFFLINE=1 pnpm test:web`. 23 more send testnet transactions and need keys.
-- 11 signing vectors in [`fixtures/vectors.json`](fixtures/vectors.json). The Rust suite and the TypeScript suite both check the rendered text, the digest and the recovered signer of every vector.
+- 713 for the SDK offline: `PASO_OFFLINE=1 pnpm test:sdk`. 10 more read testnet or need a key.
+- 522 for the web app and the relayer offline: `PASO_OFFLINE=1 pnpm test:web`. 25 more need testnet, keys or a running server.
+- The scripted-wallet journey through the app, on a network you choose: `pnpm --filter @paso/web e2e`. It moves funds; see [Scripts](#scripts).
+- 45 Rust tests and 14 JavaScript tests for the OpenZeppelin verifier, in [`verifiers`](verifiers/README.md).
+- 14 signing vectors in [`fixtures/vectors.json`](fixtures/vectors.json). The Rust suite and the TypeScript suite both check the rendered text, the digest and the recovered signer of every vector.
 - The order in which the host lists calls to `__check_auth` (root first, then sub-calls depth first) is checked by a contract test that goes through the real host path: `host_lists_contexts_root_first_then_depth_first`.
 
 [docs/CLAIMS.md](docs/CLAIMS.md) lists every claim with its evidence, and what is not claimed.
@@ -242,38 +276,17 @@ pnpm build:contracts   # target/wasm32v1-none/release/paso_account.wasm and paso
 pnpm test:contracts    # 50 account tests, 28 hub tests
 
 pnpm build:sdk
-PASO_OFFLINE=1 pnpm test:sdk   # 200 tests
-PASO_OFFLINE=1 pnpm test:web   # 321 tests: the relayer and the web app's logic
+PASO_OFFLINE=1 pnpm test:sdk   # 713 tests
+PASO_OFFLINE=1 pnpm test:web   # 522 tests: the relayer and the web app's logic
 ```
 
-`PASO_OFFLINE=1` skips every test that reaches a network. Without it, `pnpm test:sdk` runs 8 more tests that read Stellar testnet, and 2 that need `PASO_E2E_OWNER_KEY`. `pnpm test:web` has 23 more tests that send testnet transactions; they need `RELAYER_SECRET` and `PASO_E2E_OWNER_KEY`.
+`PASO_OFFLINE=1` skips every test that reaches a network. Without it, `pnpm test:sdk` runs 10 more: 8 read Stellar testnet and 2 need `PASO_E2E_OWNER_KEY`. `pnpm test:web` has 25 more: they send testnet transactions and need `RELAYER_SECRET` and `PASO_E2E_OWNER_KEY`, or drive a running server named in `PASO_SMOKE_URL`.
 
 ### Environment
 
 Copy `apps/web/.env.example` to `apps/web/.env.local`. The dev server and the web tests read that file; so do the scripts on testnet. On mainnet the scripts read the environment alone.
 
-| Variable | Required | Purpose |
-|---|---|---|
-| `PASO_NETWORK` | no | `testnet` or `mainnet`. Defaults to `testnet`. |
-| `PASO_ALLOW_MAINNET` | for mainnet | Must be `true` for `PASO_NETWORK=mainnet` to be accepted. Real funds are never used by default. |
-| `RELAYER_SECRET` | yes | Secret key (`S…`) of the Stellar account that pays the fee of every relayed transaction. It pays fees and nothing else. |
-| `DEMO_PAYER_PRIVATE_KEY` | no | Private key (`0x…`) of the server's account on Base. It burns for the testnet faucet and pays the gas of mints that finish a transfer back to Base. Empty switches both off. |
-| `STELLAR_RPC_URL` | no | Soroban RPC endpoint. Defaults to the public endpoint of the network. |
-| `BASE_RPC_URL` | no | RPC endpoint for Base. Defaults to the chain's public endpoint. |
-| `RELAYER_MAX_RESOURCE_FEE` | no | The most one transaction of the relayer may cost in resource fees, in stroops. Defaults to `5000000` (0.5 XLM). |
-| `RELAYER_MAX_DAILY_FEES` | no | The most the relayer spends on fees in any 24 hours, in stroops. Defaults to `500000000` (50 XLM). |
-| `DEMO_FUND_PER_IP_PER_HOUR` | no | Faucet requests one caller address may make per hour. Defaults to `5`. |
-| `DEMO_FUND_PER_OWNER_PER_DAY` | no | Faucet requests for one owner per day. Defaults to `2`. |
-| `DEMO_FUND_PER_DAY` | no | Faucet payouts in any 24 hours, whoever asks. Defaults to `50`. |
-| `DEMO_FUND_PAYER_FLOOR` | no | USDC the faucet's payer keeps, in 6-decimal units. No payout takes it below this. Defaults to `2000000` (2 USDC). |
-| `BASE_MINTS_PER_CALLER_PER_HOUR` | no | Mints on Base the server pays the gas for, per caller in an hour. Defaults to `10`. |
-| `BASE_MINTS_PER_DAY` | no | Mints on Base the server pays the gas for in any 24 hours, whoever asks. Defaults to `100`. |
-| `BASE_MINT_PAYER_ETH_FLOOR` | no | ETH the server's account on Base keeps, in wei. Below it the server stops paying for mints. Defaults to `100000000000000` (0.0001 ETH). |
-| `BASE_MINT_MAX_FEE_PER_GAS` | no | The most the server offers per unit of gas for a mint on Base, in wei. While Base asks more, it does not mint. Defaults to `250000000` (0.25 gwei). |
-| `PAY_BASE_MINTS_ON_MAINNET` | no | Must be `true`, on top of `PASO_ALLOW_MAINNET`, for the server to pay for mints on Base on mainnet. Off by default: any wallet can submit the mint. |
-| `PASO_E2E_OWNER_KEY` | tests, scripts | Ethereum private key (`0x…`) of an owner whose account is deployed on testnet. |
-| `PASO_E2E_SOURCE_SECRET` | tests, scripts | Secret key (`S…`) of any funded Stellar testnet account. It may be the relayer's. |
-| `PASO_E2E_PAYER_KEY` | scripts, optional | Ethereum private key (`0x…`) that pays the burn on Base Sepolia. Defaults to `DEMO_PAYER_PRIVATE_KEY`, then `PASO_E2E_OWNER_KEY`. |
+For testnet one variable is enough: `RELAYER_SECRET`, the secret key of a funded Stellar testnet account that pays the fees. The same server also serves mainnet when `PASO_ALLOW_MAINNET=true` and `RELAYER_SECRET_MAINNET`, an account of its own, are set. Every variable, grouped by network, with the limits and their defaults: [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md).
 
 ### Dev server
 
@@ -284,16 +297,16 @@ pnpm --filter @paso/web dev    # http://localhost:3000
 
 Pages: the landing page at `/`, the app at `/app`, an address lookup at `/lookup`, and the proof page at `/proof`.
 
-The server exposes the relayer API:
+The server exposes the relayer API. Each request names its network, `testnet` or `mainnet`.
 
 | Route | What it does |
 |---|---|
 | `POST /api/relay` | Wraps one signed call in a transaction and pays its fee. Deploys the account first if needed. |
-| `POST /api/deploy` | Deploys the account of an Ethereum address. |
+| `POST /api/deploy` | Testnet only: deploys the account of an Ethereum address. On mainnet it answers 404; there the relayer deploys an account only together with that account's first signed call, after checking the signature. |
 | `POST /api/cctp/deliver` | Takes the hash of a CCTP burn, asks Circle for the attestation and delivers it on Stellar. |
-| `POST /api/cctp/complete` | Takes the hash of an exit on Stellar. Once Circle has attested it, the server's account on Base submits the mint and pays its gas. On mainnet it answers 404 unless set up to pay. |
-| `POST /api/demo/fund` | Testnet only: burns 1 test USDC on Base Sepolia for an owner's account. |
-| `GET /api/health` | Network, hub, relayer address and balances. |
+| `POST /api/cctp/complete` | Takes the hash of an exit on Stellar and checks it with Circle. Where the server pays for mints (testnet, by default), its account on Base submits the mint once Circle has attested. Otherwise (mainnet, by default) it returns the attested message for the owner's wallet to submit. |
+| `POST /api/demo/fund` | Testnet only: burns 1 test USDC on Base Sepolia for an owner's account. On mainnet it answers 404. |
+| `GET /api/health` | Each network: hub, relayer address and balances. |
 
 ### Scripts
 
@@ -304,8 +317,16 @@ pnpm e2e --relayer <url>           # the same, with a relayer paying the Stellar
 pnpm e2e --network mainnet --dry-run   # every read and simulation of a mainnet run and what it would cost; sends nothing
 pnpm e2e --network mainnet         # the same journey with real funds; the owner key pays on Base, PASO_E2E_SOURCE_SECRET on Stellar
 pnpm verify <stellar tx hash> [--network mainnet]
+PASO_SOURCE_SECRET=S… pnpm deliver <base burn tx hash> [--network mainnet] [--dry-run]
+PASO_EVM_KEY=0x… pnpm mint <stellar exit tx hash> [--network mainnet] [--dry-run]
 scripts/deploy.sh <testnet|mainnet>
+
+# The scripted-wallet journey through a running app: bring USDC from Base, send some on, send some back.
+# On mainnet it moves real USDC from the key's wallet.
+PASO_E2E_NETWORK=<testnet|mainnet> PASO_E2E_BASE_URL=<site> PASO_E2E_OWNER_KEY=0x… pnpm --filter @paso/web e2e
 ```
+
+`pnpm deliver` and `pnpm mint` finish a transfer without the hosted relayer. `deliver` takes the hash of a burn on Base, asks Circle for the attestation and delivers the message on Stellar; the fee is paid by `PASO_SOURCE_SECRET`, the secret key of any funded Stellar account, and no owner key is involved. `mint` takes the hash of an exit on Stellar and submits the mint on Base; the gas is paid by `PASO_EVM_KEY`, any Base account with a little ETH, which does not have to be the recipient. Circle's contracts decide where the USDC goes in both cases. A message that was delivered or minted already is reported as it stands. `--dry-run` does every read and the simulation and sends nothing. On mainnet both print the simulated fee and send nothing unless `PASO_CONFIRM_MAINNET=1` is set.
 
 A run of `pnpm e2e` that stops half way says how to pick it up: `--resume-burn <base tx>` continues from a burn that exists, `--skip-fund` starts from the USDC the account already holds, and `--skip-transfer`, `--resume-exit <stellar tx>` and `--skip-exit` do the same for the later steps. On mainnet the script sends Stellar transactions with a bid above the minimum, and sends one again with a higher bid when no ledger took it.
 
@@ -342,29 +363,45 @@ apps/web            Next.js app: the pages, the relayer API (app/api, lib/server
 scripts             End-to-end run (e2e.ts), verification (verify.ts), deployment (deploy.sh)
 fixtures            vectors.json: signing vectors shared by the Rust and TypeScript tests; gen/ writes them
 deployments         testnet.json and mainnet.json: hub id, account wasm hash, Circle contract ids
-docs                ENCODING.md, SECURITY.md, AUDIT.md, VERIFY.md, CLAIMS.md
+verifiers           A separate Cargo workspace: an Ethereum-key verifier for OpenZeppelin smart accounts
+docs                ENCODING.md, SECURITY.md, AUDIT.md, VERIFY.md, CLAIMS.md, ENVIRONMENT.md
+.github             CI: tests, and the check that the build equals the deployed code
 ```
+
+## Also in this repository
+
+[`verifiers/`](verifiers/README.md) holds `paso-evm-verifier`, a signature verifier for OpenZeppelin's Stellar smart accounts (`stellar-accounts` 0.7.2). It lets an Ethereum address be one signer of a standard OpenZeppelin account, alone or next to other signers and policies. The signer signs EIP-712 typed data that names the account and carries the 32-byte payload hash.
+
+It is deployed on Stellar testnet at [`CBSBRBFV…MVV3L4ZX`](https://stellar.expert/explorer/testnet/contract/CBSBRBFVN6AYSRUPGDKRGPVIQHQDCXOOSE2AN7NY6WYF33JIMVV3L4ZX), wasm hash `c49e81a0b5e718eddddd9a1ccf505627e30e1a59586538d6e44201e7a96fb017`. On testnet: an account created with an Ethereum key as its signer [`907ffc6f…`](https://stellar.expert/explorer/testnet/tx/907ffc6fc877f440df194b3faf5069eb073eed46c9ff47d9bc44d36cb77372fc), a transfer authorised by that key [`c2e7aeba…`](https://stellar.expert/explorer/testnet/tx/c2e7aeba2ca6866cad76c1d31eb2303781ff6c9ca5b357aa51bc22b14bbb2f68), a second key added to the existing account [`5d12dab6…`](https://stellar.expert/explorer/testnet/tx/5d12dab6f0206fd46ae6b7ad32a983b55ceee57566edc5dc0a849da231cb44ce), and a transfer signed by both keys [`9073d3c2…`](https://stellar.expert/explorer/testnet/tx/9073d3c290251c10ffd2718a9bc9173fbd601e0b36c8900d75d5e44b3fde7012).
+
+Its scope is narrower than Paso's account:
+
+- **The wallet signs a hash, not the calls.** A verifier receives 32 bytes and nothing else, so the wallet shows the account and a hash. Paso's own account rebuilds the message from the calls; this verifier cannot.
+- **A signature is bound to the account id the signer was registered with**, not to the contract that calls the verifier. A signature made for one account does not verify for another account that lists the same address.
+- **Testnet only.** Not deployed on mainnet. Not tested with a wallet extension. Unaudited, like the rest of the repository.
+
+45 Rust tests and 14 JavaScript tests: [verifiers/README.md](verifiers/README.md) has the commands, the format and the full testnet run.
 
 ## Limits
 
 We reviewed our own contracts adversarially and published everything we found: [docs/AUDIT.md](docs/AUDIT.md). It has 13 findings, each with a test that reproduces it where a test can. It is not a third-party audit. The contracts on mainnet cannot be changed, so none of the findings can be patched.
 
-- **Only an address with a private key can spend.** Every Ethereum address has an account that can be paid. The account of an address with no private key (a Safe, a smart-contract wallet, any contract) can receive and never send, and USDC sent to it is lost. A smart-contract wallet that is not deployed yet cannot be detected in advance. Do not pay the account of an address unless its holder can sign with a plain key.
-- **Mainnet covers the contracts and one scripted run.** The hub and the account code are on Stellar mainnet, and one journey ran there with 1 USDC. The web app and the relayer are set up for testnet only.
+- **Only an address with a private key can spend.** Every Ethereum address has an account that can be paid. The account of an address with no private key (a Safe, a smart-contract wallet, any contract) can receive and never send, and USDC sent to it is lost. The SDK's `ownerKind` looks for contract code at an address on Ethereum, Base and Base Sepolia. The app uses it: it blocks a send to a contract unless the sender ticks an explicit override, and refuses a connected wallet that is a contract. Code that calls the SDK directly gets the check only if it calls `ownerKind`. A smart-contract wallet that is not deployed yet has no code anywhere and cannot be detected. Do not pay the account of an address unless its holder can sign with a plain key.
+- **Mainnet is small and young.** The hub and the account code are on Stellar mainnet. Two journeys ran there, with 1 USDC and 0.5 USDC: one from the scripts and one through the hosted app. The hosted app on mainnet is wallet-only, brings over at most 25 USDC at a time, and its relayer spends at most 2 XLM of fees a day.
 - **One source chain:** Base, and Base Sepolia on testnet. Other CCTP chains are untested, and Base is the only EVM chain configured in the SDK.
 - **No key rotation and no recovery.** The owner is set once in the constructor. Lose the Ethereum key and the account is lost.
 - **No upgrade and no administrator.** Neither contract has an admin function. A bug cannot be patched in place.
 - **Externally owned accounts only.** The account checks one 65-byte secp256k1 signature. ERC-1271 smart-contract wallets cannot sign for it.
-- **Wallet extensions are untested.** The signatures in the linked transactions were made by scripts, or by the web app's demo key in the browser, through viem's EIP-712 signer. No wallet extension such as MetaMask has been exercised live, so how a given wallet lays the message out on screen has not been checked. Neither has the app's ENS lookup.
+- **Wallet extensions are untested.** The signatures in the linked transactions were made by scripts, by the web app's demo key, or by a scripted wallet that answers the app through the standard wallet interface. All of them sign with viem. No wallet extension such as MetaMask has been exercised live, so how a given wallet lays the message out on screen has not been checked. Neither has the app's ENS lookup.
 - **Amounts and contracts are shown raw.** `5000000` is 0.5 USDC, and a contract is its `C…` address. The message carries no decimals, token symbols or names.
 - **Nested arguments are bound by hash, not shown as text.** Vectors, maps, structs, 256-bit integers, timepoints, durations and muxed addresses appear as `xdr:<sha256>`. A transfer to a muxed `M…` address therefore shows its recipient as a hash.
 - **Text does not carry types.** The number `5` and the string `"5"` read the same in the wallet. A string argument is shown as it is, line breaks included, and the list of calls does not show which call is nested in which. The payload still binds the exact values.
-- **The prompt does not name the network.** A mainnet request and a testnet request differ in a 32-byte salt and in the addresses, and in nothing a reader would recognise as "mainnet". The same key controls an owner's account on both.
-- **The signature's expiry is not shown as text, and a signature cannot be revoked.** The expiry is inside `payload`, and the contracts put no upper bound on it. The SDK's default is at most 120 ledgers, about ten minutes. Until its expiry a signature can be submitted by anyone who holds it, also after its transaction failed.
+- **The prompt does not name the network.** A mainnet request and a testnet request differ in a 32-byte salt and in the addresses, and in nothing a reader would recognise as "mainnet". The same key controls an owner's account on both. The app names the network in words at review, explains the salt, and refuses a prepared call whose salt is not the selected network's; the wallet prompt itself is unchanged.
+- **The signature's expiry is not shown as text, and a signature cannot be revoked.** The expiry is inside `payload`, and the contracts put no upper bound on it. The SDK sets 24 ledgers, about two minutes, and refuses more than 120; the hosted relayer refuses a signature valid for more than 120 ledgers; the app shows a countdown at review. Until its expiry a signature can be submitted by anyone who holds it, also after its transaction failed.
 - **One signature, one authorisation tree.** A call that needs two separate authorisations from the account is refused by the SDK.
 - **USDC crosses with 6 decimals.** Stellar USDC has 7. `exit` rejects an amount or fee cap with a non-zero seventh decimal.
 - **Addresses depend on the hub.** A different hub contract gives every owner a different account address. An owner's mainnet and testnet addresses differ.
-- **The relayer can decline.** It cannot move funds or change a signed call, and anyone can submit instead. Its limits are kept in memory and reset when the server restarts.
+- **The relayer can decline.** It cannot move funds or change a signed call, and anyone can submit instead. Its limits are kept in memory and reset when the server restarts. On mainnet they are tight: 0.3 XLM a transaction, 2 XLM a day, nothing below a 2 XLM balance.
 - **A transaction that bids the minimum fee can be left out of every ledger.** It happened to the first mainnet delivery. The scripts resend with a higher bid.
 - **A signature whose `r` is not a valid curve point aborts in the host** instead of returning a typed error. The transaction still fails.
 - **Nothing keeps the contracts alive.** The contracts never extend a lifetime. The account code shared by every account, and the hub, are archived after ledger 66,981,816, about 9 February 2027, unless someone pays to extend them. Anyone can, for a few XLM; restoring later costs more, and the hosted relayer does not do it. No funds are lost by archival. [docs/SECURITY.md](docs/SECURITY.md#lifetime-of-the-contracts) has the dates, the costs and the commands.

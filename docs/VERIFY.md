@@ -1,6 +1,6 @@
 # Check every claim in five minutes
 
-Seven steps. Steps 1 to 5 use testnet, step 6 is mainnet. Steps 1 and 5 need a browser. Steps 2, 4 and 6 need Node.js 22.12 or newer and pnpm. Step 3 needs Rust and the Stellar CLI. Step 7 is optional and needs a funded testnet account.
+Seven steps. Steps 1 to 5 use testnet, step 6 is mainnet, with the scripted run and the run through the hosted app. Steps 1 and 5 need a browser. Steps 2, 4 and 6 need Node.js 22.12 or newer and pnpm. Step 3 needs Rust and the Stellar CLI. Step 7 is optional and needs a funded testnet account.
 
 ```sh
 git clone https://github.com/RaYYeR220/paso
@@ -145,7 +145,7 @@ pnpm verify 6cae28f1ea0f3d8020cfda61f75cfb6b8b13914fe859569d20c9e935a2e79a2f
 
 ## 3. Run the contract tests
 
-The claim: 29 tests for the account contract and 15 for the hub pass.
+The claim: 50 tests for the account contract and 28 for the hub pass. 21 and 13 of them reproduce the findings of the project's own review, [AUDIT.md](AUDIT.md); a test there passes when the limit it demonstrates is present, so a pass does not mean "safe".
 
 ```sh
 pnpm test:contracts
@@ -154,8 +154,8 @@ pnpm test:contracts
 This runs `stellar contract build` and then `cargo test`. Expected lines:
 
 ```
-test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 Tests worth reading in [`contracts/account/src/test.rs`](../contracts/account/src/test.rs):
@@ -366,7 +366,34 @@ curl -s "https://iris-api.circle.com/v2/messages/27?transactionHash=fccc2318b832
 
 Both print `"status":"complete"`.
 
-What mainnet does not cover: the web app and the relayer. This run was made by `scripts/e2e.ts`.
+This run was made by `scripts/e2e.ts`, without the web app and without its relayer.
+
+### Through the hosted app
+
+On 2026-10-13 the same path ran through https://paso-stellar.vercel.app switched to mainnet. It was driven by a scripted wallet: a Playwright test opens the site in a browser and puts a wallet at `window.ethereum` that speaks the standard wallet interface (EIP-1193) and signs with a key the test holds. No browser extension was involved. The owner and the account are the same as above.
+
+| Time (UTC) | Step | Link |
+|---|---|---|
+| 08:37:05 | USDC approval on Base, sent by the wallet | <https://basescan.org/tx/0xc51cb1bc79348b5f23f368ef1030afd08cf07c926eec578335f37b9f83d79a52> |
+| 08:37:07 | 0.5 USDC burned on Base, sent by the wallet | <https://basescan.org/tx/0xd235da188139aa7ab9539f2090010e542c5966b2f720703fe2459e7550d5f6db> |
+| 08:37:17 | Delivered on Stellar by the hosted relayer: 0.39987 → 0.899805 USDC | <https://stellar.expert/explorer/public/tx/d2cf5d6274c026fdfc01f36284f11e576d76d0ccd0c0f213c06bfffa351d2f0f> |
+| 08:37:27 | 0.1 USDC to the account of `0x5BED629d44E4D76de7707b9Fd9d0Fe95B160B152`, relayed | <https://stellar.expert/explorer/public/tx/622c2279221b2a4a6bce929cc0bdda595a07600e5dc0cf357888770f879e35cc> |
+| 08:37:37 | 0.2 USDC back to Base: `hub.exit` and its nested `transfer`, relayed | <https://stellar.expert/explorer/public/tx/517fab234609285ebb0f8afe9b138724b790b61f94207a663df2f127ba4a7e38> |
+| 08:37:53 | Minted on Base; the wallet submitted the mint | <https://basescan.org/tx/0x60865a32075866fa48437e9643976a59e6370f409b2f6bf3c04bcc0cf9d3be31> |
+
+Things to check:
+
+- The three Stellar transactions have the source account `GAS65I36…SQBM`, the hosted relayer's mainnet account. The owner's account paid no fee.
+- The three Base transactions were sent by `0x20806157d9607050204bbbCd37CE71498B35D46c`, the owner's own wallet, mint included. On mainnet the server does not pay for mints.
+- The transfer passes step 2 on mainnet:
+
+```sh
+pnpm verify 622c2279221b2a4a6bce929cc0bdda595a07600e5dc0cf357888770f879e35cc --network mainnet
+```
+
+The exit code is 0. `pnpm verify 517fab234609285ebb0f8afe9b138724b790b61f94207a663df2f127ba4a7e38 --network mainnet` prints the two calls of the exit.
+
+To run the same journey yourself, against the hosted site or your own server: `PASO_E2E_NETWORK=<testnet|mainnet> PASO_E2E_BASE_URL=<site> PASO_E2E_OWNER_KEY=0x… pnpm --filter @paso/web e2e`. It needs a key with USDC and ETH on the chosen Base. On mainnet it moves real USDC.
 
 ## 7. Optional: make your own refusal
 
@@ -404,6 +431,7 @@ Your key pays the fees. No relayer is involved. This runs on testnet.
 
 - That the code is free of bugs. It is unaudited.
 - That a wallet extension displays the message well. The signatures above were made by scripts.
-- That the web app or the relayer work on mainnet. They are set up for testnet only.
+- That a browser wallet extension works with the app. The app's wallet path has been exercised by a scripted wallet only.
+- That the hosted app and relayer serve mainnet beyond small amounts. On mainnet the app brings over at most 25 USDC at a time and the relayer spends at most 2 XLM of fees a day.
 
 [CLAIMS.md](CLAIMS.md) has the full list of what is and is not claimed.

@@ -84,6 +84,14 @@ What was found is of three kinds:
 
 Severity weighs how bad the outcome is against how likely it is.
 
+### What has changed since
+
+The contracts have not changed and cannot. After the review, the SDK, the hosted app and its relayer were changed to blunt F-01, F-02, F-03, F-04, F-07 and F-13 on their side. Each finding below says what they now do under "What to do today". Three things hold for all of it:
+
+- The on-chain format is unchanged. A wallet prompt carries exactly what it carried before.
+- These are checks in this project's off-chain code. Anyone who builds requests without the SDK, or uses another front end or fee payer, gets none of them.
+- The SDK, the app and the relayer were outside the scope of this review, and these changes were not reviewed in the same way.
+
 ## Findings
 
 | Id | Finding | Severity | Evidence |
@@ -153,8 +161,9 @@ The test deploys the account of `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`, th
 **What to do today.**
 
 - Do not send to the Stellar account of an Ethereum address unless you know it is a plain key-controlled wallet whose holder can sign EIP-712 typed data.
-- An integrator has to check the recipient before showing a deposit address: ask the chains it serves for the code at the address, refuse or warn loudly when there is code, treat an EIP-7702 delegation as a key, and say in the warning that an empty answer is not proof of a key. The SDK exports `ownerKind` for this ([`packages/sdk/src/owner.ts`](../packages/sdk/src/owner.ts)); it asks Ethereum, Base and Base Sepolia and has the same limit.
-- For a wallet that is connected, ask for one harmless EIP-712 signature and check that it is 65 bytes and recovers to the address, before the account is offered as a place to receive funds. That proves the address can sign for its account.
+- **In the SDK.** `ownerKind(address)` ([`packages/sdk/src/owner.ts`](../packages/sdk/src/owner.ts)) asks Ethereum, Base and Base Sepolia for the code at an address. Code on any of them makes the answer `contract`; an EIP-7702 delegation counts as a key; a chain that does not answer makes it `unknown`. `prepare` does not call it: code that uses the SDK has to call it before it shows a deposit address or sends.
+- **In the app.** Before a transfer to the account of an Ethereum address, the app runs that check. For a contract it blocks the send with "This address is a smart contract. It has no key, so its Stellar account could never move what you send. Nothing was sent." The send goes ahead only if the sender ticks "Send anyway. I understand this USDC can never be moved again." When the check cannot be completed, or the address has never used its Stellar account, the app says so and asks the sender to confirm "I know this address is a regular wallet." A connected wallet that is a contract is refused. Before a wallet is offered a way to bring USDC over, it is asked for one signature that moves nothing, and the signature has to be 65 bytes and recover to the wallet's address. The lookup page shows the same check for any address.
+- **What remains.** A smart-contract wallet that has not been deployed yet has no code on any chain. It looks exactly like an unused key and cannot be detected by any of this. A sender can override the block. Code that does not go through the app, or calls the SDK without `ownerKind`, gets no check.
 
 ### F-02. A signature's lifetime is hidden and unbounded, a failed transaction does not use it up, and cancelling it does not last
 
@@ -186,9 +195,10 @@ cargo test -p paso-hub f02_
 
 - Treat every Paso signature as live until its expiry ledger, even if its transaction failed.
 - If you signed something on a site you no longer trust, move the funds out of the account. There is no other revocation.
-- An integrator has to keep validity short and refuse long ones, show the expiry next to the wallet prompt, and after a failure resubmit the entry already signed instead of asking for a new signature while the old one is live. If a new one is needed before the old one expires, give it the old nonce so that only one of the two can land.
-- A fee payer that accepts signed entries from others should refuse an expiry further ahead than it is willing to carry.
-- To cancel, sign a no-effect call with the same nonce and an expiry at least as late as the original's.
+- **In the SDK.** `prepare` sets the expiry 24 ledgers ahead, about two minutes (`DEFAULT_VALIDITY_LEDGERS`), and refuses a `validForLedgers` above 120, about ten minutes (`MAX_VALIDITY_LEDGERS`), in [`packages/sdk/src/actions.ts`](../packages/sdk/src/actions.ts).
+- **In the relayer.** The hosted relayer refuses a signed entry whose expiry is more than 120 ledgers ahead of the latest ledger.
+- **In the app.** The review shows how many seconds the signature will be good for. After a call that did not go through, the app says until when the signature stays usable and that anyone who holds it can still submit it, When the relayer's answer is lost or says nothing about the call, the app sends the same signed call again; it does not ask for a new signature.
+- **What remains.** The contracts still accept any expiry the host accepts, and the wallet prompt still does not show it. A site that does not use the SDK can ask for a signature that lasts months, and a fee payer other than the hosted relayer can submit it. The SDK has no cancel helper; to cancel, sign a no-effect call with the same nonce and an expiry at least as late as the original's.
 
 ### F-03. The signing prompt does not name the network
 
@@ -215,7 +225,9 @@ The same absence has two quieter consequences. Any site can ask for a signature 
 
 - Do not sign Paso prompts on a site you do not trust with a key whose mainnet account holds funds. Try a testnet demo with a key that holds nothing on mainnet.
 - The `account` in a mainnet prompt is your mainnet address, and the salt of a mainnet prompt starts `0x7ac33997`. Learn both.
-- An integrator has to say the network in words next to the prompt, build the typed data itself for the network the user chose, and refuse to forward for signing any request whose salt is not that network's. Typed data handed in from outside is never signed as given.
+- **In the SDK.** `prepare` builds the typed data itself for the network it is given. `saltNetwork(salt)` names the network a salt belongs to.
+- **In the app.** The review shows the salt next to its meaning, "Stellar mainnet" or "Stellar testnet", and says the signature is for that network in words. A prepared call whose salt is not the selected network's is refused before it reaches the review: "This request was prepared for testnet, and the page is on mainnet. Nothing was signed." Switching the app to mainnet asks once per browser for a confirmation that real funds are involved.
+- **What remains.** The wallet prompt itself is unchanged: it still names no network, and a hostile copy of the app can leave all of this out.
 
 ### F-04. The recipient of a transfer can be displayed as a hash
 
@@ -242,7 +254,8 @@ cargo test -p paso-account f04_ -- --nocapture
 **What to do today.**
 
 - Do not sign a `transfer` whose second argument starts with `xdr:` unless you produced that address yourself.
-- An integrator has to refuse a call that contains an address other than an account or a contract, or decode it and show the `M…` form and its base `G…` next to the prompt.
+- **In the SDK and the app.** `prepare` refuses a transfer to a muxed `M…` address and says to give the `G…` address instead. The app refuses `M…` in its recipient field. For a generic call, the SDK's `describeCalls` marks a muxed address as a value bound by hash, and the app asks the owner to confirm the marked lines before signing.
+- **What remains.** A front end that does not use the SDK can still ask for such a transfer, and the wallet shows the recipient as a hash.
 
 ### F-05. Nothing keeps the contracts alive
 
@@ -279,7 +292,7 @@ Restoring is permissionless: the transaction that touches an archived entry decl
 
 At that rate keeping the two code entries alive costs about 54 XLM a year. Restoring after archival costs about what creating did; the uploads were 9.3681676 XLM and 5.9556408 XLM. That restore figure is an estimate from the network's rent formula, not a measurement.
 
-Owners hold no XLM by design. The hosted relayer refuses a call whose simulation says entries have to be restored, and it refuses any transaction above its cap on resource fees, which is at most 0.5 XLM by default. After expiry the next user to act needs some other funded account to pay.
+Owners hold no XLM by design. The hosted relayer refuses a call whose simulation says entries have to be restored, and it refuses any transaction above its cap on resource fees, by default 0.3 XLM on mainnet and 0.5 XLM on testnet. After expiry the next user to act needs some other funded account to pay.
 
 No path was found by which archival loses funds (N-10).
 
@@ -431,7 +444,9 @@ How a given wallet draws these strings was not observed.
 **What to do today.**
 
 - Read every call in the list. Refuse prompts that contain `xdr:` values you cannot account for.
-- An integrator has to refuse a `String` argument that contains control or formatting characters, show decimals and token symbols next to the prompt for tokens it knows, and warn on any `xdr:` argument and on more than a handful of calls.
+- **In the SDK.** `describeCalls` gives every argument of a call its Soroban type and flags what can mislead in a wallet: control characters, line breaks, direction overrides, invisible characters, text shaped like another line of the message, text that looks like an address or a hash, and values bound by hash.
+- **In the app.** For a generic call, the review shows each argument with its type and marks the flagged lines, and signing waits until the owner ticks "I have read the marked lines." The review names the contracts it knows, such as USDC and the Paso hub. Amounts in the signed text stay raw integers.
+- **What remains.** The flags are warnings, not refusals: a flagged `String` can still be signed. The wallet prompt still shows untyped text and a flat list of calls. A front end that does not use the SDK shows none of this.
 
 ### F-08. A call with a `Bytes` argument above about 25 kB can never be authorised
 
@@ -600,7 +615,7 @@ cargo test -p paso-account f13_
 
 The test signs over the exact bytes and is accepted, then signs over the text with the mark dropped and is refused.
 
-**What to do today.** A signer has to decode `String` bytes without dropping anything: in JavaScript, `new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })`.
+**What to do today.** A signer has to decode `String` bytes without dropping anything: in JavaScript, `new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })`. The SDK's renderer now does exactly that ([`packages/sdk/src/render.ts`](../packages/sdk/src/render.ts)), and its tests check strings that start with, contain or consist of byte-order marks. A signer written without the SDK has to do the same.
 
 ## Hypotheses tested and rejected
 
