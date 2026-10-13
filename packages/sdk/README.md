@@ -14,7 +14,9 @@ The wallet shows the real calls: contract, function and every argument as text. 
 npm install paso-sdk viem
 ```
 
-ESM only, Node 22.12 or later, or any modern bundler. The deployed contract ids for Stellar testnet and mainnet are built in.
+Published on npm as [`paso-sdk`](https://www.npmjs.com/package/paso-sdk). ESM only, Node 22.12 or later, or any modern bundler. The deployed contract ids for Stellar testnet and mainnet are built in.
+
+To work on the SDK itself, use it from the repository, <https://github.com/RaYYeR220/paso>: it is the pnpm workspace package in `packages/sdk`. Run `pnpm install` and then `pnpm build:sdk` at the root; the web app and the scripts there use that copy.
 
 ## Usage
 
@@ -41,6 +43,8 @@ const prepared = await prepare(
 const signed = await sign(prepared, walletClient); // the wallet shows prepared.calls
 const { hash } = await relay(signed, "https://example.org/api/relay");
 ```
+
+Base is the default chain. To bring USDC from another one, connect the wallet to it and name it: `fundFromEvm({ ..., chain: "arc" })`, then `waitForAttestation("arc", burnTxHash, "testnet")`. The names are `base`, `ethereum`, `arbitrum`, `optimism` and `arc`; [Networks](#networks) lists them. An `exit` names its chain in `destinationChain`.
 
 `sign` accepts a viem account or a wallet client that has its account set. For a wallet client without one, wrap it: `{ signTypedData: (data) => walletClient.signTypedData({ ...data, account }) }`.
 
@@ -122,7 +126,7 @@ The first seven apply to `String` and `Symbol` arguments and to function names, 
 
 `findBurnSource(txHash, network)` tells which chain a burn was made on from its hash alone: it asks Iris under the domain of every chain listed, all at once, and answers `found` with the chain and what Iris holds, `not_found`, `unreachable`, or `ambiguous`.
 
-`deliverOperation({ message, attestation, caller }, network)` picks the right delivery call from the message itself, and `deliverWith({ message, attestation }, keypair, network)` submits it from any funded Stellar account. Delivery is permissionless: Circle's contracts check the attestation and decide where the USDC goes. From a checkout of the repository, `pnpm deliver <burn tx hash> --network <testnet|mainnet>` does the same, on whichever chain the burn was made with `PASO_SOURCE_SECRET` set to any funded Stellar account; it needs no key of the account's owner.
+`deliverOperation({ message, attestation, caller }, network)` picks the right delivery call from the message itself, and `deliverWith({ message, attestation }, keypair, network)` submits it from any funded Stellar account. Delivery is permissionless: Circle's contracts check the attestation and decide where the USDC goes. From a checkout of the repository, `pnpm deliver <burn tx hash> [--chain <name>] --network <testnet|mainnet>` does the same for a burn on any chain listed, with `PASO_SOURCE_SECRET` set to any funded Stellar account; without `--chain` it finds the chain from the hash. It needs no key of the account's owner.
 
 The way back ends on the EVM chain: `receiveMessageOnEvm({ walletClient, publicClient, message, attestation, network, chain })` hands the attested exit to Circle's MessageTransmitter there, and `isReceivedOnEvm(publicClient, message, network, chain)` says whether that has happened. `chain` defaults to Base; a message for another chain than the one named is refused before anything is sent. `pnpm mint <stellar exit tx hash>` mints on the chain the message names.
 

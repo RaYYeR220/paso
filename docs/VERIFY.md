@@ -1,6 +1,6 @@
 # Check every claim in five minutes
 
-Seven steps. Steps 1 to 5 use testnet, step 6 is mainnet, with the scripted run and the run through the hosted app. Steps 1 and 5 need a browser. Steps 2, 4 and 6 need Node.js 22.12 or newer and pnpm. Step 3 needs Rust and the Stellar CLI. Step 7 is optional and needs a funded testnet account.
+Eight steps. Steps 1 to 5 use testnet, step 6 is mainnet, with the scripted run and the run through the hosted app. Step 8 checks the five EVM chains on both networks and the two runs from Arc Testnet. Steps 1 and 5 need a browser. Steps 2, 4, 6 and 8 need Node.js 22.12 or newer and pnpm. Step 3 needs Rust and the Stellar CLI. Step 7 is optional and needs a funded testnet account.
 
 ```sh
 git clone https://github.com/RaYYeR220/paso
@@ -8,7 +8,7 @@ cd paso
 pnpm install
 ```
 
-`pnpm verify` and the Stellar CLI read a public Soroban RPC, which keeps about a week of transactions. The transactions below are from 2026-10-12. Once they have aged out, the explorer links still work and step 7 produces fresh ones on testnet.
+`pnpm verify` and the Stellar CLI read a public Soroban RPC, which keeps about a week of transactions. The transactions below are from 2026-10-12 and 2026-10-13. Once they have aged out, the explorer links still work and step 7 produces fresh ones on testnet.
 
 ## 1. Open the refused transaction and find the error
 
@@ -393,7 +393,7 @@ pnpm verify 622c2279221b2a4a6bce929cc0bdda595a07600e5dc0cf357888770f879e35cc --n
 
 The exit code is 0. `pnpm verify 517fab234609285ebb0f8afe9b138724b790b61f94207a663df2f127ba4a7e38 --network mainnet` prints the two calls of the exit.
 
-To run the same journey yourself, against the hosted site or your own server: `PASO_E2E_NETWORK=<testnet|mainnet> PASO_E2E_BASE_URL=<site> PASO_E2E_OWNER_KEY=0x… pnpm --filter @paso/web e2e`. It needs a key with USDC and ETH on the chosen Base. On mainnet it moves real USDC.
+To run the same journey yourself, against the hosted site or your own server: `PASO_E2E_NETWORK=<testnet|mainnet> PASO_E2E_BASE_URL=<site> PASO_E2E_OWNER_KEY=0x… pnpm --filter @paso/web e2e`. `PASO_E2E_CHAIN` names the EVM chain, `base` when unset. The key needs USDC on that chain and gas: ETH, or USDC on Arc. On mainnet it moves real USDC.
 
 ## 7. Optional: make your own refusal
 
@@ -427,11 +427,87 @@ Done.
 
 Your key pays the fees. No relayer is involved. This runs on testnet.
 
+## 8. The five EVM chains, and the runs from Arc
+
+The claim: USDC comes from, and goes back to, Base, Ethereum, Arbitrum, OP Mainnet and Arc, on testnet and on mainnet, and the route through Arc has run on testnet both ways.
+
+```sh
+pnpm routes --network testnet
+pnpm routes --network mainnet
+```
+
+Each reads Circle's contracts on every chain and on Stellar, with no key, and sends nothing. On the EVM chain: the chain id, the code of Circle's contracts and of USDC, the transmitter's `localDomain()`, the messenger's link to the transmitter and to Stellar's domain 27, the USDC that pairs with Stellar's, and its decimals. On Stellar: Circle's TokenMessengerMinter names that chain's messenger and pairs its USDC with Stellar's. Expected on mainnet, in part:
+
+```
+Routes between Stellar mainnet (CCTP domain 27) and 5 EVM chains
+
+  ok    Base               chain 8453, domain 6, block …
+  ok    Ethereum           chain 1, domain 0, block …
+  ok    Arbitrum           chain 42161, domain 3, block …
+  ok    OP Mainnet         chain 10, domain 2, block …
+  ok    Arc                chain 5042, domain 26, block …
+
+Every route checks out.
+```
+
+The exit code is 0. Under each chain the output lists the USDC, messenger and transmitter addresses it checked and Circle's current fee each way. `--chain <base|ethereum|arbitrum|optimism|arc>` checks one chain. `--json` prints what was read in the shape of [`packages/sdk/test/fixtures/cctp-routes.json`](../packages/sdk/test/fixtures/cctp-routes.json), which holds what the chains answered when each was listed.
+
+A route that checks out has not carried a transfer. Base has, on both networks (steps 5 and 6). Arc has, on testnet, in the two runs below. Ethereum, Arbitrum and OP Mainnet have not on either network, and Arc has not on mainnet. On testnet, `pnpm e2e --chain <name> --dry-run --owner <0x…> --source <G…>` reads and simulates a run on one of them and sends nothing.
+
+### Arc Testnet, from the scripts
+
+2026-10-13, for the example owner `0x7880DA9a52Af491f76421869d4e28DC0A4D1767C` and its account `CCI3…2VME`. The burn and the mint on Arc were sent by `0xEe67130Fa530c04b88D6Fd99fcc7D1D1494841f8`, a separate payer. Made by `scripts/e2e.ts` with `--chain arc`.
+
+| Time (UTC) | Step | Link |
+|---|---|---|
+| 11:33:02 | 0.5 USDC burned on Arc Testnet: a standard transfer, fee cap 0, gas paid in USDC | <https://explorer.testnet.arc.io/tx/0x3bfe9927a2c72308e02ec9d63bc1a7dbe18daac501748946df09ca9d6ddf668d> |
+| 11:33:12 | Delivered on Stellar: 0.5 USDC to the account | <https://stellar.expert/explorer/testnet/tx/040af2cbc1d2fbee714c1f2bbd32f785a07e15b947d189d0b91a875c22db4e89> |
+| 11:33:17 | 0.01 USDC to `CAZ7QG72L44T5AVJHGHAT2KNIEXYX77LQLSAGWYV3S5XV3OVDVME6DVT` | <https://stellar.expert/explorer/testnet/tx/bcd0d80c73074250cbc212d5a55100d22b40f03b9ddfc4092b5bc8f9ab0a20dd> |
+| 11:33:22 | 0.2 USDC burned on Stellar by `hub.exit`, for domain 26 | <https://stellar.expert/explorer/testnet/tx/a55ce5aacf46fab6c04c7dc8150474fac6aa3c0be8d153ab97b271abf9e9d2ee> |
+| 11:33:30 | 0.2 USDC minted on Arc Testnet to `0x7880DA9a52Af491f76421869d4e28DC0A4D1767C` | <https://explorer.testnet.arc.io/tx/0xfafb8ddec2bb4094c296a1e658014ffe4a6dea44a320633bc394eb9c861ab2a9> |
+| 11:33:42 | `approve` for `1`: accepted | <https://stellar.expert/explorer/testnet/tx/af1ba8285e632b8aac0c3327ae369ebec0288b5c0c47dcb38d0b5d3377afaa02> |
+| 11:33:47 | The same signature submitted with `10000000000000`: refused | <https://stellar.expert/explorer/testnet/tx/f3eca45441f58d2ba689ea72474465b36e5fb7c234795ca20fc589f3ccbb8917> |
+
+Things to check:
+
+- `pnpm verify a55ce5aacf46fab6c04c7dc8150474fac6aa3c0be8d153ab97b271abf9e9d2ee` exits 0. It prints two calls, `hub.exit` and the nested USDC `transfer`, and `args[2]   26`: the CCTP domain of Arc.
+- `pnpm verify f3eca45441f58d2ba689ea72474465b36e5fb7c234795ca20fc589f3ccbb8917` exits 1: the signature recovers to an address that is not the owner.
+- The delivery credits the whole 0.5 USDC. Arc has no fast transfer, and Circle charges nothing for a standard one.
+- 28 seconds from the burn on Arc to the mint on Arc.
+
+Circle's record of the burn and of the exit:
+
+```sh
+curl -s "https://iris-api-sandbox.circle.com/v2/messages/26?transactionHash=0x3bfe9927a2c72308e02ec9d63bc1a7dbe18daac501748946df09ca9d6ddf668d" | grep -o '"status":"[a-z_]*"'
+curl -s "https://iris-api-sandbox.circle.com/v2/messages/27?transactionHash=a55ce5aacf46fab6c04c7dc8150474fac6aa3c0be8d153ab97b271abf9e9d2ee" | grep -o '"status":"[a-z_]*"'
+```
+
+Both print `"status":"complete"`. `26` is the CCTP domain of Arc.
+
+### Arc Testnet, through the app
+
+2026-10-13, the scripted wallet of step 6 on testnet, with `PASO_E2E_CHAIN=arc`. The wallet `0xEe67130Fa530c04b88D6Fd99fcc7D1D1494841f8` is the owner here; its account is `CCJ7ZR4LSJYQUIQOHHBIOONVMVNWBAYG5W3L3NU2DJJP3KFUUKRPFKKD`.
+
+| Time (UTC) | Step | Link |
+|---|---|---|
+| 12:23:35 | 0.5 USDC burned on Arc Testnet, sent by the wallet | <https://explorer.testnet.arc.io/tx/0x87466509c2c5497d00cd1153e2533ff43ff1d7880061b61f591c051b74207dcf> |
+| 12:23:42 | Delivered on Stellar by the relayer: 0.5 USDC to the account | <https://stellar.expert/explorer/testnet/tx/9a9d4aa3e4d412082f1289546bbc0062e45c06c5fbce2a1b1a8cff51fb7996ec> |
+| 12:23:47 | 0.1 USDC to `CAFDVDSBZ2LZIFN45WRAL3JGCONZ4SCUTXFYUEY6E3R6ABJJ7IEKJHWZ`, relayed | <https://stellar.expert/explorer/testnet/tx/7b8c94116f22a8d3c482f7d3bd37609b6be13bef825e3b09bc7b31faf5ab3f83> |
+| 12:23:52 | 0.2 USDC back to Arc: `hub.exit` and its nested `transfer`, relayed | <https://stellar.expert/explorer/testnet/tx/80d3f6d7a756ed3207c081853f1d673de060d4d3c722b17b108873fd2458dff3> |
+| 12:24:03 | 0.2 USDC minted on Arc Testnet to the wallet; the wallet submitted the mint | <https://explorer.testnet.arc.io/tx/0xcd1abc65e901b4e93399c3286c9d43a330ff6cd0f12bcbcc9aa06f0c208b0241> |
+
+Things to check:
+
+- `pnpm verify 80d3f6d7a756ed3207c081853f1d673de060d4d3c722b17b108873fd2458dff3` exits 0, with the owner `0xEe67130Fa530c04b88D6Fd99fcc7D1D1494841f8`.
+- The mint on Arc was sent by the wallet, which paid its gas in USDC. The relayer pays for mints on Base only.
+- 28 seconds from the burn on Arc to the mint on Arc.
+
 ## What these steps do not show
 
-- That the code is free of bugs. It is unaudited.
+- That the code is free of bugs. It is unaudited: there has been no third-party audit, and the review in [AUDIT.md](AUDIT.md) is the project's own.
 - That a wallet extension displays the message well. The signatures above were made by scripts.
 - That a browser wallet extension works with the app. The app's wallet path has been exercised by a scripted wallet only.
+- That a transfer works from or to Ethereum, Arbitrum or OP Mainnet, on either network, or from or to Arc on mainnet. Their routes are read from the chains in step 8; no transfer has run on them.
 - That the hosted app and relayer serve mainnet beyond small amounts. On mainnet the app brings over at most 25 USDC at a time and the relayer spends at most 2 XLM of fees a day.
 
 [CLAIMS.md](CLAIMS.md) has the full list of what is and is not claimed.

@@ -7,7 +7,7 @@ One server can serve testnet and mainnet at the same time, from the same routes.
 - Testnet is served whenever `RELAYER_SECRET` is set.
 - Mainnet is served only when `PASO_ALLOW_MAINNET=true` and `RELAYER_SECRET_MAINNET` are both set. Mainnet reads only variables whose names end in `_MAINNET`: nothing set up for testnet carries over to real funds. Its relayer has to be a Stellar account of its own; the testnet relayer's secret is refused. Without both variables, requests for mainnet are answered `503 { error: "unavailable", reason: "not_serving" }`.
 
-Amounts on Stellar are in stroops, ten million to the XLM. USDC on Base is in 6-decimal units. ETH is in wei.
+Amounts on Stellar are in stroops, ten million to the XLM. USDC on the EVM chains is in 6-decimal units. ETH is in wei.
 
 ## The network and its accounts
 
@@ -23,6 +23,8 @@ Amounts on Stellar are in stroops, ten million to the XLM. USDC on Base is in 6-
 | `STELLAR_RPC_URL_MAINNET` | mainnet | Soroban RPC endpoint. | the network's public endpoint |
 | `BASE_RPC_URL_MAINNET` | mainnet | RPC endpoint for Base. | the chain's public endpoint |
 
+The server reads Ethereum, Arbitrum, OP Mainnet and Arc, and their test networks, through the public endpoints the SDK lists for them. It has no variable for those.
+
 ## Limits on the relayer
 
 | Variable | What it bounds | Testnet default | Mainnet default |
@@ -33,13 +35,13 @@ Amounts on Stellar are in stroops, ten million to the XLM. USDC on Base is in 6-
 | `RELAYER_INCLUSION_FEE` | What a transaction bids to be included in a ledger, in stroops, on top of its resource fee. Doubled each time a transaction that no ledger took is sent again; at most three are sent | `1000` | `100000` (0.01 XLM) |
 | `RELAYS_PER_CALLER_PER_HOUR`, `RELAYS_PER_HOUR` | Relayed calls paid for in an hour, from one caller and from everyone | `120`, `1200` | `8`, `40` |
 | `DEPLOYS_PER_CALLER_PER_HOUR`, `DEPLOYS_PER_HOUR` | Account deployments paid for in an hour | `60`, `600` | `3`, `12` |
-| `DELIVERIES_PER_CALLER_PER_HOUR`, `DELIVERIES_PER_HOUR` | Deliveries from Base paid for in an hour | `60`, `600` | `6`, `20` |
+| `DELIVERIES_PER_CALLER_PER_HOUR`, `DELIVERIES_PER_HOUR` | Deliveries from an EVM chain paid for in an hour | `60`, `600` | `6`, `20` |
 
-The mainnet variable has the same name with `_MAINNET` at the end, for example `RELAYER_MAX_RESOURCE_FEE_MAINNET`. A delivery from Base costs about 0.07 XLM and is the largest item. The limits are kept in memory by each server instance and start over when it restarts.
+The mainnet variable has the same name with `_MAINNET` at the end, for example `RELAYER_MAX_RESOURCE_FEE_MAINNET`. A delivery costs about 0.07 XLM and is the largest item. The limits are kept in memory by each server instance and start over when it restarts.
 
 ## Mints on Base
 
-When a transfer back to Base has been attested, someone has to submit the mint on Base and pay its gas. Where the server does not pay, it hands the attested message back and the owner's wallet submits the mint. Anyone else can submit it too.
+When a transfer back to an EVM chain has been attested, someone has to submit the mint on that chain and pay its gas. The server pays only on Base, with the settings below. A transfer back to Ethereum, Arbitrum, OP Mainnet or Arc is checked in the same way and handed back, on both networks. Where the server does not pay, it hands the attested message back and the owner's wallet submits the mint. Anyone else can submit it too.
 
 | Variable | Purpose | Default |
 |---|---|---|
@@ -68,8 +70,10 @@ The faucet burns 1 test USDC on Base Sepolia for an owner's account. It exists o
 
 | Variable | Used by | Purpose |
 |---|---|---|
-| `PASO_E2E_OWNER_KEY` | tests, scripts | Ethereum private key (`0x…`) of an owner whose account is deployed on testnet. The scripted-wallet journey (`pnpm --filter @paso/web e2e`) signs and pays on Base with it. |
+| `PASO_E2E_OWNER_KEY` | tests, scripts | Ethereum private key (`0x…`) of an owner whose account is deployed on testnet. The scripted-wallet journey (`pnpm --filter @paso/web e2e`) signs with it and pays with it on the EVM chain of the run. |
 | `PASO_E2E_SOURCE_SECRET` | tests, scripts | Secret key (`S…`) of any funded Stellar testnet account. It may be the relayer's. |
-| `PASO_E2E_PAYER_KEY` | scripts, optional | Ethereum private key (`0x…`) that pays the burn on Base Sepolia. Defaults to `DEMO_PAYER_PRIVATE_KEY`, then `PASO_E2E_OWNER_KEY`. |
+| `PASO_E2E_PAYER_KEY` | scripts, optional | Ethereum private key (`0x…`) that pays the burn and the mint on the EVM chain in a testnet run of `pnpm e2e`. Defaults to `DEMO_PAYER_PRIVATE_KEY`, then `PASO_E2E_OWNER_KEY`. |
 | `PASO_E2E_NETWORK`, `PASO_E2E_BASE_URL` | the scripted-wallet journey | The network, `testnet` or `mainnet`, and the address of the site to drive. |
+| `PASO_E2E_CHAIN` | the scripted-wallet journey | The EVM chain USDC comes from and goes back to: `base`, `ethereum`, `arbitrum`, `optimism` or `arc`. Default `base`. |
+| `BASE_RPC_URL`, `ETHEREUM_RPC_URL`, `ARBITRUM_RPC_URL`, `OPTIMISM_RPC_URL`, `ARC_RPC_URL` | scripts, the scripted-wallet journey | RPC endpoint for that chain. Default: the public endpoints the SDK lists. |
 | `PASO_OFFLINE` | tests | `1` skips every test that reaches a network. |

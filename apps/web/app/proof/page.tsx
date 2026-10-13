@@ -121,10 +121,10 @@ const ARC_RUN: readonly Station[] = [
 ];
 
 const TESTS: readonly { text: string; command?: string }[] = [
-  { text: "Account contract 29, hub 15", command: "pnpm test:contracts" },
+  { text: "Account contract 50, hub 28", command: "pnpm test:contracts" },
   { text: "SDK 812 offline", command: "pnpm test:sdk" },
   { text: "Relayer and client 552 offline", command: "pnpm test:web" },
-  { text: "11 signing vectors checked by both the Rust and the TypeScript suites." },
+  { text: "14 signing vectors checked by both the Rust and the TypeScript suites." },
 ];
 
 function Stations({ run }: { run: readonly Station[] }) {

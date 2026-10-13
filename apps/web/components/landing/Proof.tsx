@@ -6,9 +6,9 @@ import { Crest } from "./Crest";
 import { REPO_URL, VERIFY_URL } from "./demo";
 
 const FACTS = [
-  { name: "Account contract", detail: "7.8 KB, 29 tests" },
-  { name: "Hub", detail: "4.2 KB, 15 tests" },
-  { name: "SDK", detail: "713 tests, sharing 11 signing vectors with the contracts" },
+  { name: "Account contract", detail: "7.8 KB, 50 tests" },
+  { name: "Hub", detail: "4.2 KB, 28 tests" },
+  { name: "SDK", detail: "812 tests, sharing 14 signing vectors with the contracts" },
   { name: "Base → Stellar", detail: "attested in 2 seconds on mainnet" },
 ] as const;
 
