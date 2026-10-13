@@ -31,6 +31,8 @@ EIP712Domain(string name,string version,bytes32 salt)
 
 There is no `chainId` and no `verifyingContract`. The network is bound by `salt`, and the account by a field of the message. The EVM chain the wallet happens to be connected to does not matter.
 
+The message does not name the Stellar network in words either. A mainnet request and a testnet request for the same owner differ only in `salt` and in the addresses. A signer has to state the network next to the prompt; see [SECURITY.md](SECURITY.md#the-network-in-the-prompt).
+
 | Network | Passphrase | `salt` | Domain separator |
 |---|---|---|---|
 | Testnet | `Test SDF Network ; September 2015` | `0xcee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472` | `0x8b4388cb9972512e45695f4d7f8c973b055d72fe0544b1fce5ad51ee79b5d518` |
@@ -86,7 +88,7 @@ Type hashes, as constants in the contract:
 
 | Field | Content |
 |---|---|
-| `account` | Strkey (`C…`) of the account contract that will check the signature. On chain it is `env.current_contract_address()`. |
+| `account` | Strkey (`C…`) of the account contract that will check the signature. On chain it is `env.current_contract_address()`. When a Paso account acts as a delegated signer of another account, this is still the Paso account, not the account whose authority is used. |
 | `calls` | One `Call` per contract call being authorised, in the order of section 6. |
 | `calls[i].contract` | Strkey (`C…`) of the contract being called. |
 | `calls[i].fn` | The function name: the characters of the Soroban symbol. |
@@ -118,8 +120,10 @@ Rules that the examples do not show:
 
 - Integers have no leading zeros, no `+`, no separators. Zero is `0`.
 - Empty `Bytes` render as `0x`. An empty `Symbol` or `String` renders as the empty string.
-- "Anything else" covers `Vec` and `Map`, which is how structs, tuples and most enums are encoded, as well as `u256`, `i256`, timepoints, durations, and addresses that are neither an account nor a contract, such as muxed accounts. The hash is over the XDR of the whole `ScVal`, type tag included.
+- "Anything else" covers `Vec` and `Map`, which is how structs, tuples and most enums are encoded, as well as `u256`, `i256`, timepoints, durations, and addresses that are neither an account nor a contract, such as muxed accounts. The hash is over the XDR of the whole `ScVal`, type tag included. The token interface takes a muxed address as the destination of `transfer`, so the recipient of a transfer to an `M…` address renders as `xdr:…`.
 - A `String` or `Symbol` whose bytes are not valid UTF-8 has no typed-data form. The contract hashes the raw bytes; the SDK refuses to prepare such a call.
+- The bytes of a `String` are not escaped. Line breaks, control characters and direction overrides are part of the text, and so is a leading byte-order mark (`ef bb bf`): a signer has to hash it with the rest. A decoder that drops the mark produces a digest the contract will not rebuild.
+- A `Bytes` argument above about 25 kB cannot be authorised. Rendering it as hex needs more memory than a mainnet transaction is allowed; 24,000 bytes fit and 26,000 do not. The squares of the lengths add up over all `Bytes` arguments of one authorisation. A `String` of the same size is cheap.
 - The text carries no type. The `String` `true` and the `bool` `true` render the same; so do the number `5` and the string `5`. The exact values are still bound, by `payload`.
 
 ## 6. Call order
@@ -150,10 +154,12 @@ To build it:
 
 1. Simulate the transaction with no authorisation attached. The simulation returns the entries the call needs.
 2. Take the entry whose credentials name the account. There must be exactly one.
-3. Set the entry's signature expiration ledger. The SDK uses the latest ledger plus 120, about ten minutes.
+3. Set the entry's signature expiration ledger. The SDK uses at most the latest ledger plus 120, about ten minutes. The contract puts no limit on it and the host accepts any expiry that is within `max_entry_ttl − 1` ledgers of the ledger in which the entry is used, so keep it short: until that ledger the signature can be submitted by anyone who holds it.
 4. Build the preimage for that entry and hash it with sha256.
 
 With `@stellar/stellar-sdk` 17 the preimage is `buildAuthorizationEntryPreimage(entry, validUntilLedger, networkPassphrase)`; `authPayload` in the SDK wraps it.
+
+The credential wrapper itself is not part of the preimage. The address-bound encoding and the delegated one, `sorobanCredentialsAddressWithDelegates`, give the same payload, so a signed entry can be re-wrapped with a list of delegates and still verify. The account ignores the delegates and the same call runs once.
 
 The contract does not interpret `payload`. It hashes it into the struct as `bytes32`. The host computes the value from the entry that is actually submitted, so a signature made over one entry's payload cannot verify for another entry.
 
@@ -189,7 +195,9 @@ The contract recovers the public key from `digest`, `r ‖ s` and the recovery i
 
 An `r` that is in range but is not the x-coordinate of a curve point makes the host abort instead of returning a typed error. The transaction fails either way.
 
-64-byte compact signatures (EIP-2098) and smart-contract wallet signatures (ERC-1271) are not accepted.
+One signature has two valid 65-byte encodings, with `v` as `0` or `27`, or as `1` or `28`. Do not use the bytes of a signature as an identifier.
+
+64-byte compact signatures (EIP-2098) and smart-contract wallet signatures (ERC-1271) are not accepted. An owner address that is a contract can therefore never sign, and USDC sent to its account is lost.
 
 ## 10. Attaching and submitting
 
@@ -208,6 +216,7 @@ If the account contract does not exist yet, call `hub.deploy(owner)` first. Anyo
 |---|---|
 | The same signature submitted twice | The host consumes the entry's nonce. The nonce is inside `payload`. Hub test: `twin_signature_cannot_be_replayed_or_stretched`. |
 | A signature used after it expires | The host refuses an entry past its signature expiration ledger. The ledger is inside `payload`. |
+| A signature used again after its transaction failed | Nothing. A failed transaction rolls the nonce back, and the entry can be submitted again until its expiration ledger. Hub test: `f02_failed_transaction_leaves_the_signature_usable_by_anyone`. |
 | A signature used for another account | `account` is rebuilt on chain from the address of the contract doing the check. Test: `rejects_other_account`. |
 | A signature used on another network | `salt` is the network id, read on chain from the ledger. The network id is also inside `payload`. Test: `rejects_other_network`. |
 | A changed argument, contract or function | The text is rebuilt from the calls the host supplies. Tests: `rejects_changed_argument`, `rejects_changed_recipient`, `rejects_changed_contract_or_function`. |

@@ -8,7 +8,7 @@ Live on testnet: **https://paso-stellar.vercel.app** — [try it without a walle
 
 The dollars are on EVM chains. A Stellar account asks for a new wallet, a new seed phrase, XLM for reserves and a trustline before the first dollar arrives, and MetaMask's native Stellar support still creates a classic account with those costs (1 XLM, plus 0.5 XLM per trustline). Paso derives a Soroban contract account from the 20-byte Ethereum address itself. That account accepts only an EIP-712 signature from that address, and it rebuilds the signed message on chain from the calls being authorised: what the wallet displays is exactly what executes, or nothing does. USDC arrives from Base over Circle CCTP and a relayer pays the Stellar fees, so there is no new wallet, no seed phrase and no XLM.
 
-Status: the hub and the account code are deployed on Stellar mainnet and on testnet. The whole path has run on both: Base to the account, on to another account, and back to Base, with real USDC on mainnet. On mainnet that was one run from the scripts. The web app and the relayer are set up for testnet only. [Limits](#limits) lists everything that is not done.
+Status: unaudited. The hub and the account code are deployed on Stellar mainnet and on testnet. The whole path has run on both: Base to the account, on to another account, and back to Base, with real USDC on mainnet. On mainnet that was one run from the scripts. The web app and the relayer are set up for testnet only. [Limits](#limits) lists everything that is not done.
 
 ## See it
 
@@ -184,7 +184,7 @@ The relayer refuses any transaction whose resource fee is above 0.5 XLM, and sto
 
 **Tests**
 
-- 29 for the account contract and 15 for the hub: `pnpm test:contracts`.
+- 50 for the account contract and 28 for the hub: `pnpm test:contracts`. 21 and 13 of them are the tests of the project's own security review, [docs/AUDIT.md](docs/AUDIT.md). They demonstrate each limit it found and each attack that was refused, so a pass there does not mean "safe".
 - 200 for the SDK offline: `PASO_OFFLINE=1 pnpm test:sdk`. Without the flag, 8 more read testnet.
 - 321 for the web app and the relayer offline: `PASO_OFFLINE=1 pnpm test:web`. 23 more send testnet transactions and need keys.
 - 11 signing vectors in [`fixtures/vectors.json`](fixtures/vectors.json). The Rust suite and the TypeScript suite both check the rendered text, the digest and the recovered signer of every vector.
@@ -203,7 +203,7 @@ pnpm verify 85cb7efa882a1cc6cc54c294bd7d60e5c7b6e47c8221ff7625fb44f6623e2322 --n
 # 2. The same check on the transaction refused on mainnet. The recovered signer is not the owner. Exits 1.
 pnpm verify eb94539839cba10012c01cea9453410d740d89194c2e99c4b33958aec144b6a3 --network mainnet
 
-# 3. Build both contracts and run their tests: 29 + 15.
+# 3. Build both contracts and run their tests: 50 + 28.
 pnpm test:contracts
 ```
 
@@ -236,7 +236,7 @@ cd paso
 pnpm install
 
 pnpm build:contracts   # target/wasm32v1-none/release/paso_account.wasm and paso_hub.wasm
-pnpm test:contracts    # 29 account tests, 15 hub tests
+pnpm test:contracts    # 50 account tests, 28 hub tests
 
 pnpm build:sdk
 PASO_OFFLINE=1 pnpm test:sdk   # 200 tests
@@ -339,11 +339,14 @@ apps/web            Next.js app: the pages, the relayer API (app/api, lib/server
 scripts             End-to-end run (e2e.ts), verification (verify.ts), deployment (deploy.sh)
 fixtures            vectors.json: signing vectors shared by the Rust and TypeScript tests; gen/ writes them
 deployments         testnet.json and mainnet.json: hub id, account wasm hash, Circle contract ids
-docs                ENCODING.md, SECURITY.md, VERIFY.md, CLAIMS.md
+docs                ENCODING.md, SECURITY.md, AUDIT.md, VERIFY.md, CLAIMS.md
 ```
 
 ## Limits
 
+We reviewed our own contracts adversarially and published everything we found: [docs/AUDIT.md](docs/AUDIT.md). It has 13 findings, each with a test that reproduces it where a test can. It is not a third-party audit. The contracts on mainnet cannot be changed, so none of the findings can be patched.
+
+- **Only an address with a private key can spend.** Every Ethereum address has an account that can be paid. The account of an address with no private key (a Safe, a smart-contract wallet, any contract) can receive and never send, and USDC sent to it is lost. A smart-contract wallet that is not deployed yet cannot be detected in advance. Do not pay the account of an address unless its holder can sign with a plain key.
 - **Mainnet covers the contracts and one scripted run.** The hub and the account code are on Stellar mainnet, and one journey ran there with 1 USDC. The web app and the relayer are set up for testnet only.
 - **One source chain:** Base, and Base Sepolia on testnet. Other CCTP chains are untested, and Base is the only EVM chain configured in the SDK.
 - **No key rotation and no recovery.** The owner is set once in the constructor. Lose the Ethereum key and the account is lost.
@@ -351,17 +354,20 @@ docs                ENCODING.md, SECURITY.md, VERIFY.md, CLAIMS.md
 - **Externally owned accounts only.** The account checks one 65-byte secp256k1 signature. ERC-1271 smart-contract wallets cannot sign for it.
 - **Wallet extensions are untested.** The signatures in the linked transactions were made by scripts, or by the web app's demo key in the browser, through viem's EIP-712 signer. No wallet extension such as MetaMask has been exercised live, so how a given wallet lays the message out on screen has not been checked. Neither has the app's ENS lookup.
 - **Amounts and contracts are shown raw.** `5000000` is 0.5 USDC, and a contract is its `C…` address. The message carries no decimals, token symbols or names.
-- **Nested arguments are bound by hash, not shown as text.** Vectors, maps, structs, 256-bit integers, timepoints, durations and muxed addresses appear as `xdr:<sha256>`.
-- **Text does not carry types.** The number `5` and the string `"5"` read the same in the wallet. The payload still binds the exact values.
-- **The signature's expiry is not shown as text.** It is inside `payload`. The SDK sets it to 120 ledgers, about ten minutes.
+- **Nested arguments are bound by hash, not shown as text.** Vectors, maps, structs, 256-bit integers, timepoints, durations and muxed addresses appear as `xdr:<sha256>`. A transfer to a muxed `M…` address therefore shows its recipient as a hash.
+- **Text does not carry types.** The number `5` and the string `"5"` read the same in the wallet. A string argument is shown as it is, line breaks included, and the list of calls does not show which call is nested in which. The payload still binds the exact values.
+- **The prompt does not name the network.** A mainnet request and a testnet request differ in a 32-byte salt and in the addresses, and in nothing a reader would recognise as "mainnet". The same key controls an owner's account on both.
+- **The signature's expiry is not shown as text, and a signature cannot be revoked.** The expiry is inside `payload`, and the contracts put no upper bound on it. The SDK's default is at most 120 ledgers, about ten minutes. Until its expiry a signature can be submitted by anyone who holds it, also after its transaction failed.
 - **One signature, one authorisation tree.** A call that needs two separate authorisations from the account is refused by the SDK.
 - **USDC crosses with 6 decimals.** Stellar USDC has 7. `exit` rejects an amount or fee cap with a non-zero seventh decimal.
 - **Addresses depend on the hub.** A different hub contract gives every owner a different account address. An owner's mainnet and testnet addresses differ.
 - **The relayer can decline.** It cannot move funds or change a signed call, and anyone can submit instead. Its limits are kept in memory and reset when the server restarts.
 - **A transaction that bids the minimum fee can be left out of every ledger.** It happened to the first mainnet delivery. The scripts resend with a higher bid.
 - **A signature whose `r` is not a valid curve point aborts in the host** instead of returning a typed error. The transaction still fails.
-- **No TTL extension logic in the contracts.** Archived entries are restored automatically by the network when used.
-- **Unaudited.**
+- **Nothing keeps the contracts alive.** The contracts never extend a lifetime. The account code shared by every account, and the hub, are archived after ledger 66,981,816, about 9 February 2027, unless someone pays to extend them. Anyone can, for a few XLM; restoring later costs more, and the hosted relayer does not do it. No funds are lost by archival. [docs/SECURITY.md](docs/SECURITY.md#lifetime-of-the-contracts) has the dates, the costs and the commands.
+- **Every exit goes through one caller at Circle, the hub.** If Circle blocks the hub, `exit` stops for every account. Funds stay in the accounts, and an account can still call Circle's contract itself with two signatures.
+- **The hub cannot return anything.** USDC sent to the hub's address stays there for good.
+- **Unaudited.** No third-party audit and no formal verification. The project's own review is in [docs/AUDIT.md](docs/AUDIT.md).
 
 [docs/SECURITY.md](docs/SECURITY.md) has the threat model.
 
