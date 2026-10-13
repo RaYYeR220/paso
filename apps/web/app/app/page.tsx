@@ -1,7 +1,6 @@
 import type { Metadata } from "next";
 import { Suspense } from "react";
 import { AccountPair, AppShell, TopBar } from "@/components/app";
-import { NETWORK_LABEL } from "@/components/app/site";
 import { AppScreen } from "./AppScreen";
 
 export const metadata: Metadata = {
@@ -9,11 +8,13 @@ export const metadata: Metadata = {
   description: "Bring USDC from Base, send it on Stellar, and watch the account contract check every signature.",
 };
 
-/** The sheet before the browser has said who is connected. */
+/** The sheet before the browser has said which network it is on and who is connected. */
 function BlankScreen() {
   return (
     <AppShell layout="screen">
-      <TopBar network={NETWORK_LABEL} />
+      <div className="top">
+        <TopBar />
+      </div>
       <AccountPair />
     </AppShell>
   );

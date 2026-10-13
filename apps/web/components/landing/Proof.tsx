@@ -8,7 +8,7 @@ import { REPO_URL, VERIFY_URL } from "./demo";
 const FACTS = [
   { name: "Account contract", detail: "7.8 KB, 29 tests" },
   { name: "Hub", detail: "4.2 KB, 15 tests" },
-  { name: "SDK", detail: "200 tests, sharing 11 signing vectors with the contracts" },
+  { name: "SDK", detail: "686 tests, sharing 11 signing vectors with the contracts" },
   { name: "Base → Stellar", detail: "attested in 2 seconds on mainnet" },
 ] as const;
 

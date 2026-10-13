@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Suspense } from "react";
 import { decodeParam } from "@/lib/client/parse";
+import { LookupFallback } from "../LookupFallback";
 import { LookupView } from "../LookupView";
 
 export const metadata: Metadata = {
@@ -16,7 +17,7 @@ async function Resolved({ params }: { params: Promise<{ address: string }> }) {
 /** `/lookup/0x…` or `/lookup/vitalik.eth`. */
 export default function LookupPage({ params }: PageProps<"/lookup/[address]">) {
   return (
-    <Suspense fallback={<LookupView initial="" />}>
+    <Suspense fallback={<LookupFallback />}>
       <Resolved params={params} />
     </Suspense>
   );

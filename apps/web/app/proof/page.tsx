@@ -1,14 +1,14 @@
 import type { Metadata } from "next";
+import { Suspense } from "react";
 import { AccountPair, AppShell, ExternalLink, TopBar } from "@/components/app";
-import { NETWORK_LABEL, REFUSAL_ON_CHAIN, SITE_LINKS } from "@/components/app/site";
+import { REFUSAL_ON_CHAIN } from "@/components/app/site";
 import { LiveStatus } from "./LiveStatus";
+import { ProofChrome } from "./ProofChrome";
 
 export const metadata: Metadata = {
   title: "Proof",
   description: "Every claim Paso makes, with the transaction or the command that backs it.",
 };
-
-const LINKS = SITE_LINKS.filter((link) => link.href !== "/proof");
 
 const OWNER = "0x7880DA9a52Af491f76421869d4e28DC0A4D1767C";
 const ACCOUNT = "CCI3UVOB35NEJCTKPCLSPJVT745BNT2QNACV3QP46CRYTVD3QCOH2VME";
@@ -23,7 +23,6 @@ const BASESCAN = "https://sepolia.basescan.org/tx/";
 const EXPERT = "https://stellar.expert/explorer/testnet/";
 const MAINNET_BASESCAN = "https://basescan.org/tx/";
 const MAINNET_EXPERT = "https://stellar.expert/explorer/public/";
-const TESTNET_REFUSAL = `${EXPERT}tx/ded23530dfc8d114a1350522e45b257170ed775738b0e85887f0e6667d52b181`;
 const REPO = "https://github.com/RaYYeR220/paso";
 
 interface Station {
@@ -90,8 +89,8 @@ const RUN: readonly Station[] = [
 
 const TESTS: readonly { text: string; command?: string }[] = [
   { text: "Account contract 29, hub 15", command: "pnpm test:contracts" },
-  { text: "SDK 200 offline", command: "pnpm test:sdk" },
-  { text: "Relayer and client 321 offline", command: "pnpm test:web" },
+  { text: "SDK 686 offline", command: "pnpm test:sdk" },
+  { text: "Relayer and client 515 offline", command: "pnpm test:web" },
   { text: "11 signing vectors checked by both the Rust and the TypeScript suites." },
 ];
 
@@ -112,13 +111,21 @@ function Stations({ run }: { run: readonly Station[] }) {
 export default function ProofPage() {
   return (
     <AppShell>
-      <TopBar network={NETWORK_LABEL} links={LINKS} />
+      <Suspense
+        fallback={
+          <div className="top">
+            <TopBar />
+          </div>
+        }
+      >
+        <ProofChrome />
+      </Suspense>
       <AccountPair evmAddress={MAINNET_OWNER} stellarAddress={MAINNET_ACCOUNT} showBalance={false} />
       <main className="doc">
         <div className="doc-lead">
           <h1>Proof</h1>
           <p>Every claim Paso makes, with the transaction or the command that backs it.</p>
-          <p className="doc-meta">Mainnet first: Stellar and Base. Then the testnet this site runs on: Stellar testnet and Base Sepolia.</p>
+          <p className="doc-meta">Mainnet first: Stellar and Base. Then testnet: Stellar testnet and Base Sepolia.</p>
           <LiveStatus />
         </div>
 
@@ -132,7 +139,7 @@ export default function ProofPage() {
             <ul className="claims">
               <li data-mark="refused">
                 <span>Signed for amount 1, submitted with 10000000000000: refused on mainnet, Error(Contract, #2)</span>
-                <ExternalLink href={REFUSAL_ON_CHAIN}>Stellar</ExternalLink>
+                <ExternalLink href={REFUSAL_ON_CHAIN.mainnet}>Stellar</ExternalLink>
               </li>
             </ul>
             <dl className="facts">
@@ -151,7 +158,11 @@ export default function ProofPage() {
                 <dd className="hash">{ACCOUNT_CODE_HASH}, the same as on testnet</dd>
               </div>
             </dl>
-            <p>The mainnet run was made with the project&rsquo;s scripts. This site and its relayer run on testnet.</p>
+            <p>
+              The mainnet run above was made with the project&rsquo;s scripts. This site works on mainnet too, with a
+              wallet and within tight limits, whenever its relayer is serving it: the live status says whether it is.
+              Mainnet. Real USDC. This software has not been audited.
+            </p>
           </section>
 
           <section aria-labelledby="run">
@@ -173,7 +184,7 @@ export default function ProofPage() {
                   Signed for amount 1, submitted with amount 10000000000000: FAILED on chain, account answered
                   Error(Contract, #2) BadSignature
                 </span>
-                <ExternalLink href={TESTNET_REFUSAL}>Stellar</ExternalLink>
+                <ExternalLink href={REFUSAL_ON_CHAIN.testnet}>Stellar</ExternalLink>
               </li>
               <li data-mark="match">
                 <span>The honest twin of that call, accepted</span>

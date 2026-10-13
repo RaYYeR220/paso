@@ -16,7 +16,9 @@ export type VerdictState =
   /** The signature ran out before it was used. */
   | "expired"
   /** The call never reached a verdict: the wallet or the relayer failed. */
-  | "failed";
+  | "failed"
+  /** The call was signed and handed over, and nobody here saw what became of it. Neither a match nor a refusal. */
+  | "unconfirmed";
 
 export interface VerdictProps {
   state: VerdictState;
@@ -28,12 +30,24 @@ export interface VerdictProps {
   reason?: string;
   /** Seconds since the call was submitted. */
   elapsed?: string;
+  /** About how many seconds the signature being asked for would still be accepted. */
+  validFor?: number;
+  /** The network the signature is for, in words: "Stellar mainnet". The wallet prompt itself does not say it. */
+  networkName?: string;
   /** True when the demonstration will alter the amount after signing. */
   tamper?: boolean;
   /** True when the owner just said no in the wallet: the review is still open. */
   declined?: boolean;
   /** True while a relayer that was unavailable is being asked a second time. */
   retrying?: boolean;
+  /** The account on the Stellar explorer, for a call whose outcome is not known: its activity says what happened. */
+  accountHref?: string;
+  /** Said under a call that was signed and did not go through: how long the signature stays usable. */
+  signatureNote?: ReactNode;
+  /** What stands between the review and the wallet: a warning to read, a box to tick. Signing waits for it. */
+  caution?: ReactNode;
+  /** False while a caution has not been answered: the wallet is not asked. */
+  canSign?: boolean;
   /**
    * A refusal recorded on chain, to look at. A relayer turns a mismatched
    * call down before sending anything, so a refusal here has no transaction
@@ -58,6 +72,7 @@ const WORDS: Record<VerdictState, string> = {
   refused: "Refused",
   expired: "Expired",
   failed: "Not sent",
+  unconfirmed: "Unconfirmed",
 };
 
 const REFUSED = "BadSignature (#2): the transaction does not match what was signed. Nothing moved.";
@@ -91,9 +106,15 @@ export function Verdict({
   txHref,
   reason,
   elapsed,
+  validFor,
+  networkName,
   tamper = false,
   declined = false,
   retrying = false,
+  accountHref,
+  signatureNote,
+  caution,
+  canSign = true,
   exampleHref,
   onSign,
   onBack,
@@ -112,10 +133,23 @@ export function Verdict({
         ? "Declined in the wallet. Nothing was signed."
         : tamper
           ? "Demonstration: a different amount is submitted after you sign. The contract should refuse it."
-          : "Your wallet will ask you to sign exactly these lines.";
+          : `Your wallet will ask you to sign exactly these lines${networkName ? `, for ${networkName}` : ""}.`;
+      if (validFor !== undefined) {
+        text = (
+          <>
+            {text} <span className="elapsed">{validFor > 0 ? `The signature is good for about ${validFor} s.` : "This request is too old to sign."}</span>
+          </>
+        );
+      }
       actions = (
         <>
-          <Action onClick={onSign}>Sign in wallet</Action>
+          {canSign ? (
+            <Action onClick={onSign}>Sign in wallet</Action>
+          ) : (
+            <button type="button" className="btn btn-slab" disabled>
+              Sign in wallet
+            </button>
+          )}
           <Action quiet onClick={onBack}>
             Back
           </Action>
@@ -123,7 +157,7 @@ export function Verdict({
       );
       break;
     case "signing":
-      text = "Waiting for your signature. Compare what the wallet displays with the sheet on the left.";
+      text = `Waiting for your signature${networkName ? `, for ${networkName}` : ""}. Compare what the wallet displays with the sheet on the left.`;
       break;
     case "relaying":
       text = retrying ? (
@@ -160,6 +194,7 @@ export function Verdict({
       text = (
         <>
           {reason ?? REFUSED}
+          {signatureNote ? <span className="verdict-note">{signatureNote}</span> : null}
           <span className="verdict-note">
             {txHref ? (
               <ExternalLink href={txHref}>The refused transaction</ExternalLink>
@@ -195,7 +230,12 @@ export function Verdict({
       );
       break;
     case "failed":
-      text = reason ?? "The call was not sent. Nothing moved.";
+      text = (
+        <>
+          {reason ?? "The call was not sent. Nothing moved."}
+          {signatureNote ? <span className="verdict-note">{signatureNote}</span> : null}
+        </>
+      );
       actions = (
         <>
           <Action onClick={onSignAgain}>Try again</Action>
@@ -205,13 +245,32 @@ export function Verdict({
         </>
       );
       break;
+    case "unconfirmed":
+      text = (
+        <>
+          We could not confirm this call. Check the activity list before trying again.
+          <span className="verdict-note">
+            {accountHref ? <ExternalLink href={accountHref}>The account on Stellar</ExternalLink> : null}
+            {signatureNote ? <> {signatureNote}</> : null}
+          </span>
+        </>
+      );
+      actions = (
+        <Action quiet onClick={onReset}>
+          Close
+        </Action>
+      );
+      break;
   }
 
   return (
     <div className="verdict" data-state={state} role="status" aria-live="polite" aria-atomic="true">
       <strong>{WORDS[state]}</strong>
       <div className="verdict-body">
-        <p>{text}</p>
+        <div className="verdict-text">
+          <p>{text}</p>
+          {state === "review" && caution ? caution : null}
+        </div>
         {actions ? <div className="verdict-actions">{actions}</div> : null}
       </div>
       <BorderPost />

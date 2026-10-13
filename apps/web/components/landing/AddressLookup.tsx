@@ -48,10 +48,10 @@ export function AddressLookup({ children }: { children: ReactNode }) {
   if (!query) {
     result = (
       <>
-        <span className="label">For example, {shorten(DEMO_ADDRESS)} is</span>
+        <span className="label">For example, on testnet {shorten(DEMO_ADDRESS)} is</span>
         <Account value={DEMO_ACCOUNT} />
         <span className="note">
-          <Link prefetch={false} className="link" href={`/lookup/${DEMO_ADDRESS}`}>
+          <Link prefetch={false} className="link" href={`/lookup/${DEMO_ADDRESS}?network=testnet`}>
             Open this account
           </Link>
         </span>
@@ -62,7 +62,7 @@ export function AddressLookup({ children }: { children: ReactNode }) {
       <>
         <span className="label">Names are resolved on the lookup page.</span>
         <span className="note">
-          <Link prefetch={false} className="link" href={`/lookup/${encodeURIComponent(query)}`}>
+          <Link prefetch={false} className="link" href={`/lookup/${encodeURIComponent(query)}?network=testnet`}>
             Look up {query}
           </Link>
         </span>
@@ -72,11 +72,11 @@ export function AddressLookup({ children }: { children: ReactNode }) {
     if (found?.account) {
       result = (
         <>
-          <span className="label">{shorten(query)} is</span>
+          <span className="label">On testnet, {shorten(query)} is</span>
           <Account value={found.account} />
           <span className="note">
             It can receive USDC now.{" "}
-            <Link prefetch={false} className="link" href={`/lookup/${query}`}>
+            <Link prefetch={false} className="link" href={`/lookup/${query}?network=testnet`}>
               Open this account
             </Link>
           </span>

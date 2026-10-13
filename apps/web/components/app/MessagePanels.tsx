@@ -1,15 +1,19 @@
 import type { ReactNode } from "react";
 import { Skeleton } from "./primitives";
 
-export type MessageLabel = "account" | "contract" | "fn" | "args" | "payload";
+export type MessageLabel = "salt" | "account" | "contract" | "fn" | "args" | "payload";
 
 /** One line of the signed message. Both sides use the same ids, so lines pair up. */
 export interface MessageLine {
   id: string;
   label: MessageLabel;
   value: string;
-  /** A name for a known contract: "USDC". */
+  /** A name for a known contract, "USDC", or what the salt means: "Stellar mainnet". */
   name?: string;
+  /** The Soroban type of an argument, where the text alone does not say it: "string", "i128". */
+  type?: string;
+  /** What a reader should be told about this line before signing, in a few words. */
+  warning?: string;
   /** True when the other side shows something else on this line. */
   differs: boolean;
 }
@@ -32,7 +36,7 @@ interface Row {
   relation: "open" | "same" | "differs";
 }
 
-const OUTLINE: readonly MessageLabel[] = ["account", "contract", "fn", "args", "payload"];
+const OUTLINE: readonly MessageLabel[] = ["salt", "account", "contract", "fn", "args", "payload"];
 
 function pair(wallet: readonly MessageLine[], contract: readonly MessageLine[] | null): Row[] {
   const rebuilt = new Map((contract ?? []).map((line) => [line.id, line]));
@@ -133,6 +137,7 @@ function Sheet({
           >
             <dt>
               {row.showLabel ? row.label : <span className="vh">{row.label}</span>}
+              {own(row)?.type ? <span className="argtype">{own(row)?.type}</span> : null}
               {own(row)?.name ? <b className="tok">{own(row)?.name}</b> : null}
               {side === "contract" ? (
                 <span className="sign" data-relation={row.relation}>
@@ -162,7 +167,10 @@ export function MessagePanels({ wallet, contract, loading = false }: MessagePane
 
   const value = (line: MessageLine | undefined, other: MessageLine | undefined): ReactNode =>
     line ? (
-      <span className="val">{inked(line.value, other?.value)}</span>
+      <>
+        <span className="val">{inked(line.value, other?.value)}</span>
+        {line.warning ? <span className="argwarn">{line.warning}</span> : null}
+      </>
     ) : (
       <span className="absent">not in this message</span>
     );

@@ -1,4 +1,6 @@
 import type { Metadata } from "next";
+import { Suspense } from "react";
+import { LookupFallback } from "./LookupFallback";
 import { LookupView } from "./LookupView";
 
 export const metadata: Metadata = {
@@ -7,5 +9,9 @@ export const metadata: Metadata = {
 };
 
 export default function LookupIndexPage() {
-  return <LookupView initial="" />;
+  return (
+    <Suspense fallback={<LookupFallback />}>
+      <LookupView initial="" />
+    </Suspense>
+  );
 }

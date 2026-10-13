@@ -5,6 +5,7 @@ import {
   shortHash,
   type ActionFlow,
   type ActivityItem,
+  type DeclineReason,
   type Exit,
   type Funding,
   type RequestStep,
@@ -29,6 +30,7 @@ function running(elapsedSeconds: number | null): string {
 export function fundingStages(funding: Funding): Stages {
   const { state, links, elapsedSeconds } = funding;
   const burnHash = "transfer" in state && state.transfer ? state.transfer.burnTxHash : undefined;
+  const held = state.phase === "attesting" && state.held !== undefined;
 
   return funding.stages.map((stage): StageView => {
     const view: StageView = { id: stage.id, label: stage.label, status: stage.status };
@@ -40,7 +42,7 @@ export function fundingStages(funding: Funding): Stages {
         if (state.phase === "requesting") return { ...view, detail: REQUEST_WORDS[state.step][state.via] };
         return view;
       case "attested":
-        if (stage.status === "active") return { ...view, detail: running(elapsedSeconds) };
+        if (stage.status === "active") return { ...view, detail: held ? "waiting for a relayer" : running(elapsedSeconds) };
         return view;
       case "minted":
         if (stage.status === "active") return { ...view, detail: "delivering" };
@@ -67,6 +69,12 @@ export function exitStages(exit: Exit): Stages {
         if (state.phase === "untracked") return { ...view, detail: "about 20 seconds" };
         return stage.status === "active" ? { ...view, detail: running(elapsedSeconds) } : view;
       case "minted":
+        if (state.phase === "attested") return { ...view, detail: "your wallet's turn" };
+        if (state.phase === "minting") {
+          return state.baseTxHash && links.base
+            ? { ...view, detail: "confirming", href: links.base }
+            : { ...view, detail: "confirm in the wallet" };
+        }
         if (stage.status !== "done") return view;
         return links.base && state.phase === "minted" && state.baseTxHash
           ? { ...view, detail: shortHash(state.baseTxHash), href: links.base }
@@ -100,7 +108,22 @@ export function verdictOf(action: ActionFlow): VerdictState {
     case "expired":
       return "expired";
     case "failed":
-      return state.stage === "prepare" ? "idle" : "failed";
+      if (state.stage === "prepare") return "idle";
+      return action.unconfirmed ? "unconfirmed" : "failed";
+  }
+}
+
+/** Why the hosted relayer is not paying for something right now, as the end of a sentence. */
+export function declineWords(reason: DeclineReason, network: string): string {
+  switch (reason) {
+    case "not_serving":
+      return `it is not serving ${network} right now`;
+    case "daily_budget":
+      return "it has spent what it spends on fees in a day";
+    case "hourly_limit":
+      return "it has paid for all it pays for in an hour";
+    case "low_balance":
+      return "its fee account is down to what it keeps in reserve";
   }
 }
 
