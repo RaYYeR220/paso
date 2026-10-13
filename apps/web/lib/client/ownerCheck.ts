@@ -1,7 +1,5 @@
-import { NETWORKS, ownerKind, type OwnerChain, type OwnerCheck } from "paso-sdk";
+import { ownerKind, type OwnerCheck } from "paso-sdk";
 import type { Address } from "viem";
-import { mainnet } from "viem/chains";
-import { MAINNET_RPC_URLS } from "./ens";
 
 /**
  * Whether an Ethereum address is a wallet with a key or a contract.
@@ -9,18 +7,13 @@ import { MAINNET_RPC_URLS } from "./ens";
  * It matters because a Paso account obeys one thing, a signature from the
  * key of its owner address, and a contract has no key: the account derived
  * from a Safe or a smart wallet can receive USDC and never move it. The
- * address is looked up on Ethereum and on both Bases, since a smart account
- * is often deployed on one chain and not on another.
+ * address is looked up on every EVM chain Paso lists, mainnets and test
+ * networks, since a smart account is often deployed on one chain and not on
+ * another.
  *
  * "wallet" means that no code was found. A smart account that has not been
  * deployed anywhere yet has none either, and cannot be told apart.
  */
-const CHAINS: readonly OwnerChain[] = [
-  { chain: mainnet, rpcUrls: MAINNET_RPC_URLS },
-  { chain: NETWORKS.mainnet.evm.chain },
-  { chain: NETWORKS.testnet.evm.chain },
-];
-
 const UNKNOWN: OwnerCheck = { kind: "unknown", chains: [] };
 
 /**
@@ -45,4 +38,4 @@ export function createOwnerChecker(ask: (address: Address) => Promise<OwnerCheck
 }
 
 /** The app's own checker, over public endpoints. */
-export const checkOwner = createOwnerChecker((address) => ownerKind(address, { chains: CHAINS }));
+export const checkOwner = createOwnerChecker((address) => ownerKind(address));
