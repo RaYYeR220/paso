@@ -41,7 +41,7 @@ import { toEvmUnits, toStellarUnits } from "./units";
 /** Send USDC from the account to a Stellar address, or to the account of an Ethereum address. */
 export interface TransferAction {
   kind: "transfer";
-  /** `G…`, `C…`, or `0x…` for the Stellar account of that Ethereum address. */
+  /** `G…`, `C…`, or `0x…` for the Stellar account of that Ethereum address. A muxed `M…` address is refused. */
   to: string;
   /** USDC in 7-decimal units. */
   amount: bigint;
@@ -84,7 +84,10 @@ export interface PrepareOptions extends ActionContext {
    * it, so any address works; the default is the all-zero account.
    */
   source?: string;
-  /** How many ledgers (about 5 seconds each) the signature stays valid. Defaults to 120. */
+  /**
+   * How many ledgers the signature stays valid: a whole number from 1 to
+   * `MAX_VALIDITY_LEDGERS`. Defaults to `DEFAULT_VALIDITY_LEDGERS`.
+   */
   validForLedgers?: number;
   server?: rpc.Server;
 }
@@ -105,6 +108,12 @@ export interface Prepared {
   calls: Call[];
   /** Last ledger at which the signature is accepted. */
   validUntilLedger: number;
+  /**
+   * The latest ledger when the call was simulated: where the validity window
+   * starts. Set by `prepare`; absent on a call read back from a relayer
+   * request, which does not say when it was prepared.
+   */
+  preparedAtLedger?: number;
 }
 
 /** A prepared call whose account entry carries the owner's signature. Plain JSON. */
@@ -187,8 +196,22 @@ export class TransactionError extends Error {
   }
 }
 
+/** Roughly how long the network takes to close a ledger, in seconds. For display only: validity counts ledgers. */
+export const LEDGER_SECONDS = 5;
+
+/** How many ledgers a signature stays valid when `validForLedgers` is not given: about two minutes. */
+export const DEFAULT_VALIDITY_LEDGERS = 24;
+
+/**
+ * The longest validity `prepare` accepts, in ledgers: about ten minutes.
+ *
+ * Until its last valid ledger a signature can be submitted by anyone who
+ * holds it, and a transaction that fails does not use it up. The window is
+ * the only limit on that, so it is kept short.
+ */
+export const MAX_VALIDITY_LEDGERS = 120;
+
 const NULL_ACCOUNT = StrKey.encodeEd25519PublicKey(new Uint8Array(32));
-const DEFAULT_VALIDITY_LEDGERS = 120;
 const TRANSACTION_TIMEOUT_SECONDS = 60;
 const CONFIRMATION_ATTEMPTS = 60;
 
@@ -202,9 +225,31 @@ function assertPositive(amount: bigint): void {
   }
 }
 
+function assertValidity(ledgers: number): void {
+  if (!Number.isInteger(ledgers) || ledgers < 1 || ledgers > MAX_VALIDITY_LEDGERS) {
+    const got = typeof ledgers === "number" ? String(ledgers) : `${typeof ledgers} ${String(ledgers)}`;
+    throw new Error(
+      `validForLedgers must be a whole number, at least 1 and at most ${MAX_VALIDITY_LEDGERS} ledgers ` +
+        `(about ${(MAX_VALIDITY_LEDGERS * LEDGER_SECONDS) / 60} minutes); got ${got}`,
+    );
+  }
+}
+
+/**
+ * The address a transfer pays. A muxed address (`M…`) is refused and never
+ * replaced by the account inside it: the signed text shows any address that
+ * is not an account or a contract as the hash of its XDR, so the owner would
+ * approve a recipient they cannot read.
+ */
 function transferRecipient(to: string, config: NetworkConfig): string {
   if (isAddress(to, { strict: false })) return twinAddress(to, config);
   if (StrKey.isValidContract(to) || StrKey.isValidEd25519PublicKey(to)) return to;
+  if (StrKey.isValidMed25519PublicKey(to)) {
+    throw new Error(
+      `"${to}" is a muxed address. A wallet can only show a muxed address as a hash, so it is not accepted ` +
+        "as a recipient; give the G… address it stands for",
+    );
+  }
   throw new Error(`"${to}" is not a Stellar address (G… or C…) or an Ethereum address (0x…)`);
 }
 
@@ -278,11 +323,14 @@ function decodeEntries(entries: string[]): xdr.SorobanAuthorizationEntry[] {
  *
  * Nothing here needs the owner's wallet or a funded Stellar account. Invalid
  * input (a recipient that is not an address, an exit amount Base cannot
- * represent) is rejected before the network is contacted.
+ * represent, a validity longer than `MAX_VALIDITY_LEDGERS`) is rejected
+ * before the network is contacted.
  */
 export async function prepare(action: Action, options: PrepareOptions): Promise<Prepared> {
   const config = resolveNetwork(options.network);
   const account = twinAddress(options.owner, config);
+  const validForLedgers = options.validForLedgers ?? DEFAULT_VALIDITY_LEDGERS;
+  assertValidity(validForLedgers);
   const operation = await buildOperation(action, options);
 
   const source = new Account(options.source ?? NULL_ACCOUNT, "0");
@@ -302,7 +350,8 @@ export async function prepare(action: Action, options: PrepareOptions): Promise<
   // A call that needs anyone else's authorisation, the fee payer's included,
   // is not something the owner's signature can cover: it stops here.
   const recorded = assertOnlyAccountEntries(simulation.result?.auth ?? [], account);
-  const validUntilLedger = simulation.latestLedger + (options.validForLedgers ?? DEFAULT_VALIDITY_LEDGERS);
+  const preparedAtLedger = simulation.latestLedger;
+  const validUntilLedger = preparedAtLedger + validForLedgers;
   const entry = setExpiration(recorded, validUntilLedger);
 
   return {
@@ -314,6 +363,7 @@ export async function prepare(action: Action, options: PrepareOptions): Promise<
     typedData: entryTypedData(entry, config),
     calls: renderCalls(entry),
     validUntilLedger,
+    preparedAtLedger,
   };
 }
 
@@ -489,6 +539,16 @@ export function withArgument(signed: Signed, index: number, value: xdr.ScVal): S
  */
 export function isExpired(prepared: Pick<Prepared, "validUntilLedger">, latestLedger: number): boolean {
   return latestLedger >= prepared.validUntilLedger;
+}
+
+/**
+ * Roughly how many seconds a signature is still accepted, given the latest
+ * closed ledger: `LEDGER_SECONDS` for every ledger left, and 0 from the
+ * moment `isExpired` is true. An estimate for display; ledgers do not close
+ * on a fixed clock.
+ */
+export function validForSeconds(prepared: Pick<Prepared, "validUntilLedger">, latestLedger: number): number {
+  return Math.max(0, prepared.validUntilLedger - latestLedger) * LEDGER_SECONDS;
 }
 
 /**

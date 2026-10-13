@@ -3,6 +3,7 @@ export * from "./auth";
 export * from "./evm";
 export * from "./iris";
 export * from "./networks";
+export * from "./owner";
 export * from "./read";
 export * from "./render";
 export * from "./twin";

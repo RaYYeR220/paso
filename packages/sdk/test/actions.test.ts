@@ -1,10 +1,24 @@
-import { Account, Address, Keypair, Operation, rpc, StrKey, Transaction, TransactionBuilder, xdr } from "@stellar/stellar-sdk";
+import {
+  Account,
+  Address,
+  Keypair,
+  MuxedAccount,
+  Operation,
+  rpc,
+  StrKey,
+  Transaction,
+  TransactionBuilder,
+  xdr,
+} from "@stellar/stellar-sdk";
 import { recoverTypedDataAddress, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildOperation,
+  DEFAULT_VALIDITY_LEDGERS,
   isExpired,
+  LEDGER_SECONDS,
+  MAX_VALIDITY_LEDGERS,
   prepare,
   relay,
   RelayError,
@@ -14,6 +28,7 @@ import {
   simulateSigned,
   SimulationError,
   submitWith,
+  validForSeconds,
   withArgument,
   type Action,
   type Signed,
@@ -21,12 +36,14 @@ import {
 import { AuthorizationEntriesError, authPayload, entryTypedData } from "../src/auth";
 import { renderArg } from "../src/render";
 import { twinAddress } from "../src/twin";
-import { hex, HUB, ISSUER, OTHER_KEY, OWNER, OWNER_KEY, testNetwork, USDC } from "./helpers";
+import { fromHex, hex, HUB, ISSUER, OTHER_KEY, OWNER, OWNER_KEY, testNetwork, USDC } from "./helpers";
 
 const TWIN = twinAddress(OWNER, testNetwork);
 const LATEST_LEDGER = 5_000_000;
 const NONCE = 77n;
 const EVM_RECIPIENT = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+/** `ISSUER` with the id 5 folded in: the `M…` form an exchange hands out as a deposit address. */
+const MUXED_RECIPIENT = new MuxedAccount(new Account(ISSUER, "0"), "5").accountId();
 
 function invokeArgs(operation: xdr.Operation): xdr.InvokeContractArgs {
   const { body } = operation;
@@ -187,6 +204,40 @@ describe("buildOperation", () => {
     );
   });
 
+  it("refuses a muxed recipient, which a wallet could only show as a hash", async () => {
+    expect(MUXED_RECIPIENT).toMatch(/^M[A-Z2-7]{68}$/);
+    expect(StrKey.isValidMed25519PublicKey(MUXED_RECIPIENT)).toBe(true);
+
+    const failure = await buildOperation({ kind: "transfer", to: MUXED_RECIPIENT, amount: 1n }, options).catch(
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(Error);
+    const { message } = failure as Error;
+    expect(message).toContain(MUXED_RECIPIENT);
+    expect(message).toMatch(/muxed address/);
+    expect(message).toMatch(/wallet can only show .* as a hash/);
+    expect(message).toMatch(/not accepted/);
+    expect(message).toMatch(/G… address it stands for/);
+  });
+
+  it("does not replace a muxed recipient with the address it stands for", async () => {
+    const failure = await buildOperation({ kind: "transfer", to: MUXED_RECIPIENT, amount: 1n }, options).catch(
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).not.toContain(ISSUER);
+  });
+
+  it("treats an M… address with a wrong checksum as no address at all", async () => {
+    const last = MUXED_RECIPIENT.at(-1) === "A" ? "B" : "A";
+    const damaged = `${MUXED_RECIPIENT.slice(0, -1)}${last}`;
+    expect(StrKey.isValidMed25519PublicKey(damaged)).toBe(false);
+
+    await expect(buildOperation({ kind: "transfer", to: damaged, amount: 1n }, options)).rejects.toThrow(
+      /not a Stellar address/,
+    );
+  });
+
   it("passes a generic invocation through untouched", async () => {
     const invoke: Action = {
       kind: "invoke",
@@ -210,7 +261,8 @@ describe("prepare", () => {
     expect(prepared.network).toBe("testnet");
     expect(prepared.owner).toBe(OWNER);
     expect(prepared.account).toBe(TWIN);
-    expect(prepared.validUntilLedger).toBe(LATEST_LEDGER + 120);
+    expect(prepared.preparedAtLedger).toBe(LATEST_LEDGER);
+    expect(prepared.validUntilLedger).toBe(LATEST_LEDGER + DEFAULT_VALIDITY_LEDGERS);
     expect(prepared.calls).toEqual([{ contract: USDC, fn: "transfer", args: [TWIN, ISSUER, "2500000"] }]);
     expect(prepared.typedData.message.account).toBe(TWIN);
     expect(prepared.typedData.message.calls).toEqual(prepared.calls);
@@ -228,6 +280,91 @@ describe("prepare", () => {
 
     expect(sourceOf(prepared.txXdr)).toBe(source);
     expect(prepared.validUntilLedger).toBe(LATEST_LEDGER + 30);
+  });
+
+  it("keeps a signature valid for about two minutes by default and for ten at most", () => {
+    expect(DEFAULT_VALIDITY_LEDGERS).toBe(24);
+    expect(MAX_VALIDITY_LEDGERS).toBe(120);
+    expect(LEDGER_SECONDS).toBe(5);
+    expect(DEFAULT_VALIDITY_LEDGERS * LEDGER_SECONDS).toBe(120);
+    expect(MAX_VALIDITY_LEDGERS * LEDGER_SECONDS).toBe(600);
+  });
+
+  it.each([1, DEFAULT_VALIDITY_LEDGERS, MAX_VALIDITY_LEDGERS])("accepts a validity of %d ledgers", async (ledgers) => {
+    const prepared = await prepare(transfer, { ...options, server: recordingServer(), validForLedgers: ledgers });
+    expect(prepared.validUntilLedger).toBe(LATEST_LEDGER + ledgers);
+    expect(prepared.preparedAtLedger).toBe(LATEST_LEDGER);
+  });
+
+  it.each([MAX_VALIDITY_LEDGERS + 1, 720, 17_280, 3_110_400, Number.MAX_SAFE_INTEGER])(
+    "refuses a validity of %d ledgers, naming the maximum, before the network is contacted",
+    async (ledgers) => {
+      const attempt = prepare(transfer, { ...options, server: unreachableServer, validForLedgers: ledgers });
+      await expect(attempt).rejects.toThrow(/validForLedgers/);
+      await expect(attempt).rejects.toThrow(/at most 120 ledgers/);
+      await expect(attempt).rejects.toThrow(/about 10 minutes/);
+    },
+  );
+
+  it.each([0, -1, -120, 1.5, 23.999, Number.NaN, Number.POSITIVE_INFINITY, "30", 24n, [24]])(
+    "refuses a validity of %s ledgers, which is not a positive whole number",
+    async (ledgers) => {
+      const validForLedgers = ledgers as unknown as number;
+      await expect(prepare(transfer, { ...options, server: unreachableServer, validForLedgers })).rejects.toThrow(
+        /validForLedgers must be a whole number, at least 1 and at most 120 ledgers/,
+      );
+    },
+  );
+
+  it("refuses a validity that is too long before it asks Circle for an exit fee", async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new Error("the network must not be reached");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const exit: Action = { kind: "exit", amount: 10_000_000n, recipient: EVM_RECIPIENT };
+      await expect(
+        prepare(exit, { ...options, server: unreachableServer, validForLedgers: MAX_VALIDITY_LEDGERS + 1 }),
+      ).rejects.toThrow(/at most 120 ledgers/);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("refuses a muxed recipient before the network is contacted", async () => {
+    await expect(
+      prepare({ kind: "transfer", to: MUXED_RECIPIENT, amount: 1n }, { ...options, server: unreachableServer }),
+    ).rejects.toThrow(/muxed address.*not accepted.*G… address it stands for/s);
+  });
+
+  it("never asks the network to simulate a transfer to a muxed address", async () => {
+    const server = recordingServer();
+    const muxed: Action = { kind: "transfer", to: MUXED_RECIPIENT, amount: 1n };
+    await expect(prepare(muxed, { ...options, server })).rejects.toThrow(/muxed address/);
+    expect(server.simulateTransaction).not.toHaveBeenCalled();
+  });
+
+  it("hands the wallet a String that starts with a byte-order mark byte for byte", async () => {
+    const bytes = fromHex("ef bb bf 68 69");
+    const memo: Action = { kind: "invoke", contract: USDC, fn: "note", args: [xdr.ScVal.scvString(bytes)] };
+    const prepared = await prepare(memo, { ...options, server: recordingServer() });
+
+    const [shown] = prepared.typedData.message.calls[0]!.args;
+    expect(hex(new TextEncoder().encode(shown))).toBe(hex(bytes));
+    expect(prepared.calls[0]!.args).toEqual([shown]);
+  });
+
+  it("refuses a String that is not UTF-8, which no wallet could be shown", async () => {
+    const broken: Action = {
+      kind: "invoke",
+      contract: USDC,
+      fn: "note",
+      args: [xdr.ScVal.scvString(fromHex("68 69 ff"))],
+    };
+    await expect(prepare(broken, { ...options, server: recordingServer() })).rejects.toThrow(
+      "String is not valid UTF-8 and cannot be shown in a wallet",
+    );
   });
 
   it("refuses a call that needs the source account's authorisation as well", async () => {
@@ -269,6 +406,7 @@ describe("sign", () => {
     if (credentials.signature.type !== "scvBytes") throw new Error("signature is not bytes");
     expect(`0x${hex(credentials.signature.bytes.toBytes())}`).toBe(signed.signature);
     expect(signed.txXdr).toBe(prepared.txXdr);
+    expect(signed.preparedAtLedger).toBe(LATEST_LEDGER);
   });
 
   it("refuses a signature from a wallet that does not own the account", async () => {
@@ -438,8 +576,12 @@ describe("signedFromRelayRequest", () => {
     const signed = await signedTransfer();
     const read = signedFromRelayRequest(relayRequest(signed), testNetwork);
 
-    // The carrier transaction is rebuilt, with time bounds of its own; everything it carries is the same.
-    expect({ ...read, txXdr: "" }).toEqual({ ...signed, txXdr: "" });
+    // The carrier transaction is rebuilt, with time bounds of its own, and a request does not say when it
+    // was prepared; everything else is the same.
+    const { preparedAtLedger, ...carried } = signed;
+    expect(preparedAtLedger).toBe(LATEST_LEDGER);
+    expect(read).not.toHaveProperty("preparedAtLedger");
+    expect({ ...read, txXdr: "" }).toEqual({ ...carried, txXdr: "" });
     expect(relayRequest(read)).toEqual(relayRequest(signed));
     expect(sourceOf(read.txXdr)).toBe(sourceOf(signed.txXdr));
   });
@@ -554,5 +696,41 @@ describe("isExpired", () => {
     expect(isExpired(signed, prepared.validUntilLedger - 1)).toBe(false);
     expect(isExpired(signed, prepared.validUntilLedger)).toBe(true);
     expect(isExpired(signed, prepared.validUntilLedger + 1)).toBe(true);
+  });
+});
+
+describe("validForSeconds", () => {
+  const signature = { validUntilLedger: LATEST_LEDGER + DEFAULT_VALIDITY_LEDGERS };
+
+  it.each([
+    [LATEST_LEDGER, 120],
+    [LATEST_LEDGER + 1, 115],
+    [LATEST_LEDGER + 12, 60],
+    [LATEST_LEDGER + 23, 5],
+    [LATEST_LEDGER + 24, 0],
+    [LATEST_LEDGER + 25, 0],
+    [LATEST_LEDGER + 10_000, 0],
+  ])("at ledger %d there are about %d seconds left", (latestLedger, seconds) => {
+    expect(validForSeconds(signature, latestLedger)).toBe(seconds);
+  });
+
+  it("gives a freshly prepared call the whole window", async () => {
+    const prepared = await prepare(transfer, { ...options, server: recordingServer() });
+    expect(validForSeconds(prepared, prepared.preparedAtLedger!)).toBe(DEFAULT_VALIDITY_LEDGERS * LEDGER_SECONDS);
+
+    const longest = await prepare(transfer, {
+      ...options,
+      server: recordingServer(),
+      validForLedgers: MAX_VALIDITY_LEDGERS,
+    });
+    expect(validForSeconds(longest, longest.preparedAtLedger!)).toBe(600);
+  });
+
+  it("is zero exactly when the signature is expired", () => {
+    for (let latestLedger = LATEST_LEDGER - 5; latestLedger <= signature.validUntilLedger + 5; latestLedger++) {
+      expect(validForSeconds(signature, latestLedger) === 0, `ledger ${latestLedger}`).toBe(
+        isExpired(signature, latestLedger),
+      );
+    }
   });
 });

@@ -1,5 +1,5 @@
 import { StrKey } from "@stellar/stellar-sdk";
-import { isAddress } from "viem";
+import { isAddress, type Hex } from "viem";
 import { describe, expect, it } from "vitest";
 import {
   evmAddressUrl,
@@ -8,10 +8,12 @@ import {
   networkId,
   requireHub,
   resolveNetwork,
+  saltNetwork,
   stellarAddressUrl,
   stellarTxUrl,
 } from "../src/networks";
 import { twinAddress } from "../src/twin";
+import { typedData } from "../src/typedData";
 import mainnetDeployment from "../../../deployments/mainnet.json";
 import testnetDeployment from "../../../deployments/testnet.json";
 
@@ -134,5 +136,60 @@ describe("networks", () => {
     expect(evmAddressUrl("0x036CbD53842c5426634e7929541eC2318f3dCF7e", "testnet")).toBe(
       "https://sepolia.basescan.org/address/0x036CbD53842c5426634e7929541eC2318f3dCF7e",
     );
+  });
+});
+
+describe("saltNetwork", () => {
+  const TESTNET_ID = "0xcee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472";
+  const MAINNET_ID = "0x7ac33997544e3175d266bd022439b22cdb16508c01163f26e5cb2a3e1045a979";
+
+  it("names the network a salt stands for", () => {
+    expect(saltNetwork(TESTNET_ID)).toBe("testnet");
+    expect(saltNetwork(MAINNET_ID)).toBe("mainnet");
+  });
+
+  it.each(Object.values(NETWORKS))("names $name from its own network id", ({ name }) => {
+    expect(saltNetwork(networkId(name))).toBe(name);
+  });
+
+  it("reads the hex in any case", () => {
+    expect(saltNetwork(`0x${TESTNET_ID.slice(2).toUpperCase()}`)).toBe("testnet");
+    expect(saltNetwork(MAINNET_ID.toUpperCase().replace("0X", "0x") as Hex)).toBe("mainnet");
+    expect(saltNetwork(MAINNET_ID.toUpperCase() as Hex)).toBe("mainnet");
+  });
+
+  it("names the network of the typed data a wallet is asked to sign", () => {
+    const account = "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
+    const payload = `0x${"00".repeat(32)}` as const;
+    for (const { name } of Object.values(NETWORKS)) {
+      expect(saltNetwork(typedData({ account, calls: [], payload, network: name }).domain.salt)).toBe(name);
+    }
+  });
+
+  it.each([
+    ["the zero salt", `0x${"00".repeat(32)}`],
+    ["an id with one digit changed", `${TESTNET_ID.slice(0, -1)}3`],
+    ["an id cut short", TESTNET_ID.slice(0, -2)],
+    ["an id with a byte added", `${MAINNET_ID}00`],
+    ["an id without 0x", MAINNET_ID.slice(2)],
+    ["an id with a space after it", `${MAINNET_ID} `],
+    ["the name of a network", "mainnet"],
+    ["nothing", ""],
+  ])("knows no network for %s", (_name, salt) => {
+    expect(saltNetwork(salt as Hex)).toBeNull();
+  });
+
+  it("knows no network for the id of a passphrase it does not list", () => {
+    const futurenet = {
+      ...NETWORKS.testnet,
+      stellar: { ...NETWORKS.testnet.stellar, networkPassphrase: "Test SDF Future Network ; October 2022" },
+    };
+    expect(saltNetwork(networkId(futurenet))).toBeNull();
+  });
+
+  it("knows no network for a salt that is not text", () => {
+    for (const salt of [undefined, null, 5, {}, ["0x00"]]) {
+      expect(saltNetwork(salt as unknown as Hex)).toBeNull();
+    }
   });
 });

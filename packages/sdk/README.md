@@ -40,11 +40,19 @@ const { hash } = await relay(signed, "https://example.org/api/relay");
 
 | Action | What runs on Stellar |
 |---|---|
-| `{ kind: "transfer", to, amount }` | USDC `transfer(account, to, amount)`. `to` is `G…`, `C…`, or `0x…` for the Stellar account of that Ethereum address. |
+| `{ kind: "transfer", to, amount }` | USDC `transfer(account, to, amount)`. `to` is `G…`, `C…`, or `0x…` for the Stellar account of that Ethereum address. A muxed `M…` address is refused: a wallet could only show it as a hash. |
 | `{ kind: "exit", amount, recipient }` | `hub.exit(account, amount, domain, recipient, max_fee, min_finality_threshold)`: USDC leaves for `recipient` on Base. Optional `destinationDomain`, `maxFee`, `minFinalityThreshold`. |
 | `{ kind: "invoke", contract, fn, args }` | Any contract function that asks the account for authorisation. |
 
-`prepare(action, { owner, network })` returns plain JSON: `{ network, owner, account, txXdr, entries, typedData, calls, validUntilLedger }`. `entries` holds exactly one authorisation entry, the account's: a call that also needs the authorisation of anyone else, the fee payer included, is refused at this point. The signature is accepted up to and including `validUntilLedger` (about ten minutes by default; set `validForLedgers` to change it). `isExpired(prepared, latestLedger)` tells when to prepare again.
+`prepare(action, { owner, network })` returns plain JSON: `{ network, owner, account, txXdr, entries, typedData, calls, validUntilLedger, preparedAtLedger }`. `entries` holds exactly one authorisation entry, the account's: a call that also needs the authorisation of anyone else, the fee payer included, is refused at this point.
+
+### How long a signature lasts
+
+The signature is accepted up to and including `validUntilLedger`. By default that is `DEFAULT_VALIDITY_LEDGERS` (24 ledgers, about two minutes) after `preparedAtLedger`, the latest ledger when the call was simulated. `validForLedgers` changes it, up to `MAX_VALIDITY_LEDGERS` (120 ledgers, about ten minutes). `prepare` refuses a longer validity, and one that is not a positive whole number, before it contacts the network.
+
+`isExpired(prepared, latestLedger)` tells when to prepare again. `validForSeconds(prepared, latestLedger)` gives roughly how many seconds are left, counting `LEDGER_SECONDS` (5) for each ledger, and 0 once the signature is expired.
+
+Until its last valid ledger a signature can be submitted by anyone who holds it, and a transaction that fails does not use it up. After a failed attempt, send the same signed call again while it is valid. Signing a second one leaves two live signatures for one payment, and both can land.
 
 ## What the wallet signs
 
@@ -71,6 +79,27 @@ Arguments are rendered by `renderArg`:
 | anything else (Vec, Map, u256, …) | `xdr:` and the lowercase hex sha256 of the value's XDR |
 
 `typedData(...)` and `digest(...)` build and hash this structure directly; `renderCalls(entry)` turns an authorisation entry into the `calls` list.
+
+The account hashes the bytes of a `String` or `Symbol` as they are, so the text keeps every byte, a leading byte-order mark included. Bytes that are not valid UTF-8 cannot be handed to a wallet, and `prepare` refuses such a call.
+
+### What the text does not say
+
+The signed text has no types and is not escaped. The number `5` and the string `5` look the same. A `String` can hold a line break, a strkey, or text that reads like `fn: transfer`. A value bound by hash cannot be read at all.
+
+`describeCalls(entry)` lists the same calls as `renderCalls`, in the same order and with the same text, and adds what the text leaves out: `{ contract, fn, fnConcerns, args }`, each argument as `{ text, type, hashed, concerns }`. `type` is the Soroban type in a word (`address`, `i128`, `string`, `bytes`, …; for a hashed value its kind: `vec`, `map`, `u256`, `muxed address`, …). `describeArg(value)` describes one value and `textConcerns(text)` checks any string.
+
+| Concern | Reported for |
+|---|---|
+| `control` | A control character: U+0000–U+001F except `\n` and `\r`, and U+007F–U+009F. |
+| `newline` | A line break: `\n`, `\r`, U+0085, U+2028, U+2029. U+0085 is reported as `control` too. |
+| `bidi` | A character that changes the direction of text: U+202A–U+202E, U+2066–U+2069, U+200E, U+200F, U+061C. |
+| `invisible` | A character that takes no room: U+200B–U+200D, U+2060, U+FEFF, U+00AD, U+180E. |
+| `looks_like_field` | Text shaped like another line of the message: `fn`, `contract`, `account`, `args`, `payload` or `calls`, quoted or not, followed by `:` or `=`. |
+| `looks_like_address` | Text that is or contains the shape of a strkey or of an Ethereum address. A real address argument renders the same. |
+| `looks_like_hash` | Text that contains `xdr:` and 64 hex digits, or is `0x` and whole hex bytes, as bytes are shown. |
+| `hashed` | The value is `xdr:<sha256>`: bound by the signature, not readable. |
+
+The first seven apply to `String` and `Symbol` arguments and to function names, and come in this order. They are shapes, not proofs: a look-alike letter from another alphabet is not caught. None of this is signed. It is for a front end to show next to the wallet prompt.
 
 ## Funding from Base
 
@@ -140,6 +169,30 @@ These simulate a read and need no account or fee:
 - `isDeployed(owner, network)`: whether the owner's account contract exists yet.
 - `readContract(contract, fn, args, network)`: any read-only contract function.
 
+## Is the owner a key?
+
+An account obeys one thing: a signature from the key of its owner address. An Ethereum address that is a contract (a Safe, a smart wallet) has no private key, so the Stellar account derived from it can receive USDC and never spend it. Nobody can tell the two apart by looking at the address.
+
+```ts
+import { ownerKind } from "@paso/sdk";
+
+const { kind, chains } = await ownerKind(owner);
+// kind: "wallet" | "contract" | "unknown"
+// chains: [{ name: "Ethereum", chainId: 1, code: "none" }, …]
+```
+
+`ownerKind(address, options)` asks Ethereum mainnet, Base and Base Sepolia (`OWNER_CHAINS`) for the code at the address, all at once and each for at most 6 seconds.
+
+| `kind` | Meaning |
+|---|---|
+| `contract` | At least one chain has contract code at the address. Whatever is sent to its account stays there. |
+| `unknown` | No chain has contract code there, and at least one failed or timed out. |
+| `wallet` | Every chain answered and none has contract code. An EIP-7702 delegation (`0xef0100` and an address) counts as a wallet: the address still has its key. |
+
+`wallet` means "no code found", not proof of a key. A smart account that has not been deployed yet has no code on any chain.
+
+Options: `chains` (each `{ chain, rpcUrls }`; the endpoints are tried in order, the chain's public one when none is given), `timeoutMs`, `signal`, and `getCode(chain, address)` to read through your own client. A network failure never throws; it shows as `unknown`. `codeKind(code)` classifies one `eth_getCode` answer as `none`, `delegated` or `contract`.
+
 ## Showing the refusal
 
 `withArgument(signed, index, value)` returns the signed call with one argument replaced in the call and in the authorisation entry alike, and the signature left as it was. It is the change a dishonest relayer or front end would have to make. The account rebuilds the signed text from what is about to run, so `simulateSigned` and any relayer refuse the result, and on chain the transaction fails with the account's `BadSignature` error.
@@ -162,11 +215,14 @@ const network = { ...NETWORKS.testnet, stellar: { ...NETWORKS.testnet.stellar, r
 
 Contract ids come from `deployments/<network>.json` at build time. Deriving an account on a network where the hub is not deployed throws. `stellarTxUrl`, `stellarAddressUrl`, `evmTxUrl` and `evmAddressUrl` build explorer links.
 
+`networkId(network)` is the 32-byte id that salts the signing domain, and `saltNetwork(salt)` goes the other way: `"testnet"`, `"mainnet"`, or `null` for any other salt. The salt is the only readable field of a signing request that says which network it is for, so show its name next to the wallet prompt.
+
 ## Limits
 
-- Externally owned accounts only: a smart-contract wallet cannot produce the 65-byte signature the account checks.
+- Externally owned accounts only: a smart-contract wallet cannot produce the 65-byte signature the account checks, and USDC sent to the account of such an address cannot be moved again. `ownerKind` looks before you send.
 - One signature covers one authorisation tree. A call that needs the account to authorise two unrelated trees is refused.
-- Vec, Map and other nested values are bound by hash, not shown as text.
+- Vec, Map and other nested values are bound by hash, not shown as text. `describeCalls` marks them as `hashed`.
+- `prepare` keeps the validity of a signature to `MAX_VALIDITY_LEDGERS` at most. The account does not: a request built another way can carry any expiry, and the wallet prompt does not show it. The account has no function to revoke a signature before it expires.
 
 ## Develop
 

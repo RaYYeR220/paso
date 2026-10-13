@@ -27,17 +27,42 @@ interface Write {
   account: { address: string };
 }
 
-function clients({ allowance = 0n, burnStatus = "success" }: { allowance?: bigint; burnStatus?: string } = {}) {
+interface Chain {
+  /** The allowance before any approval. */
+  allowance?: bigint;
+  burnStatus?: string;
+  /** How many reads after the approval still show the old allowance: a reader that has not caught up. */
+  staleReads?: number;
+  /** What asking for the burn does, attempt after attempt; a plain success once they run out. */
+  burns?: (Error | "sent")[];
+}
+
+function clients({ allowance = 0n, burnStatus = "success", staleReads = 0, burns = [] }: Chain = {}) {
   const writes: Write[] = [];
+  let approved: bigint | undefined;
+  let stale = staleReads;
   const walletClient = {
     account: { address: PAYER, type: "json-rpc" },
     writeContract: vi.fn(async (request: Write) => {
       writes.push(request);
-      return request.functionName === "approve" ? APPROVE_HASH : BURN_HASH;
+      if (request.functionName === "approve") {
+        approved = request.args[1] as bigint;
+        return APPROVE_HASH;
+      }
+      const outcome = burns.shift();
+      if (outcome instanceof Error) throw outcome;
+      return BURN_HASH;
     }),
   };
   const publicClient = {
-    readContract: vi.fn(async () => allowance),
+    readContract: vi.fn(async () => {
+      if (approved === undefined) return allowance;
+      if (stale > 0) {
+        stale -= 1;
+        return allowance;
+      }
+      return approved;
+    }),
     waitForTransactionReceipt: vi.fn(async ({ hash }: { hash: Hex }) => ({
       status: hash === BURN_HASH ? burnStatus : "success",
     })),
@@ -133,6 +158,71 @@ describe("fundFromEvm", () => {
     });
     expect(mocks.publicClient.waitForTransactionReceipt).toHaveBeenNthCalledWith(1, { hash: APPROVE_HASH });
     expect(result.approveTxHash).toBe(APPROVE_HASH);
+  });
+
+  describe("right after an approval", () => {
+    const notYet = () =>
+      Object.assign(new Error("Execution reverted with reason: ERC20: transfer amount exceeds allowance."), { code: -32603 });
+    const short = { ...base, route: "direct" } as const;
+
+    it("waits until the approval shows before it asks for the burn", async () => {
+      vi.useFakeTimers();
+      try {
+        const { walletClient, publicClient, writes } = clients({ staleReads: 3 });
+        const funding = fundFromEvm({ ...short, walletClient, publicClient });
+
+        await vi.advanceTimersByTimeAsync(2_500);
+        expect(writes.map((write) => write.functionName)).toEqual(["approve"]);
+        await vi.advanceTimersByTimeAsync(2_000);
+
+        await expect(funding).resolves.toMatchObject({ burnTxHash: BURN_HASH, approveTxHash: APPROVE_HASH });
+        expect(writes.map((write) => write.functionName)).toEqual(["approve", "depositForBurn"]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("asks for the burn again, after a pause, when the wallet's side has not seen the approval yet", async () => {
+      vi.useFakeTimers();
+      try {
+        const { walletClient, publicClient, writes } = clients({ burns: [notYet(), notYet()] });
+        const funding = fundFromEvm({ ...short, walletClient, publicClient });
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        await expect(funding).resolves.toMatchObject({ burnTxHash: BURN_HASH });
+        expect(writes.map((write) => write.functionName)).toEqual(["approve", "depositForBurn", "depositForBurn", "depositForBurn"]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("gives up after three tries, with the wallet's own words", async () => {
+      vi.useFakeTimers();
+      try {
+        const { walletClient, publicClient, writes } = clients({ burns: [notYet(), notYet(), notYet(), notYet()] });
+        const funding = fundFromEvm({ ...short, walletClient, publicClient }).catch((error: unknown) => error);
+        await vi.advanceTimersByTimeAsync(20_000);
+
+        expect(await funding).toMatchObject({ message: expect.stringContaining("exceeds allowance") });
+        expect(writes.filter((write) => write.functionName === "depositForBurn")).toHaveLength(3);
+        expect(writes.filter((write) => write.functionName === "approve")).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not ask twice for any other refusal, or when it made no approval itself", async () => {
+      const declined = Object.assign(new Error("User rejected the request."), { code: 4001 });
+      const rejecting = clients({ burns: [declined] });
+      await expect(fundFromEvm({ ...short, walletClient: rejecting.walletClient, publicClient: rejecting.publicClient })).rejects.toBe(declined);
+      expect(rejecting.writes.filter((write) => write.functionName === "depositForBurn")).toHaveLength(1);
+
+      const approvedBefore = clients({ allowance: 5_000_000n, burns: [notYet()] });
+      await expect(
+        fundFromEvm({ ...short, walletClient: approvedBefore.walletClient, publicClient: approvedBefore.publicClient }),
+      ).rejects.toThrow(/exceeds allowance/);
+      expect(approvedBefore.writes.map((write) => write.functionName)).toEqual(["depositForBurn"]);
+    });
   });
 
   it("asks Iris for the fast-transfer fee when no maximum is given", async () => {

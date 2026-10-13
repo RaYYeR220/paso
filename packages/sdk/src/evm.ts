@@ -189,8 +189,37 @@ async function confirmed(publicClient: EvmReader, hash: Hex, what: string, confi
 }
 
 /**
+ * An approval that has just been mined is not yet known to every node. A
+ * burn asked for at that moment can reach one that still sees the old
+ * allowance, and be turned down as exceeding it before anything is sent.
+ * So the burn waits until the reader shows the approval, and a wallet whose
+ * own endpoint is a step behind is asked again after a pause, a few times.
+ */
+const APPROVAL_POLL_MS = 1_000;
+const APPROVAL_POLLS = 15;
+const BURN_ATTEMPTS = 3;
+const BURN_RETRY_MS = 2_500;
+
+const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Everything an error and its causes say, for telling one refusal from another. */
+function wordsOf(error: unknown): string {
+  const parts: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; depth < 8 && typeof current === "object" && current !== null; depth += 1) {
+    const { shortMessage, details, message, cause } = current as Record<string, unknown>;
+    for (const part of [shortMessage, details, message]) if (typeof part === "string") parts.push(part);
+    current = cause;
+  }
+  return parts.join(" ");
+}
+
+const SHORT_ALLOWANCE = /exceeds allowance|insufficient allowance/i;
+
+/**
  * Sends USDC from Base to the Stellar account of `owner`: approves Circle's
- * TokenMessenger when the allowance is short, then burns with a fast transfer.
+ * TokenMessenger when the allowance is short, waits for the approval to be
+ * seen, then burns with a fast transfer.
  *
  * The USDC appears on Stellar once the burn is attested and delivered there;
  * see `waitForAttestation` and `deliverOperation`.
@@ -217,12 +246,14 @@ export async function fundFromEvm(args: FundFromEvmArgs): Promise<FundFromEvmRes
   }
 
   let approveTxHash: Hex | undefined;
-  const allowance = await publicClient.readContract({
-    address: usdc,
-    abi: erc20Abi,
-    functionName: "allowance",
-    args: [account.address, tokenMessenger],
-  });
+  const readAllowance = () =>
+    publicClient.readContract({
+      address: usdc,
+      abi: erc20Abi,
+      functionName: "allowance",
+      args: [account.address, tokenMessenger],
+    });
+  const allowance = await readAllowance();
   if (allowance < amount) {
     approveTxHash = await walletClient.writeContract({
       address: usdc,
@@ -233,21 +264,24 @@ export async function fundFromEvm(args: FundFromEvmArgs): Promise<FundFromEvmRes
       account,
     });
     await confirmed(publicClient, approveTxHash, "approval");
+    for (let poll = 0; poll < APPROVAL_POLLS && (await readAllowance()) < amount; poll += 1) {
+      await pause(APPROVAL_POLL_MS);
+    }
   }
 
-  let burnTxHash: Hex;
-  if (route === "forwarder") {
-    const forwarder = toHex(StrKey.decodeContract(config.stellar.forwarder));
-    burnTxHash = await walletClient.writeContract({
-      address: tokenMessenger,
-      abi: tokenMessengerAbi,
-      functionName: "depositForBurnWithHook",
-      args: [amount, destinationDomain, forwarder, usdc, forwarder, maxFee, FAST_FINALITY, forwardRecipientHookData(twin)],
-      chain,
-      account,
-    });
-  } else {
-    burnTxHash = await walletClient.writeContract({
+  const burn = (): Promise<Hex> => {
+    if (route === "forwarder") {
+      const forwarder = toHex(StrKey.decodeContract(config.stellar.forwarder));
+      return walletClient.writeContract({
+        address: tokenMessenger,
+        abi: tokenMessengerAbi,
+        functionName: "depositForBurnWithHook",
+        args: [amount, destinationDomain, forwarder, usdc, forwarder, maxFee, FAST_FINALITY, forwardRecipientHookData(twin)],
+        chain,
+        account,
+      });
+    }
+    return walletClient.writeContract({
       address: tokenMessenger,
       abi: tokenMessengerAbi,
       functionName: "depositForBurn",
@@ -255,6 +289,19 @@ export async function fundFromEvm(args: FundFromEvmArgs): Promise<FundFromEvmRes
       chain,
       account,
     });
+  };
+
+  let burnTxHash: Hex;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      burnTxHash = await burn();
+      break;
+    } catch (error) {
+      // Turned down for the allowance right after this call approved it: the approval has not reached that node yet.
+      const behind = approveTxHash !== undefined && SHORT_ALLOWANCE.test(wordsOf(error));
+      if (!behind || attempt === BURN_ATTEMPTS) throw error;
+      await pause(BURN_RETRY_MS);
+    }
   }
   await confirmed(publicClient, burnTxHash, "burn");
 

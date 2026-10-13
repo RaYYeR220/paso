@@ -116,6 +116,21 @@ export function networkId(network: Network): Hex {
   return toHex(hash(resolveNetwork(network).stellar.networkPassphrase));
 }
 
+/**
+ * The network a signing domain's salt stands for: the name of the network
+ * whose network id equals it, hex compared in any case, or `null` when it is
+ * the id of no network listed here.
+ *
+ * The salt is the only readable field of a signing request that says which
+ * network it is for.
+ */
+export function saltNetwork(salt: Hex): NetworkName | null {
+  if (typeof salt !== "string") return null;
+  const wanted = salt.toLowerCase();
+  const names = Object.keys(NETWORKS) as NetworkName[];
+  return names.find((name) => networkId(name) === wanted) ?? null;
+}
+
 /** The hub contract id, or a clear error when Paso is not deployed on the network. */
 export function requireHub(network: Network): string {
   const { name, stellar } = resolveNetwork(network);
