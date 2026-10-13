@@ -362,6 +362,54 @@ const cases: Case[] = [
       },
     ],
   },
+  {
+    name: "string_with_byte_order_mark",
+    network: "testnet",
+    privateKey: KEY_A,
+    owner: OWNER_A,
+    account: ACCOUNT_A,
+    calls: [
+      {
+        contract: OTHER_CONTRACT,
+        fn: "set_label",
+        args: [
+          arg(xdr.ScVal.scvString(Buffer.from([0xef, 0xbb, 0xbf, 0x68, 0x69])), "﻿hi"),
+          arg(string("hi"), "hi"),
+        ],
+      },
+    ],
+  },
+  {
+    name: "string_multibyte_and_newline",
+    network: "testnet",
+    privateKey: KEY_A,
+    owner: OWNER_A,
+    account: ACCOUNT_A,
+    calls: [
+      {
+        contract: OTHER_CONTRACT,
+        fn: "set_label",
+        args: [arg(string("línea 1\nlínea 2"), "línea 1\nlínea 2")],
+      },
+    ],
+  },
+  {
+    name: "longest_symbol_and_empty_bytes",
+    network: "testnet",
+    privateKey: KEY_A,
+    owner: OWNER_A,
+    account: ACCOUNT_A,
+    calls: [
+      {
+        contract: OTHER_CONTRACT,
+        fn: "tag",
+        args: [
+          arg(symbol("a_symbol_of_exactly_32_chars_max"), "a_symbol_of_exactly_32_chars_max"),
+          arg(bytes(""), "0x"),
+        ],
+      },
+    ],
+  },
 ];
 
 const passphrases = { testnet: TESTNET, mainnet: MAINNET };

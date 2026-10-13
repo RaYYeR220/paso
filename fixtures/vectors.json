@@ -405,6 +405,82 @@
       ],
       "digest": "0xf87ec658e788b294cb3f3d841f579c1971e6229f175f6f44fbcdba01f935027a",
       "signature": "0x5d5b8a162a425cace4b83a0dc51f8adbf2bcde214fa5bb1260500c4c01b40e3d0899adff7860adf6a0b5861100d393b621ec51188b52c012ffb85276f2ad3d701b"
+    },
+    {
+      "name": "string_with_byte_order_mark",
+      "network": "testnet",
+      "networkPassphrase": "Test SDF Network ; September 2015",
+      "networkId": "0xcee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
+      "owner": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+      "privateKey": "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "account": "CCQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2CNSG",
+      "payload": "0x91133a8706747ab2356848f7b07bc654b390d25434c26033b10ee6b506c0a18b",
+      "calls": [
+        {
+          "contract": "CDKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJJM5",
+          "fn": "set_label",
+          "argsXdr": [
+            "AAAADgAAAAXvu79oaQAAAA==",
+            "AAAADgAAAAJoaQAA"
+          ],
+          "argsText": [
+            "﻿hi",
+            "hi"
+          ]
+        }
+      ],
+      "digest": "0x7a90b8df98fffd7464dc9f1f018e2019d0473ac00879ba21132f3b7f4fc7bb5f",
+      "signature": "0xacde73c4619370eafc37f4f8667b10c46f466bbfd10b40ae154e351cdb96b4e23c67ea998baf2e96c0e40bf2a9125da896006f5c47f162d6eef8f389834482111b"
+    },
+    {
+      "name": "string_multibyte_and_newline",
+      "network": "testnet",
+      "networkPassphrase": "Test SDF Network ; September 2015",
+      "networkId": "0xcee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
+      "owner": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+      "privateKey": "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "account": "CCQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2CNSG",
+      "payload": "0xa2bad729b4ddcb80b22e2bb0e31cb1d5cffec1d3c8358405e82b54ca110936ff",
+      "calls": [
+        {
+          "contract": "CDKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJJM5",
+          "fn": "set_label",
+          "argsXdr": [
+            "AAAADgAAABFsw61uZWEgMQpsw61uZWEgMgAAAA=="
+          ],
+          "argsText": [
+            "línea 1\nlínea 2"
+          ]
+        }
+      ],
+      "digest": "0x17608fb9c28ca742994792f38d0827208c5382ba74386b69fd2156d04d399f73",
+      "signature": "0x20d23e88d8d0f0afd86fad83a58273c371b55ae9fbe20694262cc1a2bff64c736daf6167a7207e800fbedede9955a48052acc007fa398c5cbb31e19c48a244841b"
+    },
+    {
+      "name": "longest_symbol_and_empty_bytes",
+      "network": "testnet",
+      "networkPassphrase": "Test SDF Network ; September 2015",
+      "networkId": "0xcee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
+      "owner": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+      "privateKey": "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "account": "CCQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2DINBUGQ2CNSG",
+      "payload": "0xf3a8e94fa5a401cc9de2d856100b77d02403609cc1ca9a494f4f52a3027d6724",
+      "calls": [
+        {
+          "contract": "CDKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJVGU2TKNJJM5",
+          "fn": "tag",
+          "argsXdr": [
+            "AAAADwAAACBhX3N5bWJvbF9vZl9leGFjdGx5XzMyX2NoYXJzX21heA==",
+            "AAAADQAAAAA="
+          ],
+          "argsText": [
+            "a_symbol_of_exactly_32_chars_max",
+            "0x"
+          ]
+        }
+      ],
+      "digest": "0x20e89bdcb03956b5d99daa497d7528ff4341aa218da25fd809e1e636fcc50a22",
+      "signature": "0xa549611ca2edef29ff9833cefe48e3700a91f54b2c8025a64700d7b11e2734430c11fa7dd7d074346f04202821a16a24d03b764ce55ad0de6efacb2f0c227e6b1c"
     }
   ]
 }
