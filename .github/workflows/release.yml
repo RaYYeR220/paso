@@ -1,0 +1,62 @@
+# Attested builds of both contracts, made when a v* tag is pushed.
+#
+# Each job runs the StellarExpert build workflow (SEP-55) for one contract. It
+# builds the contract with `stellar contract build`, writes
+# `source_repo=github:<this repository>` into the wasm, publishes the wasm as a
+# GitHub release named after the tag, the package and the CLI version, records
+# a GitHub build attestation for it and reports its hash to StellarExpert.
+#
+# A contract deployed from one of these release files can be traced by anyone:
+# the code on chain names this repository, and the attestation for its hash
+# names the commit and the workflow run that built it. `stellar contract info
+# build --id <contract>` and the contract page on stellar.expert both show it.
+#
+# The contracts on chain today were deployed before this workflow existed, from
+# a build without the `source_repo` entry. A release made here is 49 bytes
+# longer and has another hash, so it does not verify them: they stay unverified
+# on stellar.expert unless contracts are deployed again from a release file.
+# What ties the deployed code to this source is the contracts job in ci.yml,
+# which rebuilds that code byte for byte on every push.
+#
+# The build workflow is pinned to its commit tagged v28.1.0, which installs
+# stellar-cli 28.1.0. The Rust compiler is the one rust-toolchain.toml names:
+# while that says stable, it is the newest stable release on the day of the run.
+#
+# The tags of the releases start with v as well. They are created with the
+# workflow's own token, which does not start another run.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  id-token: write # signs the build attestation
+  contents: write # creates the release and its tag
+  attestations: write # stores the attestation
+
+jobs:
+  # `package` is the crate name. `relative_path` is left out because the Cargo
+  # workspace is the repository root, and `make_target` because neither
+  # contract needs another one built first.
+  account:
+    name: Account contract
+    uses: stellar-expert/soroban-build-workflow/.github/workflows/release.yml@6b16426dd3a61715ddddf83a2df322a6371fe071 # v28.1.0
+    with:
+      release_name: ${{ github.ref_name }}
+      release_description: "Paso account contract. Attested build of the tagged source."
+      package: paso-account
+    secrets:
+      release_token: ${{ secrets.GITHUB_TOKEN }}
+
+  hub:
+    name: Hub contract
+    uses: stellar-expert/soroban-build-workflow/.github/workflows/release.yml@6b16426dd3a61715ddddf83a2df322a6371fe071 # v28.1.0
+    with:
+      release_name: ${{ github.ref_name }}
+      release_description: "Paso hub contract. Attested build of the tagged source."
+      package: paso-hub
+    secrets:
+      release_token: ${{ secrets.GITHUB_TOKEN }}

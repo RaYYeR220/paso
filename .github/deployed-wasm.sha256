@@ -1,0 +1,11 @@
+# Code of the Paso contracts as it runs on Stellar testnet and mainnet.
+# One line per contract: SHA-256, two spaces, path from the repository root.
+#
+#   stellar contract build && sha256sum --check .github/deployed-wasm.sha256
+#
+# Built with rustc 1.99.0 and stellar-cli 28.1.0. CI builds with the same two
+# versions and fails when its result differs from these lines. After a
+# redeploy, replace the hashes here; if the compiler or the CLI changed too,
+# update their versions at the top of .github/workflows/ci.yml.
+2ee1ac08ca6407667db15bcffe75c8cbb4e41d95b2d047541b5dad133cfe75ee  target/wasm32v1-none/release/paso_account.wasm
+aeaa1c72f607071fd1f383638fa0c850df1c15bd051b3e1061ac57bc0e46b045  target/wasm32v1-none/release/paso_hub.wasm

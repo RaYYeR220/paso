@@ -1,5 +1,7 @@
 # Paso
 
+[![CI](https://github.com/RaYYeR220/paso/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/RaYYeR220/paso/actions/workflows/ci.yml)
+
 **Every Ethereum address already has a Stellar account.**
 
 Live on testnet: **https://paso-stellar.vercel.app** — [try it without a wallet](https://paso-stellar.vercel.app/app?demo=1), or see [every claim with its transaction](https://paso-stellar.vercel.app/proof).
@@ -135,6 +137,7 @@ The account contract never sees the JSON. It receives the calls from the host an
 
 **Mainnet: Stellar public network and Base**
 
+- The deployed contract code is rebuilt byte for byte on every push: CI builds both contracts on Linux and fails unless their hashes equal the ones on chain ([hashes](.github/deployed-wasm.sha256), [workflow](.github/workflows/ci.yml)). They are not shown as verified on stellar.expert: the deployed code carries no `source_repo` entry, and adding one means redeploying.
 - Hub contract: [`CDZCHMNS…AB7LJK`](https://stellar.expert/explorer/public/contract/CDZCHMNSAAIST5K2DNP4DP6H3DE4UJISUOMDFQTKD7IK6CD477AB7LJK), deployed in [`9285fcdb…`](https://stellar.expert/explorer/public/tx/9285fcdb5d3f065c196816810ff6af1ff453ece88824e5775bd4602154082426).
 - Account code: wasm hash `2ee1ac08ca6407667db15bcffe75c8cbb4e41d95b2d047541b5dad133cfe75ee`, the same as on testnet, uploaded in [`eb90e5f9…`](https://stellar.expert/explorer/public/tx/eb90e5f911d097cbbaf724bed6ab670a7a2cf3843c4a1ffb89397ce34ce05135). Hub code uploaded in [`c3eca151…`](https://stellar.expert/explorer/public/tx/c3eca151541a5e66d2d7679a37492686cd5dd46a1c5f7c66c1f9f8bcb6139161).
 - Account of `0x20806157d9607050204bbbCd37CE71498B35D46c`: [`CBWU43ND…XEZ7EPX`](https://stellar.expert/explorer/public/contract/CBWU43NDIBPC6SD2WKVNJH6A5ROHGMSDJWAVLCO3RITO5Q264XEZ7EPX). It received USDC in [`a742bf77…`](https://stellar.expert/explorer/public/tx/a742bf77748cc1d2fb25347996dea79fa4e3827d7005cf6391588874a44fe1a0) and was deployed later, in [`8da9a459…`](https://stellar.expert/explorer/public/tx/8da9a45941d661070efbbf0c0276f7d483488ce2e5003e478dc1f0feef57b6ea).

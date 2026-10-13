@@ -1,0 +1,127 @@
+# Builds and tests the Ethereum signature verifier for OpenZeppelin smart
+# accounts in verifiers/, on every push and pull request to main.
+#
+# The verifier is a Cargo workspace of its own with a JavaScript helper that
+# installs with npm. It has this workflow to itself, so its result never
+# changes the result of CI, and CI's never changes this one.
+#
+#   contract   builds the verifier with the compiler and the Stellar CLI the
+#              contracts are built with, prints the hash of the wasm and runs
+#              the tests of both crates
+#   helper     runs the tests of the JavaScript helper
+#
+# No job uses a secret. The testnet demo (`npm run demo`) needs a funded
+# account and does not run here.
+
+name: Verifier
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verifier-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The same versions as in ci.yml. RUSTUP_TOOLCHAIN takes precedence over
+  # verifiers/rust-toolchain.toml, which follows stable.
+  RUSTUP_TOOLCHAIN: "1.99.0"
+  STELLAR_CLI_VERSION: "28.1.0"
+  # SHA-256 of the stellar binary in stellar-cli-28.1.0-x86_64-unknown-linux-gnu.tar.gz.
+  STELLAR_CLI_SHA256: fd19fdafe58f8004d296a1829362e2c780a25303da04f73f4efd3dcb22e1209f
+  NODE_VERSION: "24"
+
+jobs:
+  contract:
+    name: Contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: verifiers
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target wasm32v1-none --no-self-update
+          rustc --version --verbose
+          cargo --version
+
+      # Downloaded crates and what cargo builds for the host. The wasm output
+      # is not cached.
+      - name: Restore the cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            verifiers/target/debug
+            verifiers/target/release
+          key: cargo-verifier-${{ runner.os }}-${{ runner.arch }}-rust-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('verifiers/Cargo.lock') }}
+          restore-keys: |
+            cargo-verifier-${{ runner.os }}-${{ runner.arch }}-rust-${{ env.RUSTUP_TOOLCHAIN }}-
+
+      - name: Restore the Stellar CLI
+        id: stellar-cli
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/stellar
+          key: stellar-cli-${{ env.STELLAR_CLI_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      # The official installer: downloads the release binary and verifies its
+      # build attestation.
+      - name: Install the Stellar CLI
+        if: steps.stellar-cli.outputs.cache-hit != 'true'
+        uses: stellar/stellar-cli@c0f4d0da891bbf214c08b8c5035ae6db80e9a3bd # v28.1.0
+        with:
+          version: ${{ env.STELLAR_CLI_VERSION }}
+
+      # Downloaded or restored, the binary has to be the one pinned above.
+      - name: Check the Stellar CLI
+        run: |
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$STELLAR_CLI_SHA256  $HOME/.local/bin/stellar" | sha256sum --check
+          "$HOME/.local/bin/stellar" --version
+
+      - name: Build the verifier
+        run: |
+          stellar contract build --locked
+          sha256sum target/wasm32v1-none/release/*.wasm
+
+      # The tests load the wasm built above.
+      - name: Test the verifier
+        run: cargo test --locked
+
+  helper:
+    name: JavaScript helper
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: verifiers/evm/js
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: verifiers/evm/js/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test the helper
+        run: npm test

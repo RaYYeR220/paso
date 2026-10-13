@@ -1,0 +1,251 @@
+# Builds and tests the contracts, the SDK and the app on every push and pull
+# request to main. The verifier in verifiers/ has a workflow of its own,
+# verifier.yml.
+#
+#   contracts     builds both contracts with the compiler and the Stellar CLI
+#                 the deployed code was built with, fails unless the result is
+#                 byte for byte the deployed code, then runs the contract tests
+#   sdk           builds and type-checks the SDK, runs its tests that need no
+#                 network
+#   sdk-testnet   the SDK's read-only checks against the public testnet RPC;
+#                 it is allowed to fail without failing the run
+#   web           runs the app's tests that need no network, then builds the app
+#
+# The deployed code was built on macOS. A Linux build with the same compiler
+# and CLI gives the same bytes, which is what the contracts job checks on every
+# run.
+#
+# No job uses a secret. Tests that need a key or a funded account do not run
+# here: the SDK's two signing tests (PASO_E2E_OWNER_KEY, PASO_E2E_SOURCE_SECRET),
+# the app's testnet suites (RELAYER_SECRET, PASO_E2E_OWNER_KEY,
+# DEMO_PAYER_PRIVATE_KEY) and its smoke test (PASO_SMOKE_URL). The summaries of
+# the sdk and web jobs list the suites they skipped.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The compiler and the Stellar CLI that built the deployed contracts. Another
+  # version of either can produce other bytes, so both are exact. RUSTUP_TOOLCHAIN
+  # takes precedence over rust-toolchain.toml, which follows stable.
+  RUSTUP_TOOLCHAIN: "1.99.0"
+  STELLAR_CLI_VERSION: "28.1.0"
+  # SHA-256 of the stellar binary in stellar-cli-28.1.0-x86_64-unknown-linux-gnu.tar.gz.
+  STELLAR_CLI_SHA256: fd19fdafe58f8004d296a1829362e2c780a25303da04f73f4efd3dcb22e1209f
+  NODE_VERSION: "24"
+
+jobs:
+  contracts:
+    name: Contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target wasm32v1-none --no-self-update
+          rustc --version --verbose
+          cargo --version
+
+      # Downloaded crates and what cargo builds for the host: build scripts,
+      # macros, the test binaries. The wasm output is not cached, so every run
+      # compiles the contracts and their dependencies to wasm from nothing.
+      - name: Restore the cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/debug
+            target/release
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-rust-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-rust-${{ env.RUSTUP_TOOLCHAIN }}-
+
+      - name: Restore the Stellar CLI
+        id: stellar-cli
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/stellar
+          key: stellar-cli-${{ env.STELLAR_CLI_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      # The official installer: downloads the release binary and verifies its
+      # build attestation.
+      - name: Install the Stellar CLI
+        if: steps.stellar-cli.outputs.cache-hit != 'true'
+        uses: stellar/stellar-cli@c0f4d0da891bbf214c08b8c5035ae6db80e9a3bd # v28.1.0
+        with:
+          version: ${{ env.STELLAR_CLI_VERSION }}
+
+      # Downloaded or restored, the binary has to be the one pinned above.
+      - name: Check the Stellar CLI
+        run: |
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$STELLAR_CLI_SHA256  $HOME/.local/bin/stellar" | sha256sum --check
+          "$HOME/.local/bin/stellar" --version
+
+      - name: Build the contracts
+        id: build
+        run: stellar contract build --locked
+
+      - name: Keep the built wasm
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: contracts-wasm
+          path: target/wasm32v1-none/release/*.wasm
+          if-no-files-found: error
+          overwrite: true
+
+      # Prints the size, the SHA-256, the embedded metadata and the wasm
+      # sections of each contract, and fails unless each is byte for byte the
+      # code listed in .github/deployed-wasm.sha256. Between changing a
+      # contract and deploying it, set the repository variable
+      # PASO_ALLOW_WASM_DRIFT to 1: the difference is still printed, as a
+      # warning.
+      - name: Compare the build with the deployed code
+        env:
+          PASO_ALLOW_WASM_DRIFT: ${{ vars.PASO_ALLOW_WASM_DRIFT }}
+        run: bash .github/scripts/check-wasm.sh
+
+      # Reads the code hashes from mainnet and testnet. Fails when a network
+      # answers with a hash other than the listed one. A network that does not
+      # answer leaves a warning.
+      - name: Compare the listed hashes with the chain
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: bash .github/scripts/check-wasm.sh chain
+
+      # The hub's tests load the account wasm built above.
+      - name: Test the contracts
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: cargo test --locked
+
+  sdk:
+    name: SDK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Installs the pnpm version named in package.json.
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the SDK
+        run: pnpm build:sdk
+
+      - name: Type-check the SDK
+        run: pnpm --filter @paso/sdk typecheck
+
+      - name: Test without a network
+        env:
+          PASO_OFFLINE: "1"
+        run: >-
+          pnpm test:sdk
+          --reporter=default --reporter=github-actions
+          --reporter=json --outputFile.json="$RUNNER_TEMP/tests.json"
+
+      - name: List what was skipped
+        if: ${{ !cancelled() }}
+        run: bash .github/scripts/skipped-tests.sh "$RUNNER_TEMP/tests.json" "SDK tests, no network"
+
+  # Read-only checks against the hub and an account on testnet, through the
+  # public RPC. They need no key. The public RPC and testnet itself are outside
+  # this repository, so this job is allowed to fail without failing the run.
+  sdk-testnet:
+    name: SDK against testnet (not required)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test against testnet
+        run: >-
+          pnpm test:sdk test/integration.test.ts
+          --reporter=default --reporter=github-actions
+          --reporter=json --outputFile.json="$RUNNER_TEMP/tests.json"
+
+      - name: List what was skipped
+        if: ${{ !cancelled() }}
+        run: bash .github/scripts/skipped-tests.sh "$RUNNER_TEMP/tests.json" "SDK against testnet"
+
+  web:
+    name: App
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The app imports the SDK from its built output.
+      - name: Build the SDK
+        id: sdk
+        run: pnpm build:sdk
+
+      - name: Test without a network
+        env:
+          PASO_OFFLINE: "1"
+        run: >-
+          pnpm test:web
+          --reporter=default --reporter=github-actions
+          --reporter=json --outputFile.json="$RUNNER_TEMP/tests.json"
+
+      - name: List what was skipped
+        if: ${{ !cancelled() }}
+        run: bash .github/scripts/skipped-tests.sh "$RUNNER_TEMP/tests.json" "App tests, no network"
+
+      # Runs whether or not the tests passed. The build downloads the app's
+      # fonts from Google Fonts.
+      - name: Build the app
+        if: ${{ !cancelled() && steps.sdk.outcome == 'success' }}
+        run: pnpm --filter @paso/web build
