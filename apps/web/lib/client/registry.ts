@@ -1,12 +1,23 @@
-import { erc20Abi, isDeployed, isReceivedOnEvm, twinAddress, usdcBalance, type NetworkName } from "@paso/sdk";
-import { createPublicClient, http, type Address, type PublicClient } from "viem";
+import {
+  defaultFinalityOf,
+  erc20Abi,
+  fetchBurnFee,
+  isDeployed,
+  isReceivedOnEvm,
+  twinAddress,
+  usdcBalance,
+  type EvmChainName,
+  type NetworkName,
+} from "@paso/sdk";
+import { createPublicClient, fallback, http, type Address, type PublicClient } from "viem";
 import { createActionController, type ActionController } from "./action/controller";
 import { loadChainActivity, type ChainActivity } from "./activity/events";
 import { activityLogKey, createActivityLog, type ActivityLog } from "./activity/log";
 import { createApi, type HealthResponse, type PasoApi } from "./api";
+import { chainOf } from "./chains";
 import { networkConfig, ROUTES, stellarServer } from "./config";
 import { resolveEnsName } from "./ens";
-import { askExit, createExitWatcher, exitStorageKey, isHubExit, type BaseReader, type ExitWatcher } from "./exit";
+import { askExit, createExitWatcher, exitStorageKey, isHubExit, type ChainReader, type ExitWatcher } from "./exit";
 import { createFundingController, type FundingController } from "./funding/controller";
 import { burnCeiling } from "./funding/limits";
 import { checkOwner } from "./ownerCheck";
@@ -25,7 +36,9 @@ import { browserStorage } from "./storage";
  */
 
 const TWIN_REFRESH_MS = 10_000;
-const BASE_BALANCE_REFRESH_MS = 15_000;
+const WALLET_BALANCE_REFRESH_MS = 15_000;
+/** Circle changes its fees rarely: once a few minutes is often enough to show the one in force. */
+const BURN_FEE_REFRESH_MS = 5 * 60_000;
 const ACTIVITY_REFRESH_MS = 20_000;
 const HEALTH_REFRESH_MS = 30_000;
 
@@ -50,12 +63,13 @@ const apis = perNetwork<PasoApi>((network) => createApi({ network }));
 /** The app's routes, for one network: every request it sends names that network. */
 export const apiFor = (network: NetworkName): PasoApi => apis(network, "");
 
-const readers = perNetwork<PublicClient>((network) =>
-  createPublicClient({ chain: networkConfig(network).evm.chain, transport: http() }),
-);
+const readers = perNetwork<PublicClient>((network, name) => {
+  const { chain, rpcUrls } = chainOf(networkConfig(network), name as EvmChainName);
+  return createPublicClient({ chain, transport: fallback(rpcUrls.map((url) => http(url))) });
+});
 
-/** A reader for a network's Base, over the chain's public endpoint. */
-export const baseReaderFor = (network: NetworkName): PublicClient => readers(network, "");
+/** A reader for one EVM chain of a network, over the public endpoints the SDK lists for it. */
+export const evmReaderFor = (network: NetworkName, chain: EvmChainName): PublicClient => readers(network, chain);
 
 /** What the network says about an account. */
 export interface TwinReading {
@@ -117,28 +131,47 @@ const activities = perNetwork<Resource<ChainActivity>>((network, twin) => {
   return createResource(() => loadChainActivity(twin, config, stellarServer(config)), { intervalMs: ACTIVITY_REFRESH_MS });
 });
 
-/** USDC an address holds on a network's Base, in 6-decimal units: what its wallet could bring over. */
-const baseBalances = perNetwork<Resource<bigint>>((network, owner) =>
-  createResource(
-    () =>
-      baseReaderFor(network).readContract({
-        address: networkConfig(network).evm.usdc,
-        abi: erc20Abi,
-        functionName: "balanceOf",
-        args: [owner as Address],
-      }),
-    { intervalMs: BASE_BALANCE_REFRESH_MS },
-  ),
-);
+/** What a wallet holds on one EVM chain, in that chain's units. */
+export interface WalletBalance {
+  /** USDC, 6 decimals: what the wallet could bring over. */
+  usdc: bigint;
+  /** The gas token, 18 decimals. On Arc it is the same USDC counted natively, and `usdc` is what to show. */
+  gas: bigint;
+}
 
-/** What the exit watcher reads from a network's Base: whether a message was received, and what became of a mint. */
-function baseReads(network: NetworkName): BaseReader {
+const walletBalances = perNetwork<Resource<WalletBalance>>((network, id) => {
+  const [name, owner] = id.split(":") as [EvmChainName, Address];
+  const reader = evmReaderFor(network, name);
+  const { usdc } = chainOf(networkConfig(network), name);
+  return createResource(
+    async () => {
+      const [held, gas] = await Promise.all([
+        reader.readContract({ address: usdc, abi: erc20Abi, functionName: "balanceOf", args: [owner] }),
+        reader.getBalance({ address: owner }),
+      ]);
+      return { usdc: held, gas };
+    },
+    { intervalMs: WALLET_BALANCE_REFRESH_MS },
+  );
+});
+
+/** Circle's fee, in basis points, for a burn from a chain to Stellar at the finality the app asks for there. */
+const burnFees = perNetwork<Resource<number>>((network, name) => {
+  const config = networkConfig(network);
+  const chain = chainOf(config, name as EvmChainName);
+  return createResource(() => fetchBurnFee(chain.name, "stellar", config, { finalityThreshold: defaultFinalityOf(chain) }), {
+    intervalMs: BURN_FEE_REFRESH_MS,
+  });
+});
+
+/** What the exit watcher reads from the chains: whether a message was received, and what became of a mint. */
+function chainReads(network: NetworkName): ChainReader {
   const config = networkConfig(network);
   return {
-    isReceived: (message) => isReceivedOnEvm(baseReaderFor(network), message, config),
-    async receipt(hash) {
+    isReceived: (message, chain) => isReceivedOnEvm(evmReaderFor(network, chain), message, config, chain),
+    async receipt(hash, chain) {
       try {
-        const { status } = await baseReaderFor(network).getTransactionReceipt({ hash });
+        const { status } = await evmReaderFor(network, chain).getTransactionReceipt({ hash });
         return status === "success" ? "success" : "reverted";
       } catch {
         return null;
@@ -151,9 +184,9 @@ const exits = perNetwork<ExitWatcher>((network, owner) => {
   const config = networkConfig(network);
   return createExitWatcher({
     network,
-    ask: (txHash, signal) =>
-      askExit(txHash, { url: ROUTES.complete, network, signal, accepts: (message) => isHubExit(message, config) }),
-    base: baseReads(network),
+    ask: (txHash, signal, chain) =>
+      askExit(txHash, { url: ROUTES.complete, network, signal, accepts: (message) => isHubExit(message, config, chain) }),
+    reader: chainReads(network),
     storage: browserStorage(),
     storageKey: exitStorageKey(network, owner),
   });
@@ -164,7 +197,11 @@ export const actionFor = (network: NetworkName, owner: Address): ActionControlle
 export const exitWatcherFor = (network: NetworkName, owner: Address): ExitWatcher => exits(network, ownerKey(owner));
 export const twinReadingFor = (network: NetworkName, owner: Address): Resource<TwinReading> => twins(network, ownerKey(owner));
 export const chainActivityFor = (network: NetworkName, twin: string): Resource<ChainActivity> => activities(network, twin);
-export const baseBalanceFor = (network: NetworkName, owner: Address): Resource<bigint> => baseBalances(network, ownerKey(owner));
+/** What `owner` holds on one chain of a network: USDC, and the gas token. */
+export const walletBalanceFor = (network: NetworkName, chain: EvmChainName, owner: Address): Resource<WalletBalance> =>
+  walletBalances(network, `${chain}:${ownerKey(owner)}`);
+/** Circle's fee for bringing USDC from `chain` to Stellar, in basis points. */
+export const burnFeeFor = (network: NetworkName, chain: EvmChainName): Resource<number> => burnFees(network, chain);
 
 let health: Resource<HealthResponse> | undefined;
 

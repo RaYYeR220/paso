@@ -1,4 +1,5 @@
 import {
+  DEFAULT_EVM_CHAIN,
   DEFAULT_VALIDITY_LEDGERS,
   describeCalls,
   entryTypedData,
@@ -285,6 +286,7 @@ export function createActionController(owner: Address, deps: ActionDeps): Action
       amount: amount === null ? null : amount.toString(),
       counterparty:
         request.kind === "invoke" ? request.contract : ((request.kind === "exit" ? recipient?.evm : recipient?.stellar) ?? null),
+      ...(request.kind === "exit" ? { chain: request.chain ?? DEFAULT_EVM_CHAIN } : {}),
       at: now(),
       ...(request.kind === "invoke" && entry.kind !== "refused" ? { note: request.fn } : {}),
       ...entry,

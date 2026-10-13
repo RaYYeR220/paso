@@ -5,7 +5,8 @@ import { AppScreen } from "./AppScreen";
 
 export const metadata: Metadata = {
   title: "Account",
-  description: "Bring USDC from Base, send it on Stellar, and watch the account contract check every signature.",
+  description:
+    "Bring USDC from Base, Ethereum, Arbitrum, OP Mainnet or Arc, send it on Stellar, and watch the account contract check every signature.",
 };
 
 /** The sheet before the browser has said which network it is on and who is connected. */

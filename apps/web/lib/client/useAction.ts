@@ -19,7 +19,7 @@ import { actionFor, refreshAccount } from "./registry";
 import { rememberKeyProven, useSigner } from "./signer";
 import { createStore, noSubscription } from "./store";
 
-/** Having the connected owner's account do something on one network: a transfer, a withdrawal to Base, or any contract call. */
+/** Having the connected owner's account do something on one network: a transfer, a withdrawal to an EVM chain, or any contract call. */
 export interface ActionFlow {
   /**
    * The state machine: idle → preparing → review → signing → relaying →

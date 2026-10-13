@@ -4,6 +4,8 @@ import {
   formatEvmAmount,
   toStellarUnits,
   twinAddress,
+  type EvmChainConfig,
+  type EvmChainName,
   type EvmReader,
   type FundFromEvmArgs,
   type FundFromEvmResult,
@@ -13,10 +15,11 @@ import {
 import type { Address, Hex, PublicClient, WalletClient } from "viem";
 import type { ActivityLog, LogStatus } from "../activity/log";
 import type { DeclineReason, DeliverResponse, PasoApi } from "../api";
-import { describeError, describeFailure, type ProblemError } from "../errors";
+import { chainOf, FAUCET_CHAIN, gasSymbol, storedChain } from "../chains";
+import { describeError, describeFailure, type ChainContext, type ProblemError } from "../errors";
 import { readJson, removeKey, writeJson, type KeyValueStore } from "../storage";
 import { after, createStore, sleep, type Listener } from "../store";
-import { ceilingProblem } from "./limits";
+import { ceilingProblem, gasReserve } from "./limits";
 import {
   fundingReducer,
   IDLE_FUNDING,
@@ -29,25 +32,28 @@ import {
   type Transfer,
 } from "./machine";
 
-/** The clients a burn from the owner's wallet needs: the wallet on Base, and a reader for Base. */
+/** The clients a burn from the owner's wallet needs: the wallet on the chain the USDC leaves, and a reader for that chain. */
 export interface EvmClients {
   walletClient: WalletClient;
   publicClient: EvmReader & Pick<PublicClient, "readContract">;
 }
 
 export type FundingRequest =
-  /** The testnet faucet pays: nothing to sign, nothing to hold. */
+  /** The testnet faucet pays, on Base Sepolia: nothing to sign, nothing to hold. */
   | { via: "demo" }
-  /** The connected wallet pays. `amount` is USDC in Base's 6-decimal units. */
-  | { via: "wallet"; amount: bigint; clients: () => Promise<EvmClients> };
+  /**
+   * The connected wallet pays, on `chain`. `amount` is USDC in 6-decimal
+   * units. `clients` puts the wallet on that chain.
+   */
+  | { via: "wallet"; chain: EvmChainName; amount: bigint; clients: () => Promise<EvmClients> };
 
 export interface FundingDeps {
-  /** The network the transfer is on: its Base, its Stellar account, its relayer. */
+  /** The network the transfer is on: its EVM chains, its Stellar account, its relayer. */
   network: NetworkConfig;
   /** The routes of that same network. */
   api: Pick<PasoApi, "demoFund" | "deliver">;
   storage: KeyValueStore | null;
-  /** The most one transfer from a wallet may bring over, in Base's 6-decimal units. `null` or absent for no ceiling. */
+  /** The most one transfer from a wallet may bring over, in 6-decimal units. `null` or absent for no ceiling. */
   ceiling?: bigint | null;
   /** The session log of an account, so a transfer shows up in its activity. */
   log?: (twin: string) => Pick<ActivityLog, "put"> | null;
@@ -83,10 +89,11 @@ export interface FundingController {
    */
   start(request: FundingRequest): Promise<void>;
   /**
-   * Follows a burn that already happened. Returns false when the hash is not
-   * one, a transfer is in flight, or another burn is on record.
+   * Follows a burn that already happened on `chain`, Base unless named.
+   * Returns false when the hash is not one, a transfer is in flight, or
+   * another burn is on record.
    */
-  resume(burnTxHash: Hex): boolean;
+  resume(burnTxHash: Hex, chain?: EvmChainName): boolean;
   /** Picks up the burn on record: the one in flight when the page was last open. */
   restore(): boolean;
   /** After a failure: follows the burn on record again. */
@@ -119,11 +126,16 @@ export function fundingStorageKey(network: NetworkName, owner: Address): string 
 
 const isTxHash = (value: unknown): value is Hex => typeof value === "string" && /^0x[0-9a-fA-F]{64}$/.test(value);
 
-function isTransfer(value: unknown, network: NetworkName, owner: Address): value is Transfer {
-  if (typeof value !== "object" || value === null) return false;
+/**
+ * A stored transfer of this network and owner, or `null`. A record kept
+ * before the chain could be chosen names none: it was a burn on Base, and is
+ * read as one. A record that names a chain has to carry that chain's domain.
+ */
+export function readTransfer(value: unknown, network: NetworkConfig, owner: Address): Transfer | null {
+  if (typeof value !== "object" || value === null) return null;
   const transfer = value as Record<string, unknown>;
-  return (
-    transfer.network === network &&
+  const valid =
+    transfer.network === network.name &&
     isTxHash(transfer.burnTxHash) &&
     Number.isInteger(transfer.sourceDomain) &&
     typeof transfer.owner === "string" &&
@@ -131,9 +143,15 @@ function isTransfer(value: unknown, network: NetworkName, owner: Address): value
     typeof transfer.twin === "string" &&
     (transfer.amount === null || (typeof transfer.amount === "string" && /^\d+$/.test(transfer.amount))) &&
     (transfer.via === "wallet" || transfer.via === "demo") &&
-    typeof transfer.startedAt === "number"
-  );
+    typeof transfer.startedAt === "number";
+  const chain = storedChain(transfer.chain, network);
+  if (!valid || !chain) return null;
+  if (transfer.chain !== undefined && chainOf(network, chain).cctpDomain !== transfer.sourceDomain) return null;
+  return { ...(transfer as unknown as Transfer), chain };
 }
+
+/** How a failure on an EVM chain names the chain and its gas. */
+const contextOf = (chain: EvmChainConfig): ChainContext => ({ chain: chain.label, gas: gasSymbol(chain) });
 
 function failure(
   code: FundingFailureCode,
@@ -194,8 +212,11 @@ function heldBy(error: unknown): DeclineReason | undefined {
   return reason;
 }
 
-/** What a failed question to the delivery route means for the transfer. */
-function deliveryFailure(error: unknown): { permanent: boolean; reason: FundingFailure; retryAfterMs?: number; held?: DeclineReason } {
+/** What a failed question to the delivery route means for a transfer from `chainLabel`. */
+function deliveryFailure(
+  error: unknown,
+  chainLabel: string,
+): { permanent: boolean; reason: FundingFailure; retryAfterMs?: number; held?: DeclineReason } {
   const problem = describeFailure(error);
   const said = problem.detail ?? problem.message;
   if (problem.code === "bad_request") {
@@ -209,7 +230,7 @@ function deliveryFailure(error: unknown): { permanent: boolean; reason: FundingF
   }
   return {
     permanent: false,
-    reason: failure("unavailable", "The delivery service is not answering. The burn is safe on Base.", true, problem),
+    reason: failure("unavailable", `The delivery service is not answering. The burn is safe on ${chainLabel}.`, true, problem),
     ...(problem.retryAfterSeconds ? { retryAfterMs: problem.retryAfterSeconds * 1000 } : {}),
     ...(heldBy(error) ? { held: heldBy(error) } : {}),
   };
@@ -231,16 +252,18 @@ function observeWrites(walletClient: WalletClient, report: (step: RequestStep, h
 }
 
 /**
- * The inbound flow of one owner: burn on Base (the wallet's, or the
- * faucet's), then follow the burn until the USDC is minted on Stellar.
+ * The inbound flow of one owner: burn on an EVM chain (the wallet's, on the
+ * chain it chose, or the faucet's, on Base Sepolia), then follow the burn
+ * until the USDC is minted on Stellar.
  *
  * A burn is money in transit, so it goes on record the moment its hash is
  * known and stays there until the USDC is delivered or the owner says to stop
  * tracking it. No outage, reload, second click or reset takes it off, and
  * neither does a relayer that is not delivering for now.
  *
- * Everything here belongs to one network: the Base the USDC leaves, the
+ * Everything here belongs to one network: the chains the USDC leaves, the
  * account it is for, the routes that are asked and the record that is kept.
+ * A transfer keeps the chain it left, so a reload follows it there.
  */
 export function createFundingController(owner: Address, deps: FundingDeps): FundingController {
   const { network, api, storage } = deps;
@@ -270,14 +293,14 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
       amount: transfer.amount === null ? null : toStellarUnits(BigInt(transfer.amount)).toString(),
       counterparty: null,
       at: transfer.startedAt,
-      baseTxHash: transfer.burnTxHash,
+      chain: transfer.chain,
+      evmTxHash: transfer.burnTxHash,
       ...(stellarTxHash ? { stellarTxHash } : {}),
     });
   }
 
   function stored(): Transfer | null {
-    const value = readJson<unknown>(storage, key);
-    return isTransfer(value, network.name, owner) ? value : null;
+    return readTransfer(readJson<unknown>(storage, key), network, owner);
   }
 
   const onRecord = (): Transfer | null => inFlight ?? stored();
@@ -322,7 +345,7 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
       } catch (error) {
         cancelSlow();
         if (!live()) return;
-        const { permanent, reason, retryAfterMs, held } = deliveryFailure(error);
+        const { permanent, reason, retryAfterMs, held } = deliveryFailure(error, chainOf(network, transfer.chain).label);
         errors += 1;
         if (permanent) {
           tracking = null;
@@ -369,6 +392,7 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
       const funded = await api.demoFund(owner);
       const transfer: Transfer = {
         network: network.name,
+        chain: FAUCET_CHAIN,
         burnTxHash: funded.burnTxHash,
         sourceDomain: funded.sourceDomain,
         owner,
@@ -381,16 +405,18 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
       remember(transfer);
       return transfer;
     } catch (error) {
-      dispatch({ type: "FAILED", reason: faucetFailure(error, network.evm.chain.name), at: now() });
+      dispatch({ type: "FAILED", reason: faucetFailure(error, chainOf(network, FAUCET_CHAIN).label), at: now() });
       return null;
     }
   }
 
   async function burnFromWallet(request: Extract<FundingRequest, { via: "wallet" }>): Promise<Transfer | null> {
     const { amount } = request;
-    const { chain, usdc, cctpDomain } = network.evm;
+    const source = chainOf(network, request.chain);
+    const { usdc, cctpDomain } = source;
     const transferFor = (burnTxHash: Hex): Transfer => ({
       network: network.name,
+      chain: source.name,
       burnTxHash,
       sourceDomain: cctpDomain,
       owner,
@@ -419,10 +445,13 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
           functionName: "balanceOf",
           args: [payer],
         });
-        if (held < amount) {
+        // Where gas is paid in USDC, the approval and the burn come out of the same balance as the amount.
+        const reserve = gasReserve(source);
+        if (held < amount + reserve) {
+          const needs = `this transfer needs ${formatEvmAmount(amount)}${reserve > 0n ? `, and the gas comes out of the same USDC` : ""}`;
           const reason = failure(
             "insufficient_usdc",
-            `The wallet holds ${formatEvmAmount(held)} USDC on ${chain.name}; this transfer needs ${formatEvmAmount(amount)}.`,
+            `The wallet holds ${formatEvmAmount(held)} USDC on ${source.label}; ${needs}.`,
             false,
           );
           dispatch({ type: "FAILED", reason, at: now() });
@@ -433,7 +462,7 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
       const observed = observeWrites(walletClient, (step, hash) => {
         prompt.step = step;
         if (step === "confirming" && hash) {
-          // On record from the moment Base has the burn: a reload while it confirms loses nothing.
+          // On record from the moment the chain has the burn: a reload while it confirms loses nothing.
           sent = transferFor(hash);
           remember(sent);
           dispatch({ type: "STEP", step, burnTxHash: hash });
@@ -441,13 +470,13 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
           dispatch({ type: "STEP", step, ...(step === "approved" && hash ? { approveTxHash: hash } : {}) });
         }
       });
-      const burned = await fund({ walletClient: observed, publicClient, amount, owner, network });
+      const burned = await fund({ walletClient: observed, publicClient, amount, owner, network, chain: source.name });
       return sent ?? transferFor(burned.burnTxHash);
     } catch (error) {
-      const problem = describeError(error);
+      const problem = describeError(error, contextOf(source));
       const burn: Transfer | null = sent;
       if (burn) {
-        // Base has the transaction. Only a revert means it burned nothing; anything else is followed.
+        // The chain has the transaction. Only a revert means it burned nothing; anything else is followed.
         if (problem.kind === "error" && problem.code === "reverted") {
           forget();
           dispatch({ type: "FAILED", reason: walletFailure(problem), at: now() });
@@ -484,25 +513,31 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
     follow(transfer);
   }
 
-  function resume(burnTxHash: Hex): boolean {
+  function resume(burnTxHash: Hex, chain: EvmChainName = FAUCET_CHAIN): boolean {
     if (!isTxHash(burnTxHash) || starting || isFundingActive(store.get())) return false;
     const known = onRecord();
     if (known && !sameBurn(known, burnTxHash)) return false;
-    const transfer: Transfer =
-      known
-        ? known
-        : {
-            network: network.name,
-            burnTxHash,
-            sourceDomain: network.evm.cctpDomain,
-            owner,
-            twin: twinAddress(owner, network),
-            amount: null,
-            via: "wallet",
-            startedAt: now(),
-          };
+    const transfer = known ?? burnElsewhere(burnTxHash, chain);
+    if (!transfer) return false;
     begin(transfer, "RESUMED");
     return true;
+  }
+
+  /** A burn this page did not make, on a chain the network lists, to be followed from now on. */
+  function burnElsewhere(burnTxHash: Hex, chain: EvmChainName): Transfer | null {
+    const source = storedChain(chain, network);
+    if (!source) return null;
+    return {
+      network: network.name,
+      chain: source,
+      burnTxHash,
+      sourceDomain: chainOf(network, source).cctpDomain,
+      owner,
+      twin: twinAddress(owner, network),
+      amount: null,
+      via: "wallet",
+      startedAt: now(),
+    };
   }
 
   return {
@@ -517,6 +552,7 @@ export function createFundingController(owner: Address, deps: FundingDeps): Fund
         dispatch({
           type: "REQUEST",
           via: request.via,
+          chain: request.via === "wallet" ? request.chain : FAUCET_CHAIN,
           owner,
           amount: request.via === "wallet" ? request.amount.toString() : null,
           at: now(),

@@ -2,6 +2,7 @@ export { AccountPair, type AccountPairProps } from "./AccountPair";
 export { ActivityList, type ActivityItem, type ActivityListProps } from "./ActivityList";
 export { AppShell, type AppShellProps } from "./AppShell";
 export { CAUTION_COPY, Cautions, type CautionKind, type CautionsProps } from "./Cautions";
+export { ChainChoice, type ChainChoiceOption, type ChainChoiceProps } from "./ChainChoice";
 export { Chrome, type ChromeProps } from "./Chrome";
 export { FundPanel, type FundPanelProps } from "./FundPanel";
 export { MainnetConfirm, MainnetStrip, type MainnetConfirmProps } from "./Mainnet";

@@ -39,6 +39,7 @@ import {
 
 const transfer: Transfer = {
   network: "testnet",
+  chain: "base",
   burnTxHash: BURN,
   sourceDomain: 6,
   owner: owner.address,
@@ -54,7 +55,7 @@ function run(events: FundingEvent[], from: FundingState = IDLE_FUNDING): Funding
   return events.reduce(fundingReducer, from);
 }
 
-const request: FundingEvent = { type: "REQUEST", via: "wallet", owner: owner.address, amount: "10000000", at: 500 };
+const request: FundingEvent = { type: "REQUEST", via: "wallet", chain: "base", owner: owner.address, amount: "10000000", at: 500 };
 
 describe("fundingReducer", () => {
   it("walks the whole way from idle to minted", () => {
@@ -100,10 +101,10 @@ describe("fundingReducer", () => {
   });
 
   it("fails from any phase in flight and keeps the burn it knows", () => {
-    expect(run([request, { type: "FAILED", reason: unavailable, at: 7 }])).toEqual({ phase: "failed", reason: unavailable, failedAt: 7 });
+    expect(run([request, { type: "FAILED", reason: unavailable, at: 7 }])).toEqual({ phase: "failed", reason: unavailable, chain: "base", failedAt: 7 });
     for (const before of [[], [{ type: "PENDING", attestation: "pending" }], [{ type: "DELIVERING" }]] as FundingEvent[][]) {
       const state = run([request, { type: "BURNED", transfer }, ...before, { type: "FAILED", reason: unavailable, at: 7 }]);
-      expect(state).toEqual({ phase: "failed", reason: unavailable, transfer, failedAt: 7 });
+      expect(state).toEqual({ phase: "failed", reason: unavailable, transfer, chain: "base", failedAt: 7 });
     }
   });
 
@@ -154,10 +155,11 @@ describe("fundingReducer", () => {
 });
 
 describe("trackerStages", () => {
-  const statuses = (state: FundingState) => trackerStages(state).map((stage) => stage.status);
+  const statuses = (state: FundingState) => trackerStages(state, "Base").map((stage) => stage.status);
 
-  it("uses Circle's words", () => {
-    expect(trackerStages(IDLE_FUNDING).map((stage) => stage.label)).toEqual(["Burned on Base", "Attested by Circle", "Minted on Stellar"]);
+  it("uses Circle's words, with the chain the USDC leaves", () => {
+    expect(trackerStages(IDLE_FUNDING, "Base").map((stage) => stage.label)).toEqual(["Burned on Base", "Attested by Circle", "Minted on Stellar"]);
+    expect(trackerStages(IDLE_FUNDING, "Arbitrum")[0]?.label).toBe("Burned on Arbitrum");
   });
 
   it("moves one step at a time", () => {
@@ -238,7 +240,8 @@ describe("funding with the faucet", () => {
       kind: "receive",
       status: "done",
       amount: "10000000",
-      baseTxHash: BURN,
+      chain: "base",
+      evmTxHash: BURN,
       stellarTxHash: STELLAR_HASH,
     });
   });
@@ -551,6 +554,7 @@ describe("resuming after a reload", () => {
     await until(() => controller.getState().phase === "attesting", "attesting");
     expect(JSON.parse(h.storage.getItem(key) ?? "null")).toEqual({
       network: "testnet",
+      chain: "base",
       burnTxHash: BURN,
       sourceDomain: 6,
       owner: owner.address,
@@ -643,7 +647,7 @@ describe("funding from the wallet", () => {
       steps.push(state.phase === "requesting" ? state.step : state.phase);
     });
 
-    await controller.start({ via: "wallet", amount: 10_000_000n, clients });
+    await controller.start({ via: "wallet", chain: "base", amount: 10_000_000n, clients });
     await until(() => controller.getState().phase === "minted", "minted");
 
     expect(steps).toEqual(["starting", "approving", "approved", "burning", "confirming", "burned", "minted"]);
@@ -662,7 +666,7 @@ describe("funding from the wallet", () => {
       stored = h.storage.getItem(key);
       return forever<FundFromEvmResult>().then(() => ({ burnTxHash, route: "forwarder", twin, maxFee: 0n }));
     };
-    void h.make({ fund }).start({ via: "wallet", amount: 10_000_000n, clients });
+    void h.make({ fund }).start({ via: "wallet", chain: "base", amount: 10_000_000n, clients });
     await until(() => stored !== "unset", "the burn to be sent");
     expect(JSON.parse(stored ?? "null")).toMatchObject({ burnTxHash: BURN, amount: "10000000", via: "wallet" });
 
@@ -675,7 +679,7 @@ describe("funding from the wallet", () => {
     const h = harness();
     const { clients, fund } = wallet({ write: async () => Promise.reject(rejection()) });
     const controller = h.make({ fund });
-    await controller.start({ via: "wallet", amount: 10_000_000n, clients });
+    await controller.start({ via: "wallet", chain: "base", amount: 10_000_000n, clients });
     expect(controller.getState()).toEqual({ phase: "idle", notice: "cancelled" });
     expect(h.storage.getItem(key)).toBeNull();
     expect(h.log.entries.size).toBe(0);
@@ -685,7 +689,7 @@ describe("funding from the wallet", () => {
     const h = harness();
     const { clients, fund, writeContract } = wallet({ balance: 2_500_000n });
     const controller = h.make({ fund });
-    await controller.start({ via: "wallet", amount: 10_000_000n, clients });
+    await controller.start({ via: "wallet", chain: "base", amount: 10_000_000n, clients });
     const state = controller.getState();
     expect(state).toMatchObject({ phase: "failed", reason: { code: "insufficient_usdc" } });
     expect(state.phase === "failed" && state.reason.message).toBe("The wallet holds 2.5 USDC on Base Sepolia; this transfer needs 10.");
@@ -696,6 +700,7 @@ describe("funding from the wallet", () => {
     const wrongChain = harness().make();
     await wrongChain.start({
       via: "wallet",
+      chain: "base",
       amount: 1n,
       clients: () => Promise.reject(Object.assign(new Error("Unrecognized chain ID"), { code: 4902 })),
     });
@@ -703,7 +708,7 @@ describe("funding from the wallet", () => {
 
     const { clients, fund } = wallet({ write: async () => Promise.reject(new Error("insufficient funds for gas * price + value")) });
     const noGas = harness().make({ fund });
-    await noGas.start({ via: "wallet", amount: 1n, clients });
+    await noGas.start({ via: "wallet", chain: "base", amount: 1n, clients });
     expect(noGas.getState()).toMatchObject({ phase: "failed", reason: { code: "insufficient_gas" } });
   });
 
@@ -716,7 +721,7 @@ describe("funding from the wallet", () => {
       throw new Error("fetch failed");
     };
     const controller = h.make({ fund });
-    await controller.start({ via: "wallet", amount: 10_000_000n, clients });
+    await controller.start({ via: "wallet", chain: "base", amount: 10_000_000n, clients });
     await until(() => controller.getState().phase === "attesting", "attesting");
     expect(controller.getState()).toMatchObject({ phase: "attesting", transfer: { burnTxHash: BURN, amount: "10000000" } });
     expect(JSON.parse(h.storage.getItem(key) ?? "null")).toMatchObject({ burnTxHash: BURN });
@@ -731,7 +736,7 @@ describe("funding from the wallet", () => {
       },
     });
     const controller = h.make({ fund });
-    await controller.start({ via: "wallet", amount: 10_000_000n, clients });
+    await controller.start({ via: "wallet", chain: "base", amount: 10_000_000n, clients });
     const state = controller.getState();
     expect(state).toMatchObject({ phase: "failed", reason: { code: "burn_unconfirmed", retryable: false } });
     expect(state.phase === "failed" && state.reason.message).toMatch(/did not say whether the burn was sent.*activity/);
@@ -750,14 +755,14 @@ describe("funding from the wallet", () => {
       throw new Error(`The burn reverted on Base: ${hash}`);
     };
     const controller = h.make({ fund });
-    await controller.start({ via: "wallet", amount: 10_000_000n, clients });
+    await controller.start({ via: "wallet", chain: "base", amount: 10_000_000n, clients });
     expect(controller.getState()).toMatchObject({ phase: "failed", reason: { code: "unknown", message: "The transaction reverted on Base. Nothing was sent." } });
     expect(h.storage.getItem(key)).toBeNull();
   });
 
   it("refuses an amount of nothing", async () => {
     const controller = harness().make();
-    await controller.start({ via: "wallet", amount: 0n, clients: wallet().clients });
+    await controller.start({ via: "wallet", chain: "base", amount: 0n, clients: wallet().clients });
     expect(controller.getState()).toMatchObject({ phase: "failed", reason: { message: "Enter an amount above zero" } });
   });
 
@@ -772,7 +777,7 @@ describe("funding from the wallet", () => {
       return { burnTxHash, route: "forwarder", twin, maxFee: 0n };
     };
     const controller = h.make({ fund });
-    const started = controller.start({ via: "wallet", amount: 10_000_000n, clients });
+    const started = controller.start({ via: "wallet", chain: "base", amount: 10_000_000n, clients });
     await until(() => {
       const state = controller.getState();
       return state.phase === "requesting" && state.step === "confirming";

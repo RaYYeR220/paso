@@ -148,7 +148,7 @@ describe("mergeActivity", () => {
     expect(mergeActivity([], [], context)).toEqual([]);
   });
 
-  it("words an arrival from Base, a payment in, a payment out and a withdrawal", () => {
+  it("words an arrival, a payment in, a payment out and a withdrawal, naming no chain Stellar's events do not name", () => {
     const items = mergeActivity(
       [
         chain({ id: "a", at: T0 + 4 }),
@@ -161,21 +161,21 @@ describe("mergeActivity", () => {
       context,
     );
     expect(items.map((item) => [item.kind, item.title, item.crossChain])).toEqual([
-      ["received", "Received 10.00 USDC from Base", true],
+      ["received", "Received 10.00 USDC from another chain", true],
       ["received", "Received 10.00 USDC from GBBD…FLA5", false],
       ["sent", "Sent 5.00 USDC to GBBD…FLA5", false],
-      ["exit", "Sent 2.00 USDC back to Base", true],
-      ["received", "Received 10.00 USDC from Base", true],
+      ["exit", "Sent 2.00 USDC to another chain", true],
+      ["received", "Received 10.00 USDC from another chain", true],
     ]);
     expect(items.every((item) => item.status === "confirmed" && item.source === "chain")).toBe(true);
-    expect(items[0]?.links).toEqual({ stellar: `https://stellar.expert/explorer/testnet/tx/${STELLAR_HASH}`, base: null });
+    expect(items[0]?.links).toEqual({ stellar: `https://stellar.expert/explorer/testnet/tx/${STELLAR_HASH}`, evm: null });
     expect(items[2]?.counterparty).toBe(RECIPIENT);
   });
 
-  it("shows a movement both records know once, with the Base link only the browser has", () => {
+  it("shows a movement both records know once, with the chain and the link only the browser has", () => {
     const items = mergeActivity(
       [chain({})],
-      [entry({ id: `fund:${BURN}`, status: "done", stellarTxHash: `0x${STELLAR_HASH.toUpperCase()}`, baseTxHash: BURN })],
+      [entry({ id: `fund:${BURN}`, status: "done", stellarTxHash: `0x${STELLAR_HASH.toUpperCase()}`, chain: "base", evmTxHash: BURN })],
       context,
     );
     expect(items).toHaveLength(1);
@@ -183,28 +183,48 @@ describe("mergeActivity", () => {
       id: "e1",
       title: "Received 10.00 USDC from Base",
       source: "both",
-      links: { stellar: `https://stellar.expert/explorer/testnet/tx/${STELLAR_HASH}`, base: `https://sepolia.basescan.org/tx/${BURN}` },
+      links: {
+        stellar: `https://stellar.expert/explorer/testnet/tx/${STELLAR_HASH}`,
+        evm: { label: "Base", href: `https://sepolia.basescan.org/tx/${BURN}` },
+      },
     });
   });
 
   it("shows a transfer still on its way, from the browser's record alone", () => {
-    const [item] = mergeActivity([], [entry({ baseTxHash: BURN })], context);
+    const [item] = mergeActivity([], [entry({ chain: "base", evmTxHash: BURN })], context);
     expect(item).toMatchObject({
       kind: "received",
       status: "pending",
       title: "Receiving 10.00 USDC from Base",
       source: "session",
-      links: { base: `https://sepolia.basescan.org/tx/${BURN}`, stellar: `https://stellar.expert/explorer/testnet/contract/${twin}` },
+      links: {
+        evm: { label: "Base", href: `https://sepolia.basescan.org/tx/${BURN}` },
+        stellar: `https://stellar.expert/explorer/testnet/contract/${twin}`,
+      },
     });
+  });
+
+  it("names the chain a transfer came from or went back to, with a link on that chain's explorer", () => {
+    const evm = "0x7880DA9a52Af491f76421869d4e28DC0A4D1767C";
+    const items = mergeActivity(
+      [chain({ id: "in", at: T0 + 1 }), chain({ id: "out", direction: "out", counterparty: hub, amount: 20_000_000n, txHash: "9".repeat(64) })],
+      [
+        entry({ id: `fund:${BURN}`, status: "done", stellarTxHash: STELLAR_HASH, chain: "arbitrum", evmTxHash: BURN, at: T0 + 1 }),
+        entry({ id: "x", kind: "exit", status: "done", amount: "20000000", counterparty: evm, chain: "arc", stellarTxHash: "9".repeat(64) }),
+      ],
+      context,
+    );
+    expect(items.map((item) => item.title)).toEqual(["Received 10.00 USDC from Arbitrum", "Sent 2.00 USDC back to Arc · 0x7880…767C"]);
+    expect(items[0]?.links.evm).toEqual({ label: "Arbitrum", href: `https://sepolia.arbiscan.io/tx/${BURN}` });
   });
 
   it("pairs a delivery made by someone else with the mint that followed it", () => {
     const items = mergeActivity(
       [chain({ id: "old", at: T0 - 3_600_000, txHash: "1".repeat(64) }), chain({ id: "mint", at: T0 + 20_000, txHash: "2".repeat(64) })],
-      [entry({ status: "done", baseTxHash: BURN })],
+      [entry({ status: "done", evmTxHash: BURN })],
       context,
     );
-    expect(items.map((item) => [item.id, item.source, item.links.base !== null])).toEqual([
+    expect(items.map((item) => [item.id, item.source, item.links.evm !== null])).toEqual([
       ["mint", "both", true],
       ["old", "chain", false],
     ]);
@@ -251,6 +271,18 @@ describe("mergeActivity", () => {
 
 describe("the session log", () => {
   const key = activityLogKey("testnet", twin);
+
+  it("reads an entry kept before there was a choice of chain as one about Base", () => {
+    const storage = memoryStorage({
+      [key]: JSON.stringify([{ id: `fund:${BURN}`, kind: "receive", status: "pending", amount: "100000000", counterparty: null, at: T0, baseTxHash: BURN }]),
+    });
+    const [kept] = createActivityLog(storage, key).list();
+    expect(kept).toEqual({ id: `fund:${BURN}`, kind: "receive", status: "pending", amount: "100000000", counterparty: null, at: T0, evmTxHash: BURN });
+    expect(mergeActivity([], [kept!], context)[0]).toMatchObject({
+      title: "Receiving 10.00 USDC from Base",
+      links: { evm: { label: "Base", href: `https://sepolia.basescan.org/tx/${BURN}` } },
+    });
+  });
 
   it("survives a reload", () => {
     const storage = memoryStorage();

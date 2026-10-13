@@ -36,6 +36,9 @@ const RELAY_MESSAGES: Record<RelayCode, string> = {
   relay_failed: "The relayer did not answer. Try again.",
 };
 
+/** How the SDK says a transaction was included and reverted: "The burn reverted on Arc: 0x…". */
+const REVERTED_ON = /reverted on ([^:·]+?):/;
+
 const RETRYABLE_RELAY_CODES: readonly string[] = ["rate_limited", "unavailable", "relay_failed", "expired"];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -120,11 +123,20 @@ function problem(code: string, message: string, retryable: boolean, detail?: str
   };
 }
 
+/** The EVM chain a wallet was asked to act on, so a failure there can name it and its gas. */
+export interface ChainContext {
+  /** "Arbitrum Sepolia", "Arc". */
+  chain: string;
+  /** What gas is paid in there: "ETH", or "USDC" on Arc. */
+  gas: string;
+}
+
 /**
  * Maps anything a flow can throw — a relayer refusal, an API refusal, an SDK
- * error, a wallet error — to a `Problem`.
+ * error, a wallet error — to a `Problem`. With `where`, a failure on an EVM
+ * chain names the chain and its gas.
  */
-export function describeError(error: unknown): Problem {
+export function describeError(error: unknown, where?: ChainContext): Problem {
   if (isUserRejection(error)) return { kind: "rejected" };
 
   const links = chain(error);
@@ -185,16 +197,20 @@ export function describeError(error: unknown): Problem {
     return problem("wallet_busy", "The wallet already has a request open. Open the wallet to answer it.", true, all);
   }
   if (links.some((link) => link.code === 4902 || link.name === "ChainMismatchError" || link.name === "SwitchChainError" || link.name === "ChainNotConfiguredError")) {
-    return problem("wrong_network", "The wallet is on another network. Switch it to Base and try again.", true, all);
+    const to = where ? `Switch it to ${where.chain}` : "Switch it to the chain shown";
+    return problem("wrong_network", `The wallet is on another network. ${to} and try again.`, true, all);
   }
   if (links.some((link) => link.name === "InsufficientFundsError") || /insufficient funds/i.test(all)) {
-    return problem("insufficient_gas", "The wallet does not hold enough ETH on Base to pay for gas.", false, all);
+    const gas = where ? `enough ${where.gas} on ${where.chain}` : "enough";
+    return problem("insufficient_gas", `The wallet does not hold ${gas} to pay for gas.`, false, all);
   }
   if (/transfer amount exceeds balance|exceeds balance/i.test(all)) {
-    return problem("insufficient_usdc", "The wallet does not hold enough USDC on Base.", false, all);
+    return problem("insufficient_usdc", `The wallet does not hold enough USDC${where ? ` on ${where.chain}` : ""}.`, false, all);
   }
-  if (/reverted on Base/.test(all)) {
-    return problem("reverted", "The transaction reverted on Base. Nothing was sent.", true, all);
+  const reverted = named("TransactionRevertedError") ?? (REVERTED_ON.test(all) ? {} : undefined);
+  if (reverted) {
+    const on = REVERTED_ON.exec(all)?.[1] ?? where?.chain;
+    return problem("reverted", `The transaction reverted${on ? ` on ${on}` : ""}. Nothing was sent.`, true, all);
   }
   if (/execution reverted|exceeds allowance/i.test(all)) {
     return problem("would_revert", "The wallet says this transaction would fail, so it was not sent. Nothing left the wallet.", true, all);
@@ -211,8 +227,8 @@ export function describeError(error: unknown): Problem {
 }
 
 /** `describeError` for places where a rejection cannot happen or is handled before. */
-export function describeFailure(error: unknown): ProblemError {
-  const described = describeError(error);
+export function describeFailure(error: unknown, where?: ChainContext): ProblemError {
+  const described = describeError(error, where);
   return described.kind === "error"
     ? described
     : problem("rejected", "The request was declined in the wallet.", true);

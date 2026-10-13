@@ -1,3 +1,4 @@
+import { listEvmChains, STELLAR_CCTP_DOMAIN } from "@paso/sdk";
 import type { Metadata } from "next";
 import { Suspense } from "react";
 import { AccountPair, AppShell, ExternalLink, TopBar } from "@/components/app";
@@ -22,14 +23,23 @@ const MAINNET_HUB = "CDZCHMNSAAIST5K2DNP4DP6H3DE4UJISUOMDFQTKD7IK6CD477AB7LJK";
 const BASESCAN = "https://sepolia.basescan.org/tx/";
 const EXPERT = "https://stellar.expert/explorer/testnet/";
 const MAINNET_BASESCAN = "https://basescan.org/tx/";
+const ARC_EXPLORER = "https://explorer.testnet.arc.io/tx/";
 const MAINNET_EXPERT = "https://stellar.expert/explorer/public/";
 const REPO = "https://github.com/RaYYeR220/paso";
 
 interface Station {
   text: string;
-  chain: "Base" | "Base Sepolia" | "Stellar";
+  chain: "Base" | "Base Sepolia" | "Arc Testnet" | "Stellar";
   href: string;
 }
+
+/** Every chain USDC comes from and goes back to, on mainnet and on testnet, paired by name. */
+const CHAINS = listEvmChains("mainnet").map((chain, index) => ({
+  name: chain.name,
+  mainnet: chain.label,
+  testnet: listEvmChains("testnet")[index]!.label,
+  domain: chain.cctpDomain,
+}));
 
 const MAINNET_RUN: readonly Station[] = [
   {
@@ -87,10 +97,33 @@ const RUN: readonly Station[] = [
   },
 ];
 
+const ARC_RUN: readonly Station[] = [
+  {
+    text: "0.5 USDC burned on Arc Testnet, its gas paid in USDC, no fee",
+    chain: "Arc Testnet",
+    href: `${ARC_EXPLORER}0x3bfe9927a2c72308e02ec9d63bc1a7dbe18daac501748946df09ca9d6ddf668d`,
+  },
+  {
+    text: "Attested and delivered on Stellar 10 seconds later",
+    chain: "Stellar",
+    href: `${EXPERT}tx/040af2cbc1d2fbee714c1f2bbd32f785a07e15b947d189d0b91a875c22db4e89`,
+  },
+  {
+    text: "0.2 USDC sent back to Arc with one signature",
+    chain: "Stellar",
+    href: `${EXPERT}tx/a55ce5aacf46fab6c04c7dc8150474fac6aa3c0be8d153ab97b271abf9e9d2ee`,
+  },
+  {
+    text: "Minted on Arc Testnet 8 seconds later",
+    chain: "Arc Testnet",
+    href: `${ARC_EXPLORER}0xfafb8ddec2bb4094c296a1e658014ffe4a6dea44a320633bc394eb9c861ab2a9`,
+  },
+];
+
 const TESTS: readonly { text: string; command?: string }[] = [
   { text: "Account contract 29, hub 15", command: "pnpm test:contracts" },
-  { text: "SDK 713 offline", command: "pnpm test:sdk" },
-  { text: "Relayer and client 522 offline", command: "pnpm test:web" },
+  { text: "SDK 812 offline", command: "pnpm test:sdk" },
+  { text: "Relayer and client 552 offline", command: "pnpm test:web" },
   { text: "11 signing vectors checked by both the Rust and the TypeScript suites." },
 ];
 
@@ -125,7 +158,7 @@ export default function ProofPage() {
         <div className="doc-lead">
           <h1>Proof</h1>
           <p>Every claim Paso makes, with the transaction or the command that backs it.</p>
-          <p className="doc-meta">Mainnet first: Stellar and Base. Then testnet: Stellar testnet and Base Sepolia.</p>
+          <p className="doc-meta">Mainnet first. Then testnet: one run from Base Sepolia, one from Arc Testnet.</p>
           <LiveStatus />
         </div>
 
@@ -165,6 +198,35 @@ export default function ProofPage() {
             </p>
           </section>
 
+          <section aria-labelledby="chains">
+            <h2 id="chains">Supported chains</h2>
+            <table className="chains">
+              <thead>
+                <tr>
+                  <th scope="col">Mainnet</th>
+                  <th scope="col">Testnet</th>
+                  <th scope="col">CCTP domain</th>
+                </tr>
+              </thead>
+              <tbody>
+                {CHAINS.map((chain) => (
+                  <tr key={chain.name}>
+                    <th scope="row">{chain.mainnet}</th>
+                    <td>{chain.testnet}</td>
+                    <td>{chain.domain}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p>
+              Each one both ways: into a Stellar account, CCTP domain {STELLAR_CCTP_DOMAIN}, and back out of it. On Arc the
+              gas is paid in USDC.
+            </p>
+            <p>
+              <code>pnpm routes --network mainnet</code> reads every contract address back from its chain.
+            </p>
+          </section>
+
           <section aria-labelledby="run">
             <h2 id="run">One run, start to finish</h2>
             <p className="doc-meta">
@@ -174,6 +236,19 @@ export default function ProofPage() {
             <p className="doc-sum">
               From the burn on Base to the mint back on Base: 32 seconds. The owner&rsquo;s account paid no Stellar fee.
             </p>
+          </section>
+
+          <section aria-labelledby="arc">
+            <h2 id="arc">The same run from Arc</h2>
+            <p className="doc-meta">Testnet, 2026-10-13, the same owner</p>
+            <Stations run={ARC_RUN} />
+            <ul className="claims">
+              <li data-mark="refused">
+                <span>A call changed after signing, submitted with amount 10000000000000: FAILED on chain, Error(Contract, #2)</span>
+                <ExternalLink href={`${EXPERT}tx/f3eca45441f58d2ba689ea72474465b36e5fb7c234795ca20fc589f3ccbb8917`}>Stellar</ExternalLink>
+              </li>
+            </ul>
+            <p className="doc-sum">From the burn on Arc to the mint back on Arc: 28 seconds.</p>
           </section>
 
           <section aria-labelledby="refusal">

@@ -4,7 +4,8 @@
  * here renders. Every hook that touches a chain takes the network.
  */
 export { ROUTES, contractName, networkConfig, networkLabel } from "./config";
-export { baseAddress, baseTx, stellarAddress, stellarTx } from "./explorer";
+export { evmAddress, evmTx, stellarAddress, stellarTx } from "./explorer";
+export { chainOf, chainsOf, FAUCET_CHAIN, gasSymbol, serverMintsOn } from "./chains";
 export { formatBaseUsdc, formatElapsed, formatUnits, formatUsdc, formatWait, relativeTime, shortAddress, shortHash } from "./format";
 export { describeError, describeFailure, isUserRejection, relayMessage, type Problem, type ProblemError } from "./errors";
 export { decodeParam, parseOwnerInput, parseRecipient, type ParsedOwner, type ParsedRecipient } from "./parse";
@@ -33,8 +34,17 @@ export {
   type WalletSigner,
 } from "./signer";
 export { deriveTwin, useTwin, type Twin } from "./useTwin";
-export { useFunding, type Funding, type FundingLimits, type KeyCheck } from "./useFunding";
-export { burnAmountProblem, burnCeiling, FAUCET_AMOUNT, MAINNET_BURN_CEILING, WALLET_BURN_MIN, type BurnLimits } from "./funding/limits";
+export { useFunding, type ChainOption, type Funding, type FundingLimits, type KeyCheck, type WalletHoldings } from "./useFunding";
+export {
+  burnAmountProblem,
+  burnCeiling,
+  FAUCET_AMOUNT,
+  gasReserve,
+  MAINNET_BURN_CEILING,
+  USDC_GAS_RESERVE,
+  WALLET_BURN_MIN,
+  type BurnLimits,
+} from "./funding/limits";
 export { useAction, type ActionFlow } from "./useAction";
 export { useExit, type Exit } from "./useExit";
 export type { ExitStage, ExitState, ExitTransfer } from "./exit";

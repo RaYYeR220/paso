@@ -122,13 +122,21 @@ describe("buildAction", () => {
 
   it("builds a withdrawal to Base for an address or a name, and for nothing else", async () => {
     const built = await buildAction({ kind: "exit", recipient: owner.address.toLowerCase(), amount: "2" }, context);
-    expect(built.action).toEqual({ kind: "exit", amount: 20_000_000n, recipient: owner.address });
+    expect(built.action).toEqual({ kind: "exit", amount: 20_000_000n, recipient: owner.address, destinationChain: "base" });
     expect(built.recipient).toMatchObject({ kind: "evm", evm: owner.address });
     expect((await buildAction({ kind: "exit", recipient: "owner.eth", amount: "2" }, context)).recipient).toMatchObject({
       kind: "ens",
       evm: owner.address,
     });
     await expect(buildAction({ kind: "exit", recipient: RECIPIENT, amount: "2" }, context)).rejects.toThrow(/Ethereum address/);
+  });
+
+  it("builds a withdrawal to the chain named, and names it when the recipient is missing", async () => {
+    const built = await buildAction({ kind: "exit", recipient: owner.address, amount: "0.2", chain: "arc" }, context);
+    expect(built.action).toEqual({ kind: "exit", amount: 2_000_000n, recipient: owner.address, destinationChain: "arc" });
+    await expect(buildAction({ kind: "exit", recipient: " ", amount: "1", chain: "arbitrum" }, context)).rejects.toThrow(
+      "Enter the Ethereum address that receives the USDC on Arbitrum Sepolia",
+    );
   });
 
   it("passes a generic call through", async () => {

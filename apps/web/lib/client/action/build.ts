@@ -1,4 +1,5 @@
-import { parseStellarAmount, twinAddress, type Action, type NetworkConfig } from "@paso/sdk";
+import { DEFAULT_EVM_CHAIN, parseStellarAmount, twinAddress, type Action, type NetworkConfig } from "@paso/sdk";
+import { chainOf } from "../chains";
 import type { Address } from "viem";
 import { NameNotFoundError } from "../ens";
 import { parseOwnerInput, parseRecipient } from "../parse";
@@ -65,12 +66,13 @@ export async function buildAction(request: ActionRequest, context: BuildContext)
     }
 
     case "exit": {
+      const destination = chainOf(network, request.chain ?? DEFAULT_EVM_CHAIN);
       const parsed = parseOwnerInput(request.recipient);
       const input = request.recipient.trim();
       let recipient: Recipient & { evm: Address };
       switch (parsed.kind) {
         case "empty":
-          throw new Error("Enter the Ethereum address that receives the USDC on Base");
+          throw new Error(`Enter the Ethereum address that receives the USDC on ${destination.label}`);
         case "invalid":
           throw new Error(parsed.reason);
         case "address":
@@ -81,7 +83,11 @@ export async function buildAction(request: ActionRequest, context: BuildContext)
           break;
       }
       const amount = units(request.amount);
-      return { action: { kind: "exit", amount, recipient: recipient.evm }, recipient, amount };
+      return {
+        action: { kind: "exit", amount, recipient: recipient.evm, destinationChain: destination.name },
+        recipient,
+        amount,
+      };
     }
 
     case "invoke":

@@ -14,6 +14,8 @@ export interface AccountPairProps {
   /** False when the account contract is not on the ledger yet. */
   deployed?: boolean;
   evmHref?: string;
+  /** The chain `evmHref` leads to: "Base", "Arbitrum". */
+  evmHrefLabel?: string;
   stellarHref?: string;
   /** A remark about the key itself: that it is a throwaway one, say. */
   evmNote?: string;
@@ -31,7 +33,17 @@ const COMPACT_BELOW = 1100;
 const INITIAL_SCENE: SceneSize = { width: 1440, height: 104, passX: 664 };
 
 /** The two addresses of one key, a road between them, and what the Stellar side holds. */
-export function AccountPair({ evmAddress, stellarAddress, balance, deployed, evmHref, stellarHref, evmNote, showBalance = true }: AccountPairProps) {
+export function AccountPair({
+  evmAddress,
+  stellarAddress,
+  balance,
+  deployed,
+  evmHref,
+  evmHrefLabel = "Base",
+  stellarHref,
+  evmNote,
+  showBalance = true,
+}: AccountPairProps) {
   const frame = useRef<HTMLDivElement>(null);
   const tag = useRef<HTMLSpanElement>(null);
   const [scene, setScene] = useState<SceneSize>(INITIAL_SCENE);
@@ -73,7 +85,7 @@ export function AccountPair({ evmAddress, stellarAddress, balance, deployed, evm
           )}
           {evmAddress && (evmHref || evmNote) ? (
             <span className="end-meta">
-              {evmHref ? <ExternalLink href={evmHref}>Base</ExternalLink> : null}
+              {evmHref ? <ExternalLink href={evmHref}>{evmHrefLabel}</ExternalLink> : null}
               {evmNote ? <span>{evmNote}</span> : null}
             </span>
           ) : null}

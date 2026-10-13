@@ -49,7 +49,7 @@ export function MainnetConfirm({ open, ceiling, onConfirm, onDecline }: MainnetC
     >
       <div className="mainnet-sheet">
         <h2 id={`${id}-h`}>Switch to mainnet</h2>
-        <p>On mainnet everything here moves real USDC, between Base and Stellar.</p>
+        <p>On mainnet everything here moves real USDC, between Stellar and Base, Ethereum, Arbitrum, OP Mainnet or Arc.</p>
         <ul>
           <li>This software has not been audited. The contracts cannot be paused, upgraded or recovered. Use small amounts.</li>
           <li>You sign with your own wallet. The demo key and the faucet exist on testnet only.</li>

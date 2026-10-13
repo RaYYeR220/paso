@@ -107,7 +107,7 @@ describe("how much one transfer may bring over", () => {
       fund,
     });
 
-    await controller.start({ via: "wallet", amount: 25_000_001n, clients });
+    await controller.start({ via: "wallet", chain: "base", amount: 25_000_001n, clients });
 
     expect(controller.getState()).toMatchObject({
       phase: "failed",
@@ -122,7 +122,7 @@ describe("how much one transfer may bring over", () => {
     const { clients, fund, funds } = wallet();
     const h = harness({ deliver: [delivered(STELLAR_HASH)] }, { fund });
 
-    await h.controller.start({ via: "wallet", amount: 25_000_000n, clients });
+    await h.controller.start({ via: "wallet", chain: "base", amount: 25_000_000n, clients });
     await until(() => h.controller.getState().phase === "minted", "minted");
 
     expect(funds).toHaveLength(1);
@@ -138,7 +138,7 @@ describe("a burn the relayer is not delivering right now", () => {
   const following = async (script: (DeliverResponse | Error)[]) => {
     const { clients, fund } = wallet();
     const h = harness({ deliver: script }, { fund });
-    await h.controller.start({ via: "wallet", amount: 1_000_000n, clients });
+    await h.controller.start({ via: "wallet", chain: "base", amount: 1_000_000n, clients });
     return h;
   };
 
@@ -196,7 +196,7 @@ describe("a transfer on one network and the same owner on the other", () => {
     const storage = memoryStorage();
     const { clients, fund } = wallet();
     const onTestnet = harness({ storage, network: testnet }, { fund });
-    await onTestnet.controller.start({ via: "wallet", amount: 1_000_000n, clients });
+    await onTestnet.controller.start({ via: "wallet", chain: "base", amount: 1_000_000n, clients });
     expect(onTestnet.controller.tracked()).toMatchObject({ transfer: { network: "testnet" } });
 
     // A page on mainnet, same browser, same owner: nothing to restore, and free to start its own.

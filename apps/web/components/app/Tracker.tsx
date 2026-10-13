@@ -3,7 +3,7 @@ import { ExternalLink } from "./primitives";
 
 export interface TrackerStage {
   id: string;
-  /** Circle's own words: "Burned on Base", "Attested by Circle", "Minted on Stellar". */
+  /** Circle's own words: "Burned on Arbitrum", "Attested by Circle", "Minted on Stellar". */
   label: string;
   status: StationStatus;
   /** What to say under the label: a short hash, "in progress, 8 s". Defaults to the status. */
@@ -27,7 +27,7 @@ const STATUS_WORDS: Record<StationStatus, string> = {
   failed: "stopped here",
 };
 
-/** The three steps of a transfer from Base, drawn as a route over the pass. */
+/** The three steps of a transfer between an EVM chain and Stellar, drawn as a route over the pass. */
 export function Tracker({ stages, progress, compact = false }: TrackerProps) {
   const summary = stages.map((stage) => `${stage.label}: ${STATUS_WORDS[stage.status]}`).join(". ");
 

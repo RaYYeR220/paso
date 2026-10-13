@@ -1,4 +1,4 @@
-import type { Call, DescribedCall, NetworkName, OwnerKind, Prepared } from "@paso/sdk";
+import type { Call, DescribedCall, EvmChainName, NetworkName, OwnerKind, Prepared } from "@paso/sdk";
 import type { xdr } from "@stellar/stellar-sdk";
 import type { Address } from "viem";
 import type { ProblemError } from "../errors";
@@ -8,8 +8,8 @@ import { comparePanels, NO_PANELS, type Panels, type SignedMessage } from "./pan
 export type ActionRequest =
   /** Send USDC to `G…` / `C…`, or to the Stellar account of `0x…` / an ENS name. */
   | { kind: "transfer"; to: string; amount: string | bigint }
-  /** Send USDC back to Base, to an Ethereum address or ENS name. */
-  | { kind: "exit"; recipient: string; amount: string | bigint }
+  /** Send USDC back to an EVM chain, Base unless `chain` names another, to an Ethereum address or ENS name. */
+  | { kind: "exit"; recipient: string; amount: string | bigint; chain?: EvmChainName }
   /** Call any contract function that asks the account for authorisation. */
   | { kind: "invoke"; contract: string; fn: string; args: xdr.ScVal[] };
 

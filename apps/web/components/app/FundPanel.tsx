@@ -1,11 +1,23 @@
 "use client";
 
 import { useId, type FormEvent, type ReactNode } from "react";
+import { ChainChoice, type ChainChoiceOption } from "./ChainChoice";
 import { Tracker, type TrackerProps } from "./Tracker";
 
 export interface FundPanelProps {
-  /** A wallet burns its own USDC on Base; the demo key asks the testnet faucet. */
+  /** A wallet burns its own USDC on the chain chosen; the demo key asks the testnet faucet on Base Sepolia. */
   mode: "wallet" | "demo";
+  /** The chain the USDC leaves, by the name it has on every network: "Base", "Arbitrum", "Arc". */
+  chain: string;
+  /** Every chain it can leave from, Base first. */
+  chains: readonly ChainChoiceOption[];
+  /** The chosen chain's name in the SDK. */
+  chainName: string;
+  onChainChange?: (name: string) => void;
+  /** True while a transfer is on its way: the chain it left cannot be changed. */
+  chainLocked?: boolean;
+  /** One line under the chips: what the wallet holds there, or why the other chains are not offered. */
+  chainNote?: ReactNode;
   /** Decimal text, as typed. */
   amount: string;
   onAmountChange?: (value: string) => void;
@@ -25,7 +37,24 @@ export interface FundPanelProps {
   status?: ReactNode;
 }
 
-export function FundPanel({ mode, amount, onAmountChange, busy, disabled, onSubmit, keyCheck, stages, progress, status }: FundPanelProps) {
+export function FundPanel({
+  mode,
+  chain,
+  chains,
+  chainName,
+  onChainChange,
+  chainLocked = false,
+  chainNote,
+  amount,
+  onAmountChange,
+  busy,
+  disabled,
+  onSubmit,
+  keyCheck,
+  stages,
+  progress,
+  status,
+}: FundPanelProps) {
   const id = useId();
   const fixed = mode === "demo";
 
@@ -36,7 +65,15 @@ export function FundPanel({ mode, amount, onAmountChange, busy, disabled, onSubm
 
   return (
     <section className="fund" aria-labelledby={`${id}-h`}>
-      <h2 id={`${id}-h`}>Bring USDC from Base</h2>
+      <h2 id={`${id}-h`}>Bring USDC from {chain}</h2>
+      <ChainChoice
+        legend="Bring USDC from"
+        options={chains}
+        value={chainName}
+        onChange={(name) => onChainChange?.(name)}
+        disabled={chainLocked || busy}
+        note={keyCheck ? undefined : chainNote}
+      />
       {keyCheck ? (
         <div className="fund-check">
           <p>
@@ -72,7 +109,7 @@ export function FundPanel({ mode, amount, onAmountChange, busy, disabled, onSubm
         </form>
       )}
       <div className="hint" id={`${id}-status`}>
-        {status ?? (fixed ? "The testnet faucet burns this much on Base for you." : "One transaction on Base, about 20 seconds.")}
+        {status ?? (fixed ? `The testnet faucet burns this much on ${chain} for you.` : `One transaction on ${chain}, about 20 seconds.`)}
       </div>
       <Tracker stages={stages} progress={progress} />
     </section>

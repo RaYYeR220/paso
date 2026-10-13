@@ -1,12 +1,23 @@
 "use client";
 
 import { useId, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
+import { ChainChoice, type ChainChoiceOption } from "./ChainChoice";
 
-export type SendDestination = "stellar" | "base";
+/** Another Stellar account, or back to an EVM chain over CCTP. */
+export type SendDestination = "stellar" | "evm";
 
 export interface SendFormProps {
   destination: SendDestination;
   onDestinationChange: (destination: SendDestination) => void;
+  /** The chain USDC goes back to, by the name it has on every network: "Base", "Arc". */
+  chain: string;
+  /** Every chain it can go back to, Base first. */
+  chains: readonly ChainChoiceOption[];
+  /** The chosen chain's name in the SDK. */
+  chainName: string;
+  onChainChange: (name: string) => void;
+  /** One line under the chips, while going back: who submits the mint there, or why some chains are not offered. */
+  chainNote?: ReactNode;
   /** The recipient as typed: `G…`, `C…`, `0x…` or an ENS name. */
   to: string;
   onToChange: (value: string) => void;
@@ -25,21 +36,21 @@ export interface SendFormProps {
   onSubmit: () => void;
   /** One line under the fields: where the money will land, or a nudge to fund the account first. */
   status?: ReactNode;
-  /** Shown under the heading: a transfer already on its way back to Base, say. */
+  /** Shown under the heading: a transfer already on its way back to an EVM chain, say. */
   children?: ReactNode;
 }
 
 /** Roughly what one line of the recipient field holds: past it, the field grows instead of hiding the end of an address. */
 const RECIPIENT_LINE = 26;
 
-const DESTINATIONS: readonly { value: SendDestination; label: string }[] = [
-  { value: "stellar", label: "another Stellar account" },
-  { value: "base", label: "back to Base" },
-];
-
 export function SendForm({
   destination,
   onDestinationChange,
+  chain,
+  chains,
+  chainName,
+  onChainChange,
+  chainNote,
   to,
   onToChange,
   toError,
@@ -58,6 +69,10 @@ export function SendForm({
   const problem = toError ?? amountError ?? callProblem;
 
   const recipientLines = Math.min(3, Math.max(1, Math.ceil(to.length / RECIPIENT_LINE)));
+  const destinations: readonly { value: SendDestination; label: string }[] = [
+    { value: "stellar", label: "another Stellar account" },
+    { value: "evm", label: `back to ${chain}` },
+  ];
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -78,7 +93,7 @@ export function SendForm({
           <h2 id={`${id}-h`}>Send</h2>
           <fieldset className="seg" disabled={locked}>
             <legend className="vh">Where it goes</legend>
-            {DESTINATIONS.map((option) => (
+            {destinations.map((option) => (
               <label key={option.value}>
                 <input
                   type="radio"
@@ -93,6 +108,16 @@ export function SendForm({
           </fieldset>
         </div>
         {children}
+        {destination === "evm" ? (
+          <ChainChoice
+            legend="Send it back to"
+            options={chains}
+            value={chainName}
+            onChange={onChainChange}
+            disabled={locked}
+            note={chainNote}
+          />
+        ) : null}
         <label className="field-row" htmlFor={`${id}-to`}>
           <span>To</span>
           <span className="field" data-invalid={toError ? true : undefined} data-lines={recipientLines}>
@@ -105,7 +130,7 @@ export function SendForm({
               autoCapitalize="off"
               autoCorrect="off"
               disabled={locked}
-              placeholder={destination === "base" ? "0x… or ENS name" : "G…, C…, 0x… or ENS name"}
+              placeholder={destination === "evm" ? "0x… or ENS name" : "G…, C…, 0x… or ENS name"}
               aria-invalid={toError ? true : undefined}
               aria-describedby={`${id}-status`}
               onKeyDown={submitOnEnter}

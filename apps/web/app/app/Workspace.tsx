@@ -1,6 +1,6 @@
 "use client";
 
-import { formatEvmAmount, type NetworkName } from "@paso/sdk";
+import { formatEvmAmount, isEvmChainName, type EvmChainConfig, type EvmChainName, type NetworkName } from "@paso/sdk";
 import Link from "next/link";
 import { useState, type ReactNode } from "react";
 import type { Address } from "viem";
@@ -14,19 +14,26 @@ import {
   MessagePanels,
   Notice,
   SendForm,
+  Skeleton,
   StopTracking,
   TamperSwitch,
   Tracker,
   Verdict,
   VerdictStrip,
+  type ChainChoiceOption,
   type SendDestination,
 } from "@/components/app";
 import { deliverCommand, REFUSAL_ON_CHAIN, SCRIPTS_URL } from "@/components/app/site";
 import {
-  baseAddress,
+  chainOf,
+  chainsOf,
+  evmAddress,
+  FAUCET_CHAIN,
   formatElapsed,
+  gasSymbol,
   networkConfig,
   parseRecipient,
+  serverMintsOn,
   shortAddress,
   useAction,
   useActivity,
@@ -44,7 +51,7 @@ import {
 import { activityRows, declineWords, exitStages, fundingStages, travelProgress, verdictOf } from "./view";
 
 export interface WorkspaceProps {
-  /** The network everything here works on: the account's address, the Base it is funded from, the relayer that pays. */
+  /** The network everything here works on: the account's address, the chains it is funded from, the relayer that pays. */
   network: NetworkName;
   signer: ActiveSigner;
   owner: Address;
@@ -52,6 +59,8 @@ export interface WorkspaceProps {
   prefillTo: string;
   /** Whether the hosted relayer is there to pay fees on this network. */
   relayer: RelayerStatus;
+  /** Whether the server submits the mint that ends a transfer back to Base on this network. Everywhere else the wallet does. */
+  paysBaseMints: boolean;
   /** Where the proof page shows the refusal recorded on mainnet. */
   proofHref: string;
 }
@@ -60,14 +69,67 @@ export interface WorkspaceProps {
 const SLOW_AFTER_SECONDS = 90;
 const UNSEEN_AFTER_SECONDS = 600;
 
+/** Circle's fee for the route, as a sentence to follow another: nothing until Circle has said. */
+function feeWords(chain: EvmChainConfig, bps: number | null): string {
+  if (bps === null) return "";
+  if (bps === 0) return ` Circle charges no fee from ${chain.shortLabel}.`;
+  return ` Circle keeps ${Number((bps / 100).toFixed(4))}% of it.`;
+}
+
+/** What the wallet holds on the chain in view, with where to get test funds when it holds none. */
+function holdingsNote(funding: Funding, network: NetworkName): ReactNode {
+  const { chain, holdings } = funding;
+  if (!holdings) {
+    return `The demo key brings test USDC from ${chainOf(networkConfig(network), FAUCET_CHAIN).label} only. Connect a wallet to bring it from another chain.`;
+  }
+  const where = `In the wallet on ${chain.label}: `;
+  if (holdings.usdc === null) {
+    return (
+      <>
+        {where}
+        <Skeleton width="8em" />
+      </>
+    );
+  }
+  const faucets = chain.faucets && (holdings.noUsdc || holdings.noGas) ? chain.faucets : null;
+  if (chain.gasToken.isUsdc) {
+    return (
+      <>
+        {where}
+        {holdings.usdc} USDC. Gas is paid in USDC on {chain.shortLabel}.
+        {faucets ? (
+          <>
+            {" "}
+            Test USDC, gas included: <ExternalLink href={faucets.usdc}>Circle&rsquo;s faucet</ExternalLink>.
+          </>
+        ) : null}
+      </>
+    );
+  }
+  const gas = gasSymbol(chain);
+  return (
+    <>
+      {where}
+      {holdings.usdc} USDC and {holdings.gas} {gas} for gas.
+      {faucets ? (
+        <>
+          {" "}
+          Test USDC from <ExternalLink href={faucets.usdc}>Circle&rsquo;s faucet</ExternalLink>, {gas} from{" "}
+          <ExternalLink href={faucets.gas}>a {chain.label} faucet</ExternalLink>.
+        </>
+      ) : null}
+    </>
+  );
+}
+
 function fundingStatus(funding: Funding, isDemo: boolean, network: NetworkName): ReactNode {
-  const { state, inputError, amountFormatted, elapsedSeconds, tracked, keyCheck, limits } = funding;
-  const base = networkConfig(network).evm.chain.name;
+  const { state, inputError, amountFormatted, elapsedSeconds, tracked, keyCheck, limits, chain } = funding;
+  const where = chain.label;
   if (inputError) return <span data-tone="problem">{inputError}</span>;
 
   const stop = tracked ? (
     <StopTracking onStop={funding.stopTracking}>
-      The USDC is still yours. It is burned on {base} (<ExternalLink href={tracked.link}>the burn</ExternalLink>) and is minted
+      The USDC is still yours. It is burned on {where} (<ExternalLink href={tracked.link}>the burn</ExternalLink>) and is minted
       to this account whenever the burn is delivered, followed here or not.
     </StopTracking>
   ) : null;
@@ -79,7 +141,7 @@ function fundingStatus(funding: Funding, isDemo: boolean, network: NetworkName):
           <>
             <Notice actionLabel="Ask again" onAction={() => void funding.retry()} detail={state.reason.detail}>
               {state.reason.message}{" "}
-              {tracked ? <ExternalLink href={tracked.link}>The burn on {base}</ExternalLink> : null}
+              {tracked ? <ExternalLink href={tracked.link}>The burn on {where}</ExternalLink> : null}
             </Notice>
             {stop}
           </>
@@ -95,22 +157,23 @@ function fundingStatus(funding: Funding, isDemo: boolean, network: NetworkName):
           >
             {state.reason.message}
           </Notice>
-          {state.reason.code === "burn_unconfirmed" ? <FollowBurn chain={base} onFollow={(hash) => funding.resume(hash as `0x${string}`)} /> : null}
+          {state.reason.code === "burn_unconfirmed" ? <FollowBurn chain={where} onFollow={(hash) => funding.resume(hash as `0x${string}`)} /> : null}
         </>
       );
     case "minted":
       return `${amountFormatted ?? ""} USDC arrived${elapsedSeconds === null ? "" : ` in ${formatElapsed(elapsedSeconds)}`}.`;
     case "idle":
       if (state.notice === "cancelled") return "Cancelled in the wallet. Nothing was sent.";
-      if (isDemo) return `Test USDC comes from Paso's faucet on ${base}, ${limits.faucetAmountFormatted} at a time.`;
+      if (isDemo) return `Test USDC comes from Paso's faucet on ${where}, ${limits.faucetAmountFormatted} at a time.`;
       if (keyCheck.status !== "passed") {
         if (keyCheck.status === "asking") return "Waiting for the signature. It moves nothing.";
         if (keyCheck.problem) return <span data-tone="problem">{keyCheck.problem}</span>;
         return keyCheck.notice === "declined" ? "Declined in the wallet. Nothing was signed." : "The check is asked once per wallet.";
       }
+      const fee = feeWords(chain, funding.feeBps);
       return limits.ceiling === null
-        ? `One transaction on ${base}, about 20 seconds.`
-        : `Up to ${formatEvmAmount(limits.ceiling)} USDC a transfer on mainnet: the software has not been audited.`;
+        ? `One transaction on ${where}, ${chain.fastTransfer ? "about 20 seconds" : "attested within seconds"}.${fee}`
+        : `Up to ${formatEvmAmount(limits.ceiling)} USDC a transfer on mainnet: the software has not been audited.${fee}`;
     default: {
       const slow = elapsedSeconds !== null && elapsedSeconds > SLOW_AFTER_SECONDS;
       if (state.phase === "attesting" && state.held && tracked) {
@@ -130,9 +193,9 @@ function fundingStatus(funding: Funding, isDemo: boolean, network: NetworkName):
       }
       let words = `${amountFormatted ? `${amountFormatted} USDC` : "USDC"} on its way${elapsedSeconds === null ? "" : `, ${formatElapsed(elapsedSeconds)}`}.`;
       if (state.phase === "attesting") {
-        if (state.attestation === "unreachable") words = `Still waiting: the delivery service is not answering. The burn is safe on ${base}.`;
+        if (state.attestation === "unreachable") words = `Still waiting: the delivery service is not answering. The burn is safe on ${where}.`;
         else if (state.attestation === "not_found" && elapsedSeconds !== null && elapsedSeconds > UNSEEN_AFTER_SECONDS) {
-          words = `Circle has not seen this burn yet. Check it on ${base}: it may not have gone through.`;
+          words = `Circle has not seen this burn yet. Check it on ${where}: it may not have gone through.`;
         } else if (state.delayReason) words = `Circle is holding the transfer back: ${state.delayReason}.`;
       }
       return (
@@ -146,24 +209,27 @@ function fundingStatus(funding: Funding, isDemo: boolean, network: NetworkName):
   }
 }
 
-/** What is said under the tracker of a transfer back to Base, and the step that is the wallet's to make. */
-function exitStep(exit: Exit, base: string): ReactNode {
-  const { state } = exit;
+/** What is said under the tracker of a transfer back to an EVM chain, and the step that is the wallet's to make. */
+function exitStep(exit: Exit): ReactNode {
+  const { state, chain } = exit;
+  if (!chain) return null;
+  const where = chain.label;
   if (state.phase === "attested") {
+    const gas = chain.gasToken.isUsdc ? `its gas, in USDC on ${chain.shortLabel}` : "its gas";
     return (
       <div className="exit-mint">
         <p className="exit-note" data-tone={state.problem ? "problem" : undefined}>
           {state.problem ??
             (state.notice === "declined"
               ? "Declined in the wallet. Nothing was sent; the step is still open."
-              : `Attested by Circle. The last step is yours: your wallet submits the mint on ${base} and pays its gas. The USDC goes to the address you signed for.`)}
+              : `Attested by Circle. The last step is yours: your wallet submits the mint on ${where} and pays ${gas}. The USDC goes to the address you signed for.`)}
         </p>
         {exit.canMint ? (
           <button type="button" className="btn btn-inline" onClick={() => void exit.mint()}>
             Confirm the mint in your wallet
           </button>
         ) : (
-          <p className="exit-note">This key has no wallet on {base}. Any wallet can submit the mint; connect one to do it from here.</p>
+          <p className="exit-note">This key has no wallet on {where}. Any wallet can submit the mint; connect one to do it from here.</p>
         )}
       </div>
     );
@@ -171,7 +237,7 @@ function exitStep(exit: Exit, base: string): ReactNode {
   if (state.phase === "minting") {
     return (
       <p className="exit-note">
-        {state.baseTxHash ? `The mint is sent. Waiting for ${base} to confirm it.` : "Confirm the mint in your wallet."}
+        {state.mintTxHash ? `The mint is sent. Waiting for ${where} to confirm it.` : "Confirm the mint in your wallet."}
       </p>
     );
   }
@@ -179,7 +245,7 @@ function exitStep(exit: Exit, base: string): ReactNode {
     return <p className="exit-note">The hosted relayer is not answering about this transfer right now. The USDC is burned on Stellar and stays yours to mint.</p>;
   }
   if (state.phase === "untracked") {
-    return <p className="exit-note">This server cannot follow the mint. Circle attests the burn and it lands on {base} all the same.</p>;
+    return <p className="exit-note">This server cannot follow the mint. Circle attests the burn and it lands on {where} all the same.</p>;
   }
   return null;
 }
@@ -193,9 +259,13 @@ function signatureNote(state: ActionState, now: number | null): ReactNode {
 }
 
 /** Everything a connected key can do: fund the account, send from it, and watch each signature being checked. */
-export function Workspace({ network, signer, owner, prefillTo, relayer, proofHref }: WorkspaceProps) {
+export function Workspace({ network, signer, owner, prefillTo, relayer, paysBaseMints, proofHref }: WorkspaceProps) {
+  const [fundChain, setFundChain] = useState<EvmChainName>(FAUCET_CHAIN);
+  // The way back goes to the chain the USDC came from until another is picked for it.
+  const [exitChoice, setExitChoice] = useState<EvmChainName | null>(null);
+  const exitChain = exitChoice ?? fundChain;
   const twin = useTwin(owner, network);
-  const funding = useFunding(network);
+  const funding = useFunding(network, fundChain);
   const action = useAction(network);
   const exit = useExit(network);
   const activity = useActivity(twin.address, network);
@@ -204,7 +274,7 @@ export function Workspace({ network, signer, owner, prefillTo, relayer, proofHre
   const second = useNow("second", action.since !== null || state.phase === "review" || state.phase === "refused" || state.phase === "failed");
 
   const mainnet = network === "mainnet";
-  const base = networkConfig(network).evm.chain.name;
+  const config = networkConfig(network);
   const [burnAmount, setBurnAmount] = useState(mainnet ? "1" : "10");
   const [destination, setDestination] = useState<SendDestination>("stellar");
   const [to, setTo] = useState(prefillTo);
@@ -212,6 +282,13 @@ export function Workspace({ network, signer, owner, prefillTo, relayer, proofHre
   const [attempted, setAttempted] = useState(false);
 
   const isDemo = signer.isDemo;
+  // The demo key has no wallet: it is funded on Base Sepolia, and goes back there, where Paso submits the mint.
+  const back = chainOf(config, isDemo ? FAUCET_CHAIN : exitChain);
+  const chainOptions = (available: (name: EvmChainName) => boolean): ChainChoiceOption[] =>
+    chainsOf(config).map((chain) => ({ name: chain.name, label: chain.shortLabel, available: available(chain.name) }));
+  const choose = (set: (name: EvmChainName) => void) => (name: string) => {
+    if (isEvmChainName(name)) set(name);
+  };
   const short = shortAddress(owner);
   const verdict = verdictOf(action);
   const unserved = relayer === "not_serving" || relayer === "not_paying";
@@ -223,8 +300,8 @@ export function Workspace({ network, signer, owner, prefillTo, relayer, proofHre
       ? "Enter who receives it."
       : recipient.kind === "invalid"
         ? recipient.reason
-        : destination === "base" && recipient.kind === "stellar"
-          ? `Back to ${base} needs an Ethereum address or an ENS name.`
+        : destination === "evm" && recipient.kind === "stellar"
+          ? `Back to ${back.shortLabel} needs an Ethereum address or an ENS name.`
           : undefined;
   const amountError = attempted && !amount.trim() ? "Enter an amount." : undefined;
   const prepareProblem = state.phase === "failed" && state.stage === "prepare" ? state.error.message : undefined;
@@ -232,27 +309,28 @@ export function Workspace({ network, signer, owner, prefillTo, relayer, proofHre
   const review = () => {
     setAttempted(true);
     if (recipient.kind === "empty" || recipient.kind === "invalid" || !amount.trim()) return;
-    if (destination === "base" && recipient.kind === "stellar") return;
+    if (destination === "evm" && recipient.kind === "stellar") return;
     const request: ActionRequest =
-      destination === "base"
-        ? { kind: "exit", recipient: to.trim(), amount: amount.trim() }
+      destination === "evm"
+        ? { kind: "exit", recipient: to.trim(), amount: amount.trim(), chain: back.name }
         : { kind: "transfer", to: to.trim(), amount: amount.trim() };
     void action.prepare(request);
   };
 
   const chooseDestination = (next: SendDestination) => {
     setDestination(next);
-    if (next === "base" && (recipient.kind === "empty" || recipient.kind === "stellar")) setTo(owner);
+    // Back to an EVM chain goes to the connected wallet unless another address is typed.
+    if (next === "evm" && (recipient.kind === "empty" || recipient.kind === "stellar")) setTo(owner);
   };
 
   const empty = twin.balance !== null && twin.balance === 0n;
   let sendStatus: ReactNode;
   if (state.phase === "preparing") sendStatus = "Simulating the call on Stellar.";
-  else if (empty) sendStatus = `No USDC here yet. Bring some from ${base} first.`;
-  else if (destination === "base") {
-    sendStatus = mainnet
-      ? `Burned on Stellar. About 20 seconds later your wallet submits the mint on ${base}.`
-      : `Burned on Stellar, minted on ${base} about 20 seconds later.`;
+  else if (empty) sendStatus = "No USDC here yet. Bring some over first.";
+  else if (destination === "evm") {
+    sendStatus = serverMintsOn(back.name, paysBaseMints)
+      ? `Burned on Stellar, minted on ${back.label} about 20 seconds later.`
+      : `Burned on Stellar. About 20 seconds later your wallet submits the mint on ${back.label}${back.gasToken.isUsdc ? " and pays its gas in USDC" : ""}.`;
   } else if (recipient.kind === "address" || recipient.kind === "ens") sendStatus = "Goes to that address's Stellar account, deployed or not.";
   else sendStatus = "Paso's relayer pays the Stellar fee.";
 
@@ -269,7 +347,8 @@ export function Workspace({ network, signer, owner, prefillTo, relayer, proofHre
         stellarAddress={twin.address ?? undefined}
         balance={twin.balanceFormatted ?? (twin.status === "error" ? "unknown" : undefined)}
         deployed={twin.deployed ?? undefined}
-        evmHref={baseAddress(owner, network)}
+        evmHref={evmAddress(owner, network, funding.chain.name)}
+        evmHrefLabel={funding.chain.shortLabel}
         stellarHref={twin.link ?? undefined}
         evmNote={isDemo ? "a throwaway key kept in this browser" : undefined}
       />
@@ -285,6 +364,16 @@ export function Workspace({ network, signer, owner, prefillTo, relayer, proofHre
           ) : null}
           <FundPanel
             mode={isDemo ? "demo" : "wallet"}
+            chain={funding.chain.shortLabel}
+            chains={funding.chains.map(({ chain, available }) => ({ name: chain.name, label: chain.shortLabel, available }))}
+            chainName={funding.chain.name}
+            onChainChange={(name) => {
+              // A finished or failed request belongs to the chain it was for: a new chain starts from a clean panel.
+              choose(setFundChain)(name);
+              funding.reset();
+            }}
+            chainLocked={funding.chainLocked}
+            chainNote={holdingsNote(funding, network)}
             amount={isDemo ? funding.limits.faucetAmountFormatted : burnAmount}
             onAmountChange={setBurnAmount}
             busy={funding.isActive}
@@ -298,6 +387,15 @@ export function Workspace({ network, signer, owner, prefillTo, relayer, proofHre
           <SendForm
             destination={destination}
             onDestinationChange={chooseDestination}
+            chain={back.shortLabel}
+            chains={chainOptions((name) => !isDemo || name === FAUCET_CHAIN)}
+            chainName={back.name}
+            onChainChange={choose(setExitChoice)}
+            chainNote={
+              isDemo
+                ? `With the demo key USDC goes back to ${back.label} only, where Paso submits the mint. Connect a wallet to send it back to another chain.`
+                : undefined
+            }
             to={to}
             onToChange={setTo}
             toError={toError}
@@ -310,15 +408,15 @@ export function Workspace({ network, signer, owner, prefillTo, relayer, proofHre
             onSubmit={review}
             status={sendStatus}
           >
-            {exit.phase === "idle" ? null : (
+            {exit.phase === "idle" || !exit.chain ? null : (
               <div className="exit">
                 <p>
-                  <b>Back to {base}</b>
+                  <b>Back to {exit.chain.shortLabel}</b>
                   {exit.tracked ? (
                     <StopTracking onStop={exit.stopTracking}>
                       The USDC is still on its way: it is burned on Stellar (
-                      <ExternalLink href={exit.tracked.link}>the burn</ExternalLink>) and is minted on {base} whether it is
-                      followed here or not.
+                      <ExternalLink href={exit.tracked.link}>the burn</ExternalLink>) and is minted on {exit.chain.label} whether
+                      it is followed here or not.
                     </StopTracking>
                   ) : (
                     <button type="button" className="linkbtn" onClick={exit.stopTracking}>
@@ -327,7 +425,7 @@ export function Workspace({ network, signer, owner, prefillTo, relayer, proofHre
                   )}
                 </p>
                 <Tracker compact stages={exitStages(exit)} />
-                {exitStep(exit, base)}
+                {exitStep(exit)}
                 {exit.tracked && !exit.tracked.saved ? (
                   <p className="exit-note">This browser keeps no storage, so a reload forgets the tracker. The USDC is unaffected.</p>
                 ) : null}

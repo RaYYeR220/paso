@@ -1,15 +1,18 @@
-import { decodeBurnMessage, type NetworkConfig, type NetworkName } from "@paso/sdk";
+import { decodeBurnMessage, DEFAULT_EVM_CHAIN, type EvmChainName, type NetworkConfig, type NetworkName } from "@paso/sdk";
 import { StrKey } from "@stellar/stellar-sdk";
 import { isHex, size, toHex, type Hex } from "viem";
 import { declineReason, type DeclineReason } from "./api";
+import { chainOf, gasSymbol, storedChain } from "./chains";
 import { describeError } from "./errors";
 import { readJson, removeKey, writeJson, type KeyValueStore } from "./storage";
 import { createStore, type Listener } from "./store";
 
-/** USDC that left a Stellar account for Base: burned on Stellar, on its way to being minted on Base. */
+/** USDC that left a Stellar account for an EVM chain: burned on Stellar, on its way to being minted there. */
 export interface ExitTransfer {
   /** The network the burn was made on. A transfer is never followed on another. */
   network: NetworkName;
+  /** The chain the USDC is minted on. A record kept before there was a choice names none, and is read as Base. */
+  chain: EvmChainName;
   /** The Stellar transaction that burned the USDC. */
   stellarTxHash: string;
   /** When the burn was confirmed, in milliseconds. */
@@ -35,7 +38,7 @@ export type ExitState =
     }
   /**
    * Attested, and the last step is the owner's: the server does not pay for
-   * mints on this network, so the wallet submits the message on Base.
+   * mints on this chain, so the wallet submits the message there.
    */
   | {
       phase: "attested";
@@ -47,28 +50,29 @@ export type ExitState =
       /** Why the last attempt did not go through. The step is still open. */
       problem?: string;
     }
-  /** The wallet has been asked for the mint, or has sent it and Base has not confirmed it yet. */
-  | { phase: "minting"; transfer: ExitTransfer; message: Hex; attestation: Hex; baseTxHash?: Hex }
-  | { phase: "minted"; transfer: ExitTransfer; baseTxHash?: string; finishedAt: number }
+  /** The wallet has been asked for the mint, or has sent it and the chain has not confirmed it yet. */
+  | { phase: "minting"; transfer: ExitTransfer; message: Hex; attestation: Hex; mintTxHash?: Hex }
+  | { phase: "minted"; transfer: ExitTransfer; mintTxHash?: string; finishedAt: number }
   /**
    * The server cannot follow the transfer. The USDC still arrives: the burn
-   * is attested by Circle and the mint on Base needs no help from Paso.
+   * is attested by Circle and the mint needs no help from Paso.
    */
   | { phase: "untracked"; transfer: ExitTransfer };
 
 export type ExitAnswer =
   | { status: "pending"; attestation: ExitAttestation }
   | { status: "minted"; hash?: string }
-  /** Checked by the server and handed back: the wallet submits these two on Base. */
+  /** Checked by the server and handed back: the wallet submits these two on the chain the exit is for. */
   | { status: "attested"; message: Hex; attestation: Hex }
   | { status: "unsupported" };
 
 export type StageStatus = "waiting" | "active" | "done" | "failed";
 
-/** One of the three steps of a transfer back to Base, in Circle's words. */
+/** One of the three steps of a transfer back to an EVM chain, in Circle's words. */
 export interface ExitStage {
   id: "burned" | "attested" | "minted";
-  label: "Burned on Stellar" | "Attested by Circle" | "Minted on Base";
+  /** "Burned on Stellar", "Attested by Circle", "Minted on Arc". */
+  label: string;
   status: StageStatus;
 }
 
@@ -97,16 +101,16 @@ export interface AskExitOptions {
 
 /**
  * Whether a CCTP message is what an exit from a Paso account looks like on
- * `network`: burned on its Stellar, for its Base, at the request of its hub.
- * The server checks the same before it hands a message back; the wallet is
- * asked to pay for nothing that does not also pass here.
+ * `network`: burned on its Stellar, for `chain` (Base unless named), at the
+ * request of its hub. The server checks the same before it hands a message
+ * back; the wallet is asked to pay for nothing that does not also pass here.
  */
-export function isHubExit(message: Hex, network: NetworkConfig): boolean {
+export function isHubExit(message: Hex, network: NetworkConfig, chain: EvmChainName = DEFAULT_EVM_CHAIN): boolean {
   try {
     const burn = decodeBurnMessage(message.toLowerCase() as Hex);
     return (
       burn.sourceDomain === network.stellar.cctpDomain &&
-      burn.destinationDomain === network.evm.cctpDomain &&
+      burn.destinationDomain === chainOf(network, chain).cctpDomain &&
       burn.messageSender === toHex(StrKey.decodeContract(network.stellar.hub))
     );
   } catch {
@@ -115,7 +119,7 @@ export function isHubExit(message: Hex, network: NetworkConfig): boolean {
 }
 
 /**
- * Asks the server once how far a transfer back to Base has come. A server
+ * Asks the server once how far a transfer back to an EVM chain has come. A server
  * without the route answers 404, which is reported as `unsupported` rather
  * than as a failure. A refusal is thrown, with the server's reason for
  * declining when it gave one.
@@ -151,38 +155,41 @@ export async function askExit(txHash: string, options: AskExitOptions): Promise<
   return { status: "pending", attestation: attestation as ExitAttestation };
 }
 
-/** What the watcher reads from Base itself, with no wallet and no server. */
-export interface BaseReader {
-  /** Whether Circle's MessageTransmitter on Base has taken the message: the USDC is minted, by whoever. */
-  isReceived(message: Hex): Promise<boolean>;
-  /** What became of a mint that was sent: `null` while Base has not included it. */
-  receipt(hash: Hex): Promise<"success" | "reverted" | null>;
+/** What the watcher reads from the chain an exit is for, with no wallet and no server. */
+export interface ChainReader {
+  /** Whether Circle's MessageTransmitter on `chain` has taken the message: the USDC is minted, by whoever. */
+  isReceived(message: Hex, chain: EvmChainName): Promise<boolean>;
+  /** What became of a mint that was sent: `null` while `chain` has not included it. */
+  receipt(hash: Hex, chain: EvmChainName): Promise<"success" | "reverted" | null>;
 }
 
 /**
- * Has the wallet submit the mint. Resolves when Base has confirmed it, or
- * when the message turns out to have been received already; `onSubmitted`
- * is called with the transaction as soon as the wallet has sent it.
+ * Has the wallet submit the mint on `chain`. Resolves when the chain has
+ * confirmed it, or when the message turns out to have been received
+ * already; `onSubmitted` is called with the transaction as soon as the
+ * wallet has sent it.
  */
 export type SubmitMint = (mint: {
   message: Hex;
   attestation: Hex;
+  chain: EvmChainName;
   onSubmitted: (hash: Hex) => void;
 }) => Promise<{ hash?: Hex; alreadyReceived: boolean }>;
 
 export interface ExitWatcherDeps {
   /** The network the watcher follows transfers on. One from any other is refused. */
   network: NetworkName;
-  ask: (txHash: string, signal: AbortSignal) => Promise<ExitAnswer>;
-  /** Reads of Base, for a transfer whose mint is left to the wallet. Without it only the wallet's own answer is known. */
-  base?: BaseReader;
+  /** Asks the server once about the exit in `txHash`, for `chain`. */
+  ask: (txHash: string, signal: AbortSignal, chain: EvmChainName) => Promise<ExitAnswer>;
+  /** Reads of the chains, for a transfer whose mint is left to the wallet. Without it only the wallet's own answer is known. */
+  reader?: ChainReader;
   /** Where the transfer in flight is kept, so a reload carries on following it. */
   storage: KeyValueStore | null;
   storageKey: string;
   now?: () => number;
   /** Time between two questions to the server, in milliseconds. */
   intervalMs?: number;
-  /** Time between two looks at Base while the mint is the wallet's to make or on its way. */
+  /** Time between two looks at the chain while the mint is the wallet's to make or on its way. */
   receivedCheckMs?: number;
   setTimeout?: (run: () => void, ms: number) => unknown;
   clearTimeout?: (handle: unknown) => void;
@@ -199,7 +206,7 @@ export interface ExitWatcher {
   getState(): ExitState;
   subscribe(listener: Listener): () => void;
   /**
-   * Follows a burn until it is minted on Base. Returns false, and changes
+   * Follows a burn until it is minted on its chain. Returns false, and changes
    * nothing, while another burn is on record, or when the burn is another
    * network's: one in flight is never written over.
    */
@@ -208,14 +215,14 @@ export interface ExitWatcher {
   restore(): boolean;
   /**
    * The last step where the server does not mint: has the wallet submit the
-   * attested message on Base. Does nothing unless the transfer is waiting
+   * attested message on the transfer's chain. Does nothing unless the transfer is waiting
    * for exactly that, so two clicks ask the wallet once, and a mint already
    * on its way is never sent a second time.
    */
   mint(submit: SubmitMint): Promise<void>;
   /**
    * Stops following and forgets the transfer. The only way a burn leaves the
-   * record short of being minted: the USDC still arrives on Base.
+   * record short of being minted: the USDC still arrives on its chain.
    */
   stopTracking(): void;
   /** The burn on record, if any. */
@@ -226,7 +233,8 @@ const DEFAULT_INTERVAL_MS = 2_000;
 const DEFAULT_RECEIVED_CHECK_MS = 10_000;
 const MAX_BACKOFF_STEPS = 5;
 
-const MINT_REVERTED = "The mint reverted on Base. Nothing was minted, and it can be tried again.";
+const mintReverted = (chainLabel: string): string =>
+  `The mint reverted on ${chainLabel}. Nothing was minted, and it can be tried again.`;
 
 export function exitStorageKey(network: NetworkName, owner: string): string {
   return `paso.exit.${network}.${owner.toLowerCase()}`;
@@ -235,7 +243,8 @@ export function exitStorageKey(network: NetworkName, owner: string): string {
 /**
  * A stored transfer of this network. A record that names another network is
  * not one. A record that names none was made before networks were named,
- * when there was only testnet: it is testnet's and nobody else's.
+ * when there was only testnet: it is testnet's and nobody else's. A record
+ * that names no chain was made before there was a choice: it is Base's.
  */
 function recordOf(value: unknown, network: NetworkName): ExitRecord | null {
   if (!isRecord(value)) return null;
@@ -243,29 +252,38 @@ function recordOf(value: unknown, network: NetworkName): ExitRecord | null {
   if (typeof stellarTxHash !== "string" || !/^[0-9a-fA-F]{64}$/.test(stellarTxHash) || typeof startedAt !== "number") return null;
   const named = value.network === undefined ? "testnet" : value.network;
   if (named !== network) return null;
+  const chain = storedChain(value.chain, network);
+  if (!chain) return null;
   return {
     network,
+    chain,
     stellarTxHash,
     startedAt,
     ...(typeof mintTxHash === "string" && /^0x[0-9a-fA-F]{64}$/.test(mintTxHash) ? { mintTxHash: mintTxHash as Hex } : {}),
   };
 }
 
-const transferOf = ({ network, stellarTxHash, startedAt }: ExitRecord): ExitTransfer => ({ network, stellarTxHash, startedAt });
+const transferOf = ({ network, chain, stellarTxHash, startedAt }: ExitRecord): ExitTransfer => ({
+  network,
+  chain,
+  stellarTxHash,
+  startedAt,
+});
 
 /**
- * Follows USDC on its way back to Base. Like a burn on Base, a burn on
- * Stellar is money in transit: it goes on record when it is first watched
- * and stays there until it is minted or the owner says to stop tracking it.
+ * Follows USDC on its way back to an EVM chain. Like a burn on that chain, a
+ * burn on Stellar is money in transit: it goes on record, with the chain it
+ * is for, when it is first watched and stays there until it is minted or the
+ * owner says to stop tracking it.
  *
  * Where the server mints, the watcher only asks it how far things are. Where
- * it does not, the server hands back the attested message and the watcher
- * takes over: it looks at Base for the message, offers the mint to the
- * wallet, remembers a mint the wallet sent, and never asks for a second one
- * while the first may still land.
+ * it does not, on any chain but Base Sepolia, the server hands back the
+ * attested message and the watcher takes over: it looks at the chain for the
+ * message, offers the mint to the wallet, remembers a mint the wallet sent,
+ * and never asks for a second one while the first may still land.
  */
 export function createExitWatcher(deps: ExitWatcherDeps): ExitWatcher {
-  const { storage, storageKey, network, base } = deps;
+  const { storage, storageKey, network, reader } = deps;
   const now = deps.now ?? Date.now;
   const intervalMs = deps.intervalMs ?? DEFAULT_INTERVAL_MS;
   const receivedCheckMs = deps.receivedCheckMs ?? DEFAULT_RECEIVED_CHECK_MS;
@@ -307,22 +325,24 @@ export function createExitWatcher(deps: ExitWatcherDeps): ExitWatcher {
     abort = undefined;
   }
 
-  function minted(transfer: ExitTransfer, baseTxHash?: string): void {
+  function minted(transfer: ExitTransfer, mintTxHash?: string): void {
     halt();
     forget();
-    store.set({ phase: "minted", transfer, ...(baseTxHash ? { baseTxHash } : {}), finishedAt: now() });
+    store.set({ phase: "minted", transfer, ...(mintTxHash ? { mintTxHash } : {}), finishedAt: now() });
   }
 
-  const received = async (message: Hex): Promise<boolean> => (base ? base.isReceived(message).catch(() => false) : false);
+  const received = async (message: Hex, chain: EvmChainName): Promise<boolean> =>
+    reader ? reader.isReceived(message, chain).catch(() => false) : false;
+  const label = (transfer: ExitTransfer): string => chainOf(network, transfer.chain).label;
 
-  /** The last step is open: looks at Base now and then, in case someone else makes the mint. */
+  /** The last step is open: looks at the chain now and then, in case someone else makes the mint. */
   function awaitWallet(transfer: ExitTransfer, message: Hex, attestation: Hex, extra: { notice?: "declined"; problem?: string } = {}): void {
     halt();
     const mine = epoch;
     store.set({ phase: "attested", transfer, message, attestation, ...extra });
-    if (!base) return;
+    if (!reader) return;
     const look = async (): Promise<void> => {
-      const done = await received(message);
+      const done = await received(message, transfer.chain);
       if (epoch !== mine) return;
       if (done) minted(transfer);
       else timer = schedule(() => void look(), receivedCheckMs);
@@ -330,21 +350,21 @@ export function createExitWatcher(deps: ExitWatcherDeps): ExitWatcher {
     timer = schedule(() => void look(), receivedCheckMs);
   }
 
-  /** A mint was sent and its outcome is not known: Base is asked until it says, and the wallet is not asked again. */
+  /** A mint was sent and its outcome is not known: the chain is asked until it says, and the wallet is not asked again. */
   function awaitMint(transfer: ExitTransfer, message: Hex, attestation: Hex, hash: Hex): void {
     halt();
     const mine = epoch;
-    store.set({ phase: "minting", transfer, message, attestation, baseTxHash: hash });
-    if (!base) return;
+    store.set({ phase: "minting", transfer, message, attestation, mintTxHash: hash });
+    if (!reader) return;
     const look = async (): Promise<void> => {
-      const receipt = await base.receipt(hash).catch(() => null);
-      const done = await received(message);
+      const receipt = await reader.receipt(hash, transfer.chain).catch(() => null);
+      const done = await received(message, transfer.chain);
       if (epoch !== mine) return;
       if (done) {
         minted(transfer, receipt === "success" ? hash : undefined);
       } else if (receipt === "reverted") {
         remember(transfer);
-        awaitWallet(transfer, message, attestation, { problem: MINT_REVERTED });
+        awaitWallet(transfer, message, attestation, { problem: mintReverted(label(transfer)) });
       } else {
         timer = schedule(() => void look(), receivedCheckMs);
       }
@@ -354,7 +374,7 @@ export function createExitWatcher(deps: ExitWatcherDeps): ExitWatcher {
 
   async function handOver(record: ExitRecord, message: Hex, attestation: Hex, mine: number): Promise<void> {
     const transfer = transferOf(record);
-    const done = await received(message);
+    const done = await received(message, transfer.chain);
     if (epoch !== mine) return;
     if (done) minted(transfer);
     else if (record.mintTxHash) awaitMint(transfer, message, attestation, record.mintTxHash);
@@ -369,7 +389,7 @@ export function createExitWatcher(deps: ExitWatcherDeps): ExitWatcher {
     let answer: ExitAnswer | null;
     let held: DeclineReason | undefined;
     try {
-      answer = await deps.ask(transfer.stellarTxHash, controller.signal);
+      answer = await deps.ask(transfer.stellarTxHash, controller.signal, transfer.chain);
     } catch (error) {
       answer = null;
       held = declineReason((error as { reason?: unknown } | null)?.reason);
@@ -412,7 +432,7 @@ export function createExitWatcher(deps: ExitWatcherDeps): ExitWatcher {
     subscribe: store.subscribe,
 
     watch(transfer) {
-      if (transfer.network !== network) return false;
+      if (transfer.network !== network || !storedChain(transfer.chain, network)) return false;
       const known = onRecord();
       if (known) return known.stellarTxHash === transfer.stellarTxHash;
       const current = store.get();
@@ -443,24 +463,26 @@ export function createExitWatcher(deps: ExitWatcherDeps): ExitWatcher {
         const result = await submit({
           message,
           attestation,
+          chain: transfer.chain,
           onSubmitted(hash) {
             if (!live()) return;
             sent = hash;
-            // On record from the moment Base has the mint: a reload while it confirms does not ask for another.
+            // On record from the moment the chain has the mint: a reload while it confirms does not ask for another.
             remember({ ...transfer, mintTxHash: hash });
-            store.set({ phase: "minting", transfer, message, attestation, baseTxHash: hash });
+            store.set({ phase: "minting", transfer, message, attestation, mintTxHash: hash });
           },
         });
         if (live()) minted(transfer, result.alreadyReceived ? undefined : (result.hash ?? sent));
       } catch (error) {
         if (!live()) return;
-        const problem = describeError(error);
+        const chain = chainOf(network, transfer.chain);
+        const problem = describeError(error, { chain: chain.label, gas: gasSymbol(chain) });
         if (sent && !(problem.kind === "error" && problem.code === "reverted")) {
-          // Base has the transaction and nobody here saw what became of it: it is waited for, not sent again.
+          // The chain has the transaction and nobody here saw what became of it: it is waited for, not sent again.
           awaitMint(transfer, message, attestation, sent);
         } else if (sent) {
           remember(transfer);
-          awaitWallet(transfer, message, attestation, { problem: MINT_REVERTED });
+          awaitWallet(transfer, message, attestation, { problem: mintReverted(chain.label) });
         } else if (problem.kind === "rejected") {
           awaitWallet(transfer, message, attestation, { notice: "declined" });
         } else {
@@ -482,26 +504,26 @@ export function createExitWatcher(deps: ExitWatcherDeps): ExitWatcher {
   };
 }
 
-function stages(burned: StageStatus, attested: StageStatus, minted: StageStatus): ExitStage[] {
+function stages(chainLabel: string, burned: StageStatus, attested: StageStatus, minted: StageStatus): ExitStage[] {
   return [
     { id: "burned", label: "Burned on Stellar", status: burned },
     { id: "attested", label: "Attested by Circle", status: attested },
-    { id: "minted", label: "Minted on Base", status: minted },
+    { id: "minted", label: `Minted on ${chainLabel}`, status: minted },
   ];
 }
 
-/** The three-step tracker of a transfer back to Base. */
-export function exitStages(state: ExitState): ExitStage[] {
+/** The three-step tracker of a transfer back to an EVM chain. `chainLabel` names it: "Base", "Arc". */
+export function exitStages(state: ExitState, chainLabel: string): ExitStage[] {
   switch (state.phase) {
     case "idle":
-      return stages("waiting", "waiting", "waiting");
+      return stages(chainLabel, "waiting", "waiting", "waiting");
     case "attesting":
     case "untracked":
-      return stages("done", "active", "waiting");
+      return stages(chainLabel, "done", "active", "waiting");
     case "attested":
     case "minting":
-      return stages("done", "done", "active");
+      return stages(chainLabel, "done", "done", "active");
     case "minted":
-      return stages("done", "done", "done");
+      return stages(chainLabel, "done", "done", "done");
   }
 }

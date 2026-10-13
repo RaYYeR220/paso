@@ -5,7 +5,7 @@ import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type { Address } from "viem";
 import { resolveEnsName } from "./ens";
 import { describeFailure } from "./errors";
-import { baseAddress } from "./explorer";
+import { evmAddress } from "./explorer";
 import { parseOwnerInput, type ParsedOwner } from "./parse";
 import { createStore, type Store } from "./store";
 import { useTwin, type Twin } from "./useTwin";
@@ -148,7 +148,7 @@ export function useLookup(input: string, network: NetworkName): Lookup {
       owner,
       twin,
       error,
-      ownerLink: owner ? baseAddress(owner, network) : null,
+      ownerLink: owner ? evmAddress(owner, network) : null,
     };
   }, [parsed, name, typedName, resolution, owner, twin, network]);
 }

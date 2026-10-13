@@ -52,7 +52,7 @@ export function SignerChooser({
           <h2>Connect an EVM wallet</h2>
           <p>
             {mainnet
-              ? "A regular wallet on Base: MetaMask, Rabby, Coinbase Wallet or a Ledger. A smart-contract wallet cannot sign for a Stellar account."
+              ? "A regular wallet: MetaMask, Rabby, Coinbase Wallet or a Ledger. A smart-contract wallet cannot sign for a Stellar account."
               : "MetaMask, Rabby, Coinbase Wallet or a Ledger. Nothing to install, no seed phrase, no XLM."}
           </p>
           {wallets.length > 0 ? (

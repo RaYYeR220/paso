@@ -1,4 +1,4 @@
-import { erc20Abi, messageTransmitterAbi, tokenMessengerAbi, type NetworkConfig } from "@paso/sdk";
+import { erc20Abi, listEvmChains, messageTransmitterAbi, tokenMessengerAbi, type EvmChainConfig, type NetworkConfig } from "@paso/sdk";
 import type { Page } from "@playwright/test";
 import {
   createPublicClient,
@@ -15,7 +15,7 @@ import {
 import type { PrivateKeyAccount } from "viem/accounts";
 import { mainnet } from "viem/chains";
 
-/** What the wallet sent on Base, in the order it sent it. */
+/** What the wallet sent on the chain of the run, in the order it sent it. */
 export interface SentTransaction {
   kind: "approve" | "burn" | "mint";
   hash: Hex;
@@ -23,9 +23,11 @@ export interface SentTransaction {
 
 export interface SyntheticWalletOptions {
   account: PrivateKeyAccount;
-  /** The network of the run. The wallet sends transactions on its Base and nowhere else. */
+  /** The network of the run. The wallet can be switched to any of its EVM chains. */
   network: NetworkConfig;
-  /** RPC endpoint for that Base. The chain's public endpoint when absent. */
+  /** The chain of the run: the wallet sends transactions there and nowhere else. */
+  chain: EvmChainConfig;
+  /** RPC endpoint for that chain. The first public endpoint the SDK lists for it when absent. */
   rpcUrl?: string;
   /** The most USDC, in 6-decimal units, the wallet will approve or burn in one transaction. */
   spendLimit: bigint;
@@ -47,8 +49,9 @@ class ProviderError extends Error {
  * `window.ethereum` whose every request is answered here, by a viem account
  * and a real RPC endpoint. It approves whatever it is asked, with one
  * exception: it sends only the three transactions the journey consists of,
- * to Circle's contracts and to USDC on the network's Base, within the spend
- * limit, with no ETH attached. Anything else it refuses, and the run fails.
+ * to Circle's contracts and to USDC on the chain of the run, within the
+ * spend limit, with no value attached. Anything else it refuses, and the run
+ * fails.
  *
  * The private key stays in this process. The page sees the address.
  */
@@ -62,10 +65,10 @@ export class SyntheticWallet {
   private readonly chains: Map<number, { chain: Chain; rpcUrl?: string }>;
 
   constructor(private readonly options: SyntheticWalletOptions) {
-    const base = options.network.evm.chain;
     this.chains = new Map([
       [mainnet.id, { chain: mainnet, rpcUrl: "https://ethereum-rpc.publicnode.com" }],
-      [base.id, { chain: base, rpcUrl: options.rpcUrl }],
+      ...listEvmChains(options.network).map((listed) => [listed.chain.id, { chain: listed.chain, rpcUrl: listed.rpcUrls[0] }] as const),
+      [options.chain.chain.id, { chain: options.chain.chain, rpcUrl: options.rpcUrl ?? options.chain.rpcUrls[0] }],
     ]);
     this.chainId = options.startChainId ?? mainnet.id;
   }
@@ -176,11 +179,11 @@ export class SyntheticWallet {
 
   /** The transaction the app asks for, if it is one of the three the journey has. Throws for anything else. */
   private vet(tx: { to?: Address; data?: Hex; value?: Hex }): SentTransaction["kind"] {
-    const { usdc, tokenMessenger, messageTransmitter, chain } = this.options.network.evm;
+    const { usdc, tokenMessenger, messageTransmitter, chain, label } = this.options.chain;
     const { spendLimit } = this.options;
-    if (this.chainId !== chain.id) throw new ProviderError(4901, `The wallet is on chain ${this.chainId}, not on ${chain.name}`);
+    if (this.chainId !== chain.id) throw new ProviderError(4901, `The wallet is on chain ${this.chainId}, not on ${label}`);
     if (!tx.to || !tx.data) throw new ProviderError(4100, "The synthetic wallet sends contract calls only");
-    if (tx.value !== undefined && BigInt(tx.value) !== 0n) throw new ProviderError(4100, "The synthetic wallet attaches no ETH");
+    if (tx.value !== undefined && BigInt(tx.value) !== 0n) throw new ProviderError(4100, "The synthetic wallet attaches no value");
 
     if (isAddressEqual(tx.to, usdc)) {
       const call = decodeFunctionData({ abi: erc20Abi, data: tx.data });

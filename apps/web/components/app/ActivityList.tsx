@@ -6,13 +6,14 @@ export interface ActivityItem {
   kind: "received" | "sent" | "refused";
   /** True while the entry is still under way. */
   pending?: boolean;
-  /** "Received 10.00 USDC from Base". */
+  /** "Received 10.00 USDC from Arbitrum". */
   text: string;
   /** "2 min ago". */
   time?: string;
   /** ISO timestamp for the `time` element. */
   dateTime?: string;
-  links: readonly { label: "Base" | "Stellar"; href: string }[];
+  /** Each named after its chain: "Base", "Arc", "Stellar". */
+  links: readonly { label: string; href: string }[];
 }
 
 export interface ActivityListProps {
@@ -37,7 +38,7 @@ export function ActivityList({ items, loading = false, footnote }: ActivityListP
         </ul>
       ) : items.length === 0 ? (
         <p className="activity-empty">
-          Nothing yet. USDC arriving from Base, sends and refused calls are listed here as they happen.
+          Nothing yet. USDC arriving from another chain, sends and refused calls are listed here as they happen.
         </p>
       ) : (
         <ul>

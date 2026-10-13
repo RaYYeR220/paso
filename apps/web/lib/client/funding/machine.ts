@@ -1,20 +1,22 @@
-import type { InboundRoute, NetworkName } from "@paso/sdk";
+import type { EvmChainName, InboundRoute, NetworkName } from "@paso/sdk";
 import type { Address, Hex } from "viem";
 import type { DeclineReason } from "../api";
 
-/** Who pays the burn on Base: the connected wallet, or the testnet faucet. */
+/** Who pays the burn: the connected wallet, or the testnet faucet on Base Sepolia. */
 export type FundingVia = "wallet" | "demo";
 
-/** A burn on Base on its way to a Stellar account. Plain JSON: it is kept in `localStorage` while in flight. */
+/** A burn on an EVM chain on its way to a Stellar account. Plain JSON: it is kept in `localStorage` while in flight. */
 export interface Transfer {
   network: NetworkName;
+  /** The chain the USDC left. A record kept before there was a choice names none, and is read as Base. */
+  chain: EvmChainName;
   burnTxHash: Hex;
   /** CCTP domain of the chain the burn happened on. */
   sourceDomain: number;
   owner: Address;
   /** The Stellar account being funded. */
   twin: string;
-  /** USDC burned, in Base's 6-decimal units, as text; `null` when tracking a burn made elsewhere. */
+  /** USDC burned, in the chain's 6-decimal units, as text; `null` when tracking a burn made elsewhere. */
   amount: string | null;
   via: FundingVia;
   /** When tracking began, in milliseconds. Survives a reload, so the timer does too. */
@@ -23,15 +25,15 @@ export interface Transfer {
 
 /** What the wallet is being asked for while the burn is prepared. */
 export type RequestStep =
-  /** Asking the faucet, or getting the wallet onto Base. */
+  /** Asking the faucet, or getting the wallet onto the chain. */
   | "starting"
   /** The wallet shows the USDC approval. */
   | "approving"
-  /** The approval is sent and waiting for Base. */
+  /** The approval is sent and waiting for the chain. */
   | "approved"
   /** The wallet shows the burn. */
   | "burning"
-  /** The burn is sent and waiting for Base. */
+  /** The burn is sent and waiting for the chain. */
   | "confirming";
 
 /** What Circle's attestation service last said about the burn. */
@@ -74,6 +76,8 @@ export type FundingState =
   | {
       phase: "requesting";
       via: FundingVia;
+      /** The chain the USDC leaves. */
+      chain: EvmChainName;
       owner: Address;
       /** 6-decimal units as text; `null` until the faucet says how much it sent. */
       amount: string | null;
@@ -107,10 +111,17 @@ export type FundingState =
       route: InboundRoute;
       finishedAt: number;
     }
-  | { phase: "failed"; reason: FundingFailure; transfer?: Transfer; failedAt: number };
+  | {
+      phase: "failed";
+      reason: FundingFailure;
+      transfer?: Transfer;
+      /** The chain the request was for: a burn that may have been sent is looked for there. */
+      chain: EvmChainName;
+      failedAt: number;
+    };
 
 export type FundingEvent =
-  | { type: "REQUEST"; via: FundingVia; owner: Address; amount: string | null; at: number }
+  | { type: "REQUEST"; via: FundingVia; chain: EvmChainName; owner: Address; amount: string | null; at: number }
   | { type: "STEP"; step: RequestStep; approveTxHash?: Hex; burnTxHash?: Hex }
   | { type: "BURNED"; transfer: Transfer }
   /** Tracking picked up again: after a reload, or for a burn made elsewhere. */
@@ -148,6 +159,7 @@ export function fundingReducer(state: FundingState, event: FundingEvent): Fundin
       return {
         phase: "requesting",
         via: event.via,
+        chain: event.chain,
         owner: event.owner,
         amount: event.amount,
         step: "starting",
@@ -203,7 +215,9 @@ export function fundingReducer(state: FundingState, event: FundingEvent): Fundin
     case "FAILED": {
       if (!isFundingActive(state)) return state;
       const transfer = transferOf(state);
-      return { phase: "failed", reason: event.reason, ...(transfer ? { transfer } : {}), failedAt: event.at };
+      const chain = transfer?.chain ?? (state.phase === "requesting" ? state.chain : undefined);
+      if (!chain) return state;
+      return { phase: "failed", reason: event.reason, ...(transfer ? { transfer } : {}), chain, failedAt: event.at };
     }
 
     case "CANCELLED":
@@ -220,42 +234,49 @@ export type StageStatus = "waiting" | "active" | "done" | "failed";
 /** One of the three steps of a transfer, in Circle's words. */
 export interface TrackerStage {
   id: "burned" | "attested" | "minted";
-  label: "Burned on Base" | "Attested by Circle" | "Minted on Stellar";
+  /** "Burned on Arbitrum", "Attested by Circle", "Minted on Stellar". */
+  label: string;
   status: StageStatus;
 }
 
-const STAGE_LABELS = {
-  burned: "Burned on Base",
-  attested: "Attested by Circle",
-  minted: "Minted on Stellar",
-} as const;
-
-function stages(burned: StageStatus, attested: StageStatus, minted: StageStatus): TrackerStage[] {
+function stages(chainLabel: string, burned: StageStatus, attested: StageStatus, minted: StageStatus): TrackerStage[] {
   return [
-    { id: "burned", label: STAGE_LABELS.burned, status: burned },
-    { id: "attested", label: STAGE_LABELS.attested, status: attested },
-    { id: "minted", label: STAGE_LABELS.minted, status: minted },
+    { id: "burned", label: `Burned on ${chainLabel}`, status: burned },
+    { id: "attested", label: "Attested by Circle", status: attested },
+    { id: "minted", label: "Minted on Stellar", status: minted },
   ];
 }
 
-/** The three-step tracker for a state: which step is done, which is running, which is waiting. */
-export function trackerStages(state: FundingState): TrackerStage[] {
+/**
+ * The three-step tracker for a state: which step is done, which is running,
+ * which is waiting. `chainLabel` names the chain the USDC leaves: "Base",
+ * "Arbitrum", "Arc".
+ */
+export function trackerStages(state: FundingState, chainLabel: string): TrackerStage[] {
   switch (state.phase) {
     case "idle":
-      return stages("waiting", "waiting", "waiting");
+      return stages(chainLabel, "waiting", "waiting", "waiting");
     case "requesting":
-      return stages("active", "waiting", "waiting");
+      return stages(chainLabel, "active", "waiting", "waiting");
     case "burned":
     case "attesting":
-      return stages("done", "active", "waiting");
+      return stages(chainLabel, "done", "active", "waiting");
     case "delivering":
-      return stages("done", "done", "active");
+      return stages(chainLabel, "done", "done", "active");
     case "minted":
-      return stages("done", "done", "done");
+      return stages(chainLabel, "done", "done", "done");
     case "failed":
-      if (!state.transfer) return stages("failed", "waiting", "waiting");
+      if (!state.transfer) return stages(chainLabel, "failed", "waiting", "waiting");
       return state.reason.code === "undeliverable"
-        ? stages("done", "done", "failed")
-        : stages("done", "failed", "waiting");
+        ? stages(chainLabel, "done", "done", "failed")
+        : stages(chainLabel, "done", "failed", "waiting");
   }
+}
+
+/** The chain a state is about: its transfer's, or the one being asked for. `null` while idle. */
+export function chainOfState(state: FundingState): EvmChainName | null {
+  if (state.phase === "idle") return null;
+  if (state.phase === "requesting") return state.chain;
+  if (state.phase === "failed") return state.transfer?.chain ?? state.chain;
+  return state.transfer.chain;
 }

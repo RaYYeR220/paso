@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { formatEvmAmount, NETWORKS, parseEvmAmount, twinAddress, type NetworkName } from "@paso/sdk";
+import { evmChain, formatEvmAmount, isEvmChainName, NETWORKS, parseEvmAmount, twinAddress, type NetworkName } from "@paso/sdk";
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { concat, getAddress, isAddress, keccak256, stringToHex, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -8,8 +8,9 @@ import { SyntheticWallet } from "./wallet";
 
 /**
  * One journey through the app with a wallet that is not an extension:
- * connect, bring USDC from Base, send some on to another address's account,
- * send some back to Base, and on testnet watch a changed call be refused.
+ * connect, bring USDC from an EVM chain (Base unless `PASO_E2E_CHAIN` names
+ * another), send some on to another address's account, send some back to the
+ * same chain, and on testnet watch a changed call be refused.
  *
  * Every step goes through the page, and every signature and transaction
  * through the provider the page finds at `window.ethereum`. On mainnet the
@@ -32,8 +33,12 @@ function walletKey(): Hex {
   return key as Hex;
 }
 
+const chainName = process.env.PASO_E2E_CHAIN?.trim() || "base";
+if (!isEvmChainName(chainName)) throw new Error("PASO_E2E_CHAIN must be base, ethereum, arbitrum, optimism or arc");
+
 const config = NETWORKS[network];
-const base = config.evm.chain.name;
+const chain = evmChain(config, chainName);
+const base = chain.label;
 const amounts = {
   bring: process.env.PASO_E2E_BRING?.trim() || "0.5",
   send: process.env.PASO_E2E_SEND?.trim() || "0.1",
@@ -84,7 +89,8 @@ test(`${network}: connect, bring ${amounts.bring} USDC from ${base}, send ${amou
   const wallet = new SyntheticWallet({
     account,
     network: config,
-    rpcUrl: process.env.BASE_RPC_URL?.trim() || undefined,
+    chain,
+    rpcUrl: process.env[`${chain.name.toUpperCase()}_RPC_URL`]?.trim() || undefined,
     spendLimit: parseEvmAmount(amounts.bring),
   });
   await wallet.install(page);
@@ -129,7 +135,7 @@ test(`${network}: connect, bring ${amounts.bring} USDC from ${base}, send ${amou
 
   await test.step("show that the wallet signs with its own key", async () => {
     const check = page.getByRole("button", { name: "Check this wallet" });
-    const amount = page.locator(".fund input");
+    const amount = page.locator(".fund .field input");
     await expect(check.or(amount)).toBeVisible();
     if (await check.isVisible()) {
       await check.click();
@@ -147,7 +153,12 @@ test(`${network}: connect, bring ${amounts.bring} USDC from ${base}, send ${amou
 
   await test.step(`bring ${amounts.bring} USDC from ${base}`, async () => {
     const fund = page.locator(".fund");
-    await fund.locator("input").fill(amounts.bring);
+    await fund.getByRole("radio", { name: chain.shortLabel, exact: true }).check();
+    await expect(fund.getByRole("heading", { name: `Bring USDC from ${chain.shortLabel}` })).toBeVisible();
+    await expect(fund.locator(".routes-note")).toContainText(`In the wallet on ${base}:`);
+    await expect(fund.locator(".routes-note")).toContainText("USDC", { timeout: 30_000 });
+    await shot(page, `fund-${chain.name}`);
+    await fund.locator('.field input[type="text"]').fill(amounts.bring);
     await fund.getByRole("button", { name: "Bring over" }).click();
 
     await expect(await leg(fund, 0))
@@ -156,10 +167,12 @@ test(`${network}: connect, bring ${amounts.bring} USDC from ${base}, send ${amou
         report();
         throw error;
       });
-    expect(wallet.switches).toContain(config.evm.chain.id);
+    expect(wallet.switches).toContain(chain.chain.id);
+    await expect((await leg(fund, 0)).locator("b")).toHaveText(`Burned on ${chain.shortLabel}`);
+    await expect((await leg(fund, 0)).locator("a")).toHaveAttribute("href", new RegExp(`^${chain.explorerUrl}/tx/0x`));
     const burn = wallet.sent.find((tx) => tx.kind === "burn");
     expect(burn, "the wallet sent the burn").toBeDefined();
-    for (const tx of wallet.sent) log(tx.kind, `${tx.hash}  ${config.evm.chain.blockExplorers?.default.url}/tx/${tx.hash}`);
+    for (const tx of wallet.sent) log(tx.kind, `${tx.hash}  ${chain.explorerUrl}/tx/${tx.hash}`);
 
     await expect(await leg(fund, 2)).toHaveAttribute("data-status", "done", { timeout: 600_000 });
     const delivered = await (await leg(fund, 2)).locator("a").getAttribute("href");
@@ -181,13 +194,21 @@ test(`${network}: connect, bring ${amounts.bring} USDC from ${base}, send ${amou
   });
 
   await test.step(`send ${amounts.back} USDC back to ${base}`, async () => {
-    await page.getByRole("radio", { name: "back to Base" }).check();
+    const form = page.locator(".send");
+    // With nothing typed, the way back goes to the connected wallet.
+    await form.locator("textarea").fill("");
+    await form.getByRole("radio", { name: /^back to / }).check();
+    await expect(form.locator("textarea")).toHaveValue(account.address);
+    await form.locator(".routes").getByRole("radio", { name: chain.shortLabel, exact: true }).check();
+    await expect(form.getByRole("radio", { name: `back to ${chain.shortLabel}` })).toBeChecked();
     await prepareSend(page, account.address, amounts.back);
     await sign(page);
     await expect(page.locator('.verdict[data-state="match"]')).toBeVisible({ timeout: 180_000 });
 
     const exit = page.locator(".exit");
     await expect(exit).toBeVisible();
+    await expect(exit).toContainText(`Back to ${chain.shortLabel}`);
+    await expect((await leg(exit, 2)).locator("b")).toHaveText(`Minted on ${chain.shortLabel}`);
     const burned = await (await leg(exit, 0)).locator("a").getAttribute("href");
     log("exit", `${hashIn(burned)}  ${burned}`);
 
@@ -196,7 +217,7 @@ test(`${network}: connect, bring ${amounts.bring} USDC from ${base}, send ${amou
     await expect(mine.or(minted.and(exit.locator('[data-status="done"]')))).toBeVisible({ timeout: 600_000 });
     if (await mine.isVisible()) {
       log("mint", "attested; the wallet submits it");
-      await shot(page, "wallet-mint-step");
+      await shot(page, `wallet-mint-step-${chain.name}`);
       await mine.click();
     } else {
       log("mint", "submitted by the server");
@@ -204,7 +225,8 @@ test(`${network}: connect, bring ${amounts.bring} USDC from ${base}, send ${amou
     await expect(minted).toHaveAttribute("data-status", "done", { timeout: 300_000 });
     const mint = await minted.locator("a").getAttribute("href").catch(() => null);
     log("minted", mint ? `${hashIn(mint)}  ${mint}` : "the message had been received already");
-    await shot(page, "minted");
+    if (mint) expect(mint.startsWith(`${chain.explorerUrl}/tx/`)).toBe(true);
+    await shot(page, `minted-${chain.name}`);
     await page.locator('.verdict[data-state="match"]').getByRole("button", { name: "New send" }).click();
   });
 

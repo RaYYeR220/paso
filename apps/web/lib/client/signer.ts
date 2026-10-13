@@ -1,6 +1,6 @@
 "use client";
 
-import type { AuthorizationTypedData, NetworkConfig, NetworkName } from "@paso/sdk";
+import type { AuthorizationTypedData, EvmChainName, NetworkConfig, NetworkName } from "@paso/sdk";
 import { useMemo, useSyncExternalStore } from "react";
 import type { Address, Hex } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
@@ -17,7 +17,7 @@ import {
   watchAccount,
   watchConnectors,
 } from "wagmi/actions";
-import type { AppChainId } from "../wagmi";
+import { chainOf } from "./chains";
 import { networkConfig } from "./config";
 import { DEMO_LABEL, DEMO_TESTNET_ONLY, demoAvailable, ensureDemoKey, forgetDemoKey, loadDemoKey } from "./demoKey";
 import { describeError } from "./errors";
@@ -35,7 +35,7 @@ export type SignerStatus = "disconnected" | "connecting" | "connected";
 /**
  * Whatever signs for the account: a connected wallet, or the demo key. Fits
  * the SDK's `sign`. A signer belongs to a network: the demo key exists on
- * testnet only, and a wallet brings USDC from that network's Base.
+ * testnet only, and a wallet brings USDC from that network's EVM chains.
  */
 export interface Signer {
   kind: SignerKind;
@@ -57,11 +57,10 @@ export interface WalletSigner extends Signer {
   connectingId: string | null;
   /** Name of the connected wallet. */
   walletName: string | null;
+  /** The chain the wallet is on. Signing for Stellar works on any chain. */
   chainId: number | null;
-  /** True when the wallet is on the network's Base, where USDC is brought from. Signing for Stellar works on any chain. */
-  onBase: boolean;
-  /** The wallet on the network's Base, switched there if need be, with a reader for it: what a burn or a mint needs. */
-  evmClients(): Promise<EvmClients>;
+  /** The wallet on one EVM chain of the network, switched there if need be, with a reader for it: what a burn or a mint needs. */
+  evmClients(chain: EvmChainName): Promise<EvmClients>;
   /**
    * True once this browser has seen the wallet sign with its own key on this
    * network. Until then it is offered no way to bring USDC over: an address
@@ -347,18 +346,19 @@ export function startDemo(network: NetworkName, renew = false): boolean {
 }
 
 /**
- * The connected wallet on a network's Base, with a reader for that chain.
- * The wallet is asked to switch when it is somewhere else; one that does not
- * know the chain is offered it first. Nothing is sent from here.
+ * The connected wallet on one EVM chain of a network, with a reader for that
+ * chain. The wallet is asked to switch when it is somewhere else; one that
+ * does not know the chain is offered it first. Nothing is sent from here.
  */
-export async function evmClients(config: Config, network: NetworkConfig): Promise<EvmClients> {
-  const chainId = network.evm.chain.id as AppChainId;
+export async function evmClients(config: Config, network: NetworkConfig, name: EvmChainName): Promise<EvmClients> {
+  const { chain, label } = chainOf(network, name);
+  const chainId = chain.id;
   if (getAccount(config).chainId !== chainId) {
     await switchChain(config, { chainId });
   }
   const walletClient = await getWalletClient(config, { chainId });
   const publicClient = getPublicClient(config, { chainId });
-  if (!publicClient) throw new Error(`${network.evm.chain.name} is not configured`);
+  if (!publicClient) throw new Error(`${label} is not configured`);
   return { walletClient, publicClient };
 }
 
@@ -393,7 +393,6 @@ export function useSigner(name: NetworkName): ActiveSigner {
       : "disconnected";
   const { walletName, chainId } = account;
   const networkName = network.name;
-  const baseChainId = network.evm.chain.id;
 
   const wallet = useMemo<WalletSigner>(
     () => ({
@@ -404,7 +403,6 @@ export function useSigner(name: NetworkName): ActiveSigner {
       connectingId,
       walletName,
       chainId,
-      onBase: chainId === baseChainId,
       signTypedData: (typedData) =>
         walletAddress ? signTypedData(config, { ...typedData, account: walletAddress }) : notConnected(),
       connect: (connectorId?: string) => connectWallet(config, networkName, connectorId),
@@ -412,7 +410,7 @@ export function useSigner(name: NetworkName): ActiveSigner {
         await disconnect(config);
         if (local.get().chosen[networkName] === "wallet") choose(networkName, null);
       },
-      evmClients: () => evmClients(config, network),
+      evmClients: (chain: EvmChainName) => evmClients(config, network, chain),
       keyProven: walletAddress !== null && keyProven(networkName, walletAddress, seenKeys),
       async proveKey() {
         if (!walletAddress) return notConnected();
@@ -420,7 +418,7 @@ export function useSigner(name: NetworkName): ActiveSigner {
         rememberKeyProven(networkName, walletAddress);
       },
     }),
-    [config, network, networkName, baseChainId, options, connectingId, walletAddress, walletStatus, walletName, chainId, seenKeys],
+    [config, network, networkName, options, connectingId, walletAddress, walletStatus, walletName, chainId, seenKeys],
   );
   const { available, key: demoKey, chosen: demoChosen } = demoState(networkName, state);
   const demo = useMemo<DemoSigner>(() => {

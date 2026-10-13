@@ -1,13 +1,15 @@
 "use client";
 
-import { parseEvmAmount, type NetworkName } from "@paso/sdk";
+import { parseEvmAmount, type EvmChainConfig, type EvmChainName, type NetworkName } from "@paso/sdk";
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type { Hex } from "viem";
+import { chainOf, chainsOf, FAUCET_CHAIN } from "./chains";
 import { networkConfig } from "./config";
 import { describeError } from "./errors";
-import { baseTx, stellarAddress, stellarTx } from "./explorer";
+import { evmTx, stellarAddress, stellarTx } from "./explorer";
 import { formatBaseUsdc } from "./format";
 import {
+  chainOfState,
   IDLE_FUNDING,
   isFundingActive,
   trackerStages,
@@ -16,14 +18,14 @@ import {
   type FundingVia,
   type TrackerStage,
 } from "./funding/machine";
-import { burnAmountProblem, burnCeiling, FAUCET_AMOUNT, WALLET_BURN_MIN } from "./funding/limits";
-import { baseBalanceFor, fundingFor, refreshAccount } from "./registry";
+import { burnAmountProblem, burnCeiling, FAUCET_AMOUNT, gasReserve, WALLET_BURN_MIN } from "./funding/limits";
+import { burnFeeFor, fundingFor, refreshAccount, walletBalanceFor, type WalletBalance } from "./registry";
 import { idleResource, type ResourceState } from "./resource";
 import { useSigner } from "./signer";
 import { noSubscription } from "./store";
 import { useNow } from "./useNow";
 
-/** How much can be brought over, known before anything starts. Amounts are in Base's 6-decimal units. */
+/** How much can be brought over, known before anything starts. Amounts are in 6-decimal units. */
 export interface FundingLimits {
   /** What the testnet faucet sends per request: a fixed 1 USDC. */
   faucetAmount: bigint;
@@ -32,7 +34,11 @@ export interface FundingLimits {
   /** The smallest amount a wallet can burn. */
   min: bigint;
   minFormatted: string;
-  /** The most a wallet can burn: the USDC it holds on Base. `null` with the demo key, and until the balance is read. */
+  /**
+   * The most a wallet can burn: the USDC it holds on the chain, less what
+   * stays there for gas where gas is paid in USDC. `null` with the demo key,
+   * and until the balance is read.
+   */
   max: bigint | null;
   maxFormatted: string | null;
   /** The app's own ceiling on one transfer on this network; `null` where there is none. */
@@ -47,11 +53,43 @@ export type KeyCheck =
   | { status: "needed"; notice?: "declined"; problem?: string }
   | { status: "asking" };
 
-/** Bringing USDC from Base to the connected owner's Stellar account, on one network. */
+/** One chain USDC can be brought from, as the choice offers it. */
+export interface ChainOption {
+  chain: EvmChainConfig;
+  /** False where the current signer cannot bring USDC from it: the demo key brings it from Base Sepolia only. */
+  available: boolean;
+}
+
+/** What the connected wallet holds on the chain in view. */
+export interface WalletHoldings {
+  /** USDC, 6 decimals, as text: `"12.40"`. `null` until read. */
+  usdc: string | null;
+  /** The gas token as text where it is not USDC: `"0.0031"`. `null` on Arc, where gas comes out of `usdc`, and until read. */
+  gas: string | null;
+  /** True once read and there is nothing to pay gas with. */
+  noGas: boolean;
+  /** True once read and there is no USDC to bring over. */
+  noUsdc: boolean;
+}
+
+/** Bringing USDC from an EVM chain to the connected owner's Stellar account, on one network. */
 export interface Funding {
   /** The state machine: idle → requesting → burned → attesting → delivering → minted | failed. */
   state: FundingState;
   phase: FundingState["phase"];
+  /**
+   * The chain the panel is about: the one a transfer in flight or on record
+   * left, or else the one chosen. With the demo key it is always Base.
+   */
+  chain: EvmChainConfig;
+  /** The chains of the network, Base first, each with whether the current signer can use it. */
+  chains: ChainOption[];
+  /** True while a transfer is in flight or on record: the chain cannot be changed until it is done. */
+  chainLocked: boolean;
+  /** What the wallet holds on `chain`. `null` with the demo key. */
+  holdings: WalletHoldings | null;
+  /** Circle's fee from `chain` to Stellar, in basis points; `null` until Circle has answered. */
+  feeBps: number | null;
   /** The three steps of the tracker, in Circle's words, each waiting, active, done or failed. */
   stages: TrackerStage[];
   /** True from the first click until the USDC is minted or the transfer fails. */
@@ -63,8 +101,8 @@ export interface Funding {
   /** USDC being brought over, as text (`"10.00"`); `null` when not known. */
   amountFormatted: string | null;
   links: {
-    /** The burn on Base. */
-    base: string | null;
+    /** The burn on its chain. */
+    evm: string | null;
     /** The mint on Stellar; the account itself when someone else delivered the message. */
     stellar: string | null;
   };
@@ -77,12 +115,12 @@ export interface Funding {
   /** Asks the wallet for the key check: one message that moves nothing. */
   checkKey(): Promise<void>;
   /**
-   * Starts a transfer. With a wallet, `amount` is USDC as decimal text
-   * (`"10"`) or in Base's 6-decimal units; with the demo key the faucet
-   * decides the amount. Ignored while a transfer is in flight.
+   * Starts a transfer from `chain`. With a wallet, `amount` is USDC as
+   * decimal text (`"10"`) or in 6-decimal units; with the demo key the
+   * faucet decides the amount. Ignored while a transfer is in flight.
    */
   start(amount?: string | bigint): Promise<void>;
-  /** Follows a burn that already happened, by its hash on Base. */
+  /** Follows a burn that already happened, by its hash on `chain`. */
   resume(burnTxHash: Hex): boolean;
   /** After a failure: follows the burn on record again. */
   retry(): boolean;
@@ -99,14 +137,22 @@ export interface Funding {
 }
 
 const idle = (): FundingState => IDLE_FUNDING;
-const noBalance = (): ResourceState<bigint> => idleResource<bigint>();
+const noBalance = (): ResourceState<WalletBalance> => idleResource<WalletBalance>();
+const noFee = (): ResourceState<number> => idleResource<number>();
+
+/** Gas in its own token, for display: up to six decimals, enough to tell a little from none. */
+function formatGas(wei: bigint): string {
+  const micro = wei / 1_000_000_000_000n;
+  return micro === 0n && wei > 0n ? "under 0.000001" : formatBaseUsdc(micro);
+}
 
 /**
- * The inbound flow for the connected owner on `network`. A transfer in
- * flight survives a reload: it is picked up again as soon as the same owner
- * is connected on the same network.
+ * The inbound flow for the connected owner on `network`, from `chosen`, the
+ * chain picked in the panel. A transfer in flight survives a reload: it is
+ * picked up again, on the chain it left, as soon as the same owner is
+ * connected on the same network.
  */
-export function useFunding(network: NetworkName): Funding {
+export function useFunding(network: NetworkName, chosen: EvmChainName): Funding {
   const signer = useSigner(network);
   const owner = signer.status === "connected" ? signer.address : null;
   const controller = owner ? fundingFor(network, owner) : null;
@@ -119,12 +165,22 @@ export function useFunding(network: NetworkName): Funding {
   }, [controller]);
 
   const isDemo = signer.isDemo;
-  // Only a wallet pays its own burn, so only a wallet's USDC on Base sets a ceiling.
-  const balance = owner && !isDemo ? baseBalanceFor(network, owner) : null;
+  const config = networkConfig(network);
+  // The record changes only together with the state, so reading it on every render keeps the two in step.
+  const recordChain = controller?.tracked()?.transfer.chain ?? null;
+  const chainName: EvmChainName = chainOfState(state) ?? recordChain ?? (isDemo ? FAUCET_CHAIN : chosen);
+  const chain = chainOf(config, chainName);
+  const chainLocked = isFundingActive(state) || recordChain !== null;
+
+  // Only a wallet pays its own burn, so only a wallet's USDC on the chain sets a ceiling.
+  const balance = owner && !isDemo ? walletBalanceFor(network, chainName, owner) : null;
   const held = useSyncExternalStore(balance?.subscribe ?? noSubscription, balance?.getState ?? noBalance, noBalance);
-  const max = held.data;
+  const fee = isDemo ? null : burnFeeFor(network, chainName);
+  const quoted = useSyncExternalStore(fee?.subscribe ?? noSubscription, fee?.getState ?? noFee, noFee);
+  const reserve = gasReserve(chain);
+  const usdcHeld = held.data?.usdc ?? null;
+  const max = usdcHeld === null ? null : usdcHeld > reserve ? usdcHeld - reserve : 0n;
   const ceiling = isDemo ? null : burnCeiling(network);
-  const chainName = networkConfig(network).evm.chain.name;
 
   const minted = state.phase === "minted";
   useEffect(() => {
@@ -168,16 +224,16 @@ export function useFunding(network: NetworkName): Funding {
         setInputError(error instanceof Error ? error.message : "Enter an amount");
         return;
       }
-      const problem = burnAmountProblem(units, { min: WALLET_BURN_MIN, max, ceiling }, chainName);
+      const problem = burnAmountProblem(units, { min: WALLET_BURN_MIN, max: usdcHeld, ceiling, gasReserve: reserve }, chain.label);
       if (problem) {
         setInputError(problem);
         return;
       }
-      await controller.start({ via: "wallet", amount: units, clients: evmClients });
+      await controller.start({ via: "wallet", chain: chain.name, amount: units, clients: () => evmClients(chain.name) });
     },
-    [controller, isDemo, proven, evmClients, max, ceiling, chainName],
+    [controller, isDemo, proven, evmClients, usdcHeld, reserve, ceiling, chain],
   );
-  const resume = useCallback((burnTxHash: Hex) => controller?.resume(burnTxHash) ?? false, [controller]);
+  const resume = useCallback((burnTxHash: Hex) => controller?.resume(burnTxHash, chainName) ?? false, [controller, chainName]);
   const retry = useCallback(() => controller?.retry() ?? false, [controller]);
   const reset = useCallback(() => {
     setInputError(null);
@@ -200,7 +256,6 @@ export function useFunding(network: NetworkName): Funding {
       elapsedSeconds = Math.max(0, Math.floor((now - since) / 1000));
     }
 
-    // The record changes only together with the state, so reading it here keeps the two in step.
     const onRecord = controller?.tracked() ?? null;
     const keyCheck: KeyCheck = proven
       ? { status: "passed" }
@@ -208,16 +263,32 @@ export function useFunding(network: NetworkName): Funding {
         ? { status: "asking" }
         : { status: "needed", ...(check.notice ? { notice: check.notice } : {}), ...(check.problem ? { problem: check.problem } : {}) };
 
+    const reading = held.data;
+    const holdings: WalletHoldings | null =
+      owner && !isDemo
+        ? {
+            usdc: reading ? formatBaseUsdc(reading.usdc) : null,
+            gas: reading && !chain.gasToken.isUsdc ? formatGas(reading.gas) : null,
+            noGas: reading !== null && reading.gas === 0n,
+            noUsdc: reading !== null && reading.usdc === 0n,
+          }
+        : null;
+
     return {
       state,
       phase: state.phase,
-      stages: trackerStages(state),
+      chain,
+      chains: chainsOf(config).map((option) => ({ chain: option, available: !isDemo || option.name === FAUCET_CHAIN })),
+      chainLocked,
+      holdings,
+      feeBps: quoted.data,
+      stages: trackerStages(state, chain.shortLabel),
       isActive: active,
       via: owner ? (isDemo ? "demo" : "wallet") : null,
       elapsedSeconds,
       amountFormatted: amount ? formatBaseUsdc(BigInt(amount)) : null,
       links: {
-        base: burnTxHash ? baseTx(burnTxHash, network) : null,
+        evm: burnTxHash ? evmTx(burnTxHash, network, chain.name) : null,
         stellar:
           state.phase === "minted"
             ? state.stellarTxHash
@@ -243,9 +314,13 @@ export function useFunding(network: NetworkName): Funding {
       retry,
       reset,
       tracked: onRecord
-        ? { burnTxHash: onRecord.transfer.burnTxHash, link: baseTx(onRecord.transfer.burnTxHash, network), saved: onRecord.saved }
+        ? {
+            burnTxHash: onRecord.transfer.burnTxHash,
+            link: evmTx(onRecord.transfer.burnTxHash, network, onRecord.transfer.chain),
+            saved: onRecord.saved,
+          }
         : null,
       stopTracking,
     };
-  }, [state, active, now, owner, network, isDemo, max, ceiling, inputError, proven, check, checkKey, controller, start, resume, retry, reset, stopTracking]);
+  }, [state, active, now, owner, network, config, isDemo, chain, chainLocked, held, quoted, max, ceiling, inputError, proven, check, checkKey, controller, start, resume, retry, reset, stopTracking]);
 }

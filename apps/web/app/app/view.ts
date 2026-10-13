@@ -13,14 +13,21 @@ import {
 
 type Stages = [StageView, StageView, StageView];
 
-/** What is being waited for while the burn on Base is prepared. */
-const REQUEST_WORDS: Record<RequestStep, { wallet: string; demo: string }> = {
-  starting: { wallet: "opening the wallet", demo: "asking the faucet" },
-  approving: { wallet: "approve USDC in the wallet", demo: "asking the faucet" },
-  approved: { wallet: "approval confirming", demo: "asking the faucet" },
-  burning: { wallet: "confirm in the wallet", demo: "asking the faucet" },
-  confirming: { wallet: "confirming on Base", demo: "confirming on Base" },
-};
+/** What is being waited for while the burn is prepared, on the chain named. */
+function requestWords(step: RequestStep, via: "wallet" | "demo", chain: string): string {
+  if (step === "confirming") return `confirming on ${chain}`;
+  if (via === "demo") return "asking the faucet";
+  switch (step) {
+    case "starting":
+      return `opening the wallet on ${chain}`;
+    case "approving":
+      return "approve USDC in the wallet";
+    case "approved":
+      return "approval confirming";
+    case "burning":
+      return "confirm in the wallet";
+  }
+}
 
 function running(elapsedSeconds: number | null): string {
   return elapsedSeconds === null ? "in progress" : `in progress, ${formatElapsed(elapsedSeconds)}`;
@@ -38,8 +45,8 @@ export function fundingStages(funding: Funding): Stages {
 
     switch (stage.id) {
       case "burned":
-        if (stage.status === "done" && burnHash && links.base) return { ...view, detail: shortHash(burnHash), href: links.base };
-        if (state.phase === "requesting") return { ...view, detail: REQUEST_WORDS[state.step][state.via] };
+        if (stage.status === "done" && burnHash && links.evm) return { ...view, detail: shortHash(burnHash), href: links.evm };
+        if (state.phase === "requesting") return { ...view, detail: requestWords(state.step, state.via, funding.chain.shortLabel) };
         return view;
       case "attested":
         if (stage.status === "active") return { ...view, detail: held ? "waiting for a relayer" : running(elapsedSeconds) };
@@ -55,7 +62,7 @@ export function fundingStages(funding: Funding): Stages {
   }) as Stages;
 }
 
-/** The outbound tracker: the same three steps, from Stellar back to Base. */
+/** The outbound tracker: the same three steps, from Stellar back to an EVM chain. */
 export function exitStages(exit: Exit): Stages {
   const { state, links, elapsedSeconds } = exit;
   return exit.stages.map((stage): StageView => {
@@ -71,13 +78,13 @@ export function exitStages(exit: Exit): Stages {
       case "minted":
         if (state.phase === "attested") return { ...view, detail: "your wallet's turn" };
         if (state.phase === "minting") {
-          return state.baseTxHash && links.base
-            ? { ...view, detail: "confirming", href: links.base }
+          return state.mintTxHash && links.evm
+            ? { ...view, detail: "confirming", href: links.evm }
             : { ...view, detail: "confirm in the wallet" };
         }
         if (stage.status !== "done") return view;
-        return links.base && state.phase === "minted" && state.baseTxHash
-          ? { ...view, detail: shortHash(state.baseTxHash), href: links.base }
+        return links.evm && state.phase === "minted" && state.mintTxHash
+          ? { ...view, detail: shortHash(state.mintTxHash), href: links.evm }
           : { ...view, detail: "arrived" };
     }
   }) as Stages;
@@ -130,7 +137,7 @@ export function declineWords(reason: DeclineReason, network: string): string {
 export function activityRows(items: readonly ActivityItem[], now: number | null): ActivityRow[] {
   return items.map((item): ActivityRow => {
     const links: ActivityRow["links"][number][] = [];
-    if (item.links.base) links.push({ label: "Base", href: item.links.base });
+    if (item.links.evm) links.push(item.links.evm);
     if (item.links.stellar) links.push({ label: "Stellar", href: item.links.stellar });
     return {
       id: item.id,

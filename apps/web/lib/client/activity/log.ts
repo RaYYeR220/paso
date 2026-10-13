@@ -1,13 +1,13 @@
-import type { NetworkName } from "@paso/sdk";
+import { isEvmChainName, type EvmChainName, type NetworkName } from "@paso/sdk";
 import { readJson, writeJson, type KeyValueStore } from "../storage";
 import { createStore, type Listener } from "../store";
 
 export type LogKind =
-  /** USDC on its way in from Base, or arrived. */
+  /** USDC on its way in from an EVM chain, or arrived. */
   | "receive"
   /** A transfer out of the account. */
   | "send"
-  /** USDC sent back to Base. */
+  /** USDC sent back to an EVM chain. */
   | "exit"
   /** Any other contract call the account authorised. */
   | "call"
@@ -28,7 +28,10 @@ export interface LogEntry {
   /** Milliseconds since the epoch. */
   at: number;
   stellarTxHash?: string;
-  baseTxHash?: string;
+  /** The EVM chain the USDC came from or went to. An entry written before there was a choice names none: it was Base. */
+  chain?: EvmChainName;
+  /** The transaction on that chain: the burn of a transfer in. */
+  evmTxHash?: string;
   /** A short remark: the function called, or why a call was refused. */
   note?: string;
 }
@@ -52,10 +55,17 @@ function isEntry(value: unknown): value is LogEntry {
   return typeof entry.id === "string" && typeof entry.kind === "string" && typeof entry.at === "number";
 }
 
+/** An entry as it is read back: one written before there was a choice of chain kept its burn under `baseTxHash`. */
+function current(entry: LogEntry): LogEntry {
+  const { baseTxHash, chain, evmTxHash, ...plain } = entry as LogEntry & { baseTxHash?: unknown };
+  const hash = typeof evmTxHash === "string" ? evmTxHash : typeof baseTxHash === "string" ? baseTxHash : undefined;
+  return { ...plain, ...(isEvmChainName(chain) ? { chain } : {}), ...(hash ? { evmTxHash: hash } : {}) };
+}
+
 /** The session log of one account: newest first, capped, and written through to storage. */
 export function createActivityLog(storage: KeyValueStore | null, key: string, limit = DEFAULT_LIMIT): ActivityLog {
   const stored = readJson<unknown>(storage, key);
-  const store = createStore<LogEntry[]>(Array.isArray(stored) ? stored.filter(isEntry).slice(0, limit) : []);
+  const store = createStore<LogEntry[]>(Array.isArray(stored) ? stored.filter(isEntry).slice(0, limit).map(current) : []);
   return {
     list: store.get,
     put(entry) {

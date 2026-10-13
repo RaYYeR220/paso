@@ -6,7 +6,7 @@ import {
   isHubExit,
   exitStages,
   exitStorageKey,
-  type BaseReader,
+  type ChainReader,
   type ExitAnswer,
   type ExitTransfer,
   type SubmitMint,
@@ -23,7 +23,7 @@ const ATTESTATION: Hex = `0x${"bb".repeat(130)}`;
 const MINT: Hex = `0x${"d8".repeat(32)}`;
 const key = exitStorageKey("mainnet", owner.address);
 
-const transfer: ExitTransfer = { network: "mainnet", stellarTxHash: EXIT, startedAt: 1_000 };
+const transfer: ExitTransfer = { network: "mainnet", chain: "base", stellarTxHash: EXIT, startedAt: 1_000 };
 const attested: ExitAnswer = { status: "attested", message: MESSAGE, attestation: ATTESTATION };
 const rejection = () => Object.assign(new Error("User rejected the request."), { code: 4001 });
 
@@ -41,13 +41,13 @@ function harness(script: (ExitAnswer | Error)[], storage: KeyValueStore | null =
   const base = {
     isReceived: vi.fn(async () => next(received)),
     receipt: vi.fn(async () => next(receipts)),
-  } satisfies BaseReader;
+  } satisfies ChainReader;
   const timers: (() => void)[] = [];
   const clock = { now: 1_000 };
   const watcher = createExitWatcher({
     network: "mainnet",
     ask,
-    base,
+    reader: base,
     storage,
     storageKey: key,
     now: () => clock.now,
@@ -100,7 +100,7 @@ describe("an exit the server leaves to the wallet", () => {
     const h = await attestedExit();
 
     expect(h.watcher.getState()).toEqual({ phase: "attested", transfer, message: MESSAGE, attestation: ATTESTATION });
-    expect(exitStages(h.watcher.getState())).toEqual([
+    expect(exitStages(h.watcher.getState(), "Base")).toEqual([
       { id: "burned", label: "Burned on Stellar", status: "done" },
       { id: "attested", label: "Attested by Circle", status: "done" },
       { id: "minted", label: "Minted on Base", status: "active" },
@@ -145,17 +145,17 @@ describe("the mint in the wallet", () => {
 
     const minting = h.watcher.mint(wallet.submit);
     expect(h.watcher.getState()).toEqual({ phase: "minting", transfer, message: MESSAGE, attestation: ATTESTATION });
-    expect(wallet.submit).toHaveBeenCalledWith({ message: MESSAGE, attestation: ATTESTATION, onSubmitted: expect.any(Function) });
-    expect(exitStages(h.watcher.getState())[2]).toMatchObject({ status: "active" });
+    expect(wallet.submit).toHaveBeenCalledWith({ message: MESSAGE, attestation: ATTESTATION, chain: "base", onSubmitted: expect.any(Function) });
+    expect(exitStages(h.watcher.getState(), "Base")[2]).toMatchObject({ status: "active" });
 
     wallet.sent(MINT);
-    expect(h.watcher.getState()).toMatchObject({ phase: "minting", baseTxHash: MINT });
+    expect(h.watcher.getState()).toMatchObject({ phase: "minting", mintTxHash: MINT });
     expect(h.stored()).toEqual({ ...transfer, mintTxHash: MINT });
 
     h.clock.now = 9_000;
     wallet.confirm({ hash: MINT, alreadyReceived: false });
     await minting;
-    expect(h.watcher.getState()).toEqual({ phase: "minted", transfer, baseTxHash: MINT, finishedAt: 9_000 });
+    expect(h.watcher.getState()).toEqual({ phase: "minted", transfer, mintTxHash: MINT, finishedAt: 9_000 });
     expect(h.stored()).toBeNull();
     expect(h.watcher.tracked()).toBeNull();
   });
@@ -242,7 +242,7 @@ describe("the mint in the wallet", () => {
     wallet.fail(new Error("The request timed out"));
     await minting;
 
-    expect(h.watcher.getState()).toMatchObject({ phase: "minting", baseTxHash: MINT });
+    expect(h.watcher.getState()).toMatchObject({ phase: "minting", mintTxHash: MINT });
     expect(h.stored()).toEqual({ ...transfer, mintTxHash: MINT });
 
     // The wallet is not asked a second time: Base is, until it says what became of the first.
@@ -253,7 +253,7 @@ describe("the mint in the wallet", () => {
     await h.tick();
     h.clock.now = 20_000;
     await h.tick();
-    expect(h.watcher.getState()).toEqual({ phase: "minted", transfer, baseTxHash: MINT, finishedAt: 20_000 });
+    expect(h.watcher.getState()).toEqual({ phase: "minted", transfer, mintTxHash: MINT, finishedAt: 20_000 });
   });
 
   it("drops the answer of a wallet that was still open when the tracker was stopped", async () => {
@@ -295,14 +295,14 @@ describe("the mint after a reload", () => {
     after.watcher.restore();
     await settle(3);
 
-    expect(after.watcher.getState()).toEqual({ phase: "minting", transfer, message: MESSAGE, attestation: ATTESTATION, baseTxHash: MINT });
+    expect(after.watcher.getState()).toEqual({ phase: "minting", transfer, message: MESSAGE, attestation: ATTESTATION, mintTxHash: MINT });
     const again = walletMint();
     void after.watcher.mint(again.submit);
     expect(again.submit).not.toHaveBeenCalled();
 
     after.clock.now = 50_000;
     await after.tick();
-    expect(after.watcher.getState()).toMatchObject({ phase: "minted", baseTxHash: MINT, finishedAt: 50_000 });
+    expect(after.watcher.getState()).toMatchObject({ phase: "minted", mintTxHash: MINT, finishedAt: 50_000 });
     expect(after.stored()).toBeNull();
   });
 
@@ -349,8 +349,8 @@ describe("a transfer back on one network and the same owner on the other", () =>
     const watcher = createExitWatcher({ network: "testnet", ask: () => forever<ExitAnswer>(), storage, storageKey: testnetKey });
 
     expect(watcher.restore()).toBe(true);
-    expect(watcher.getState()).toMatchObject({ phase: "attesting", transfer: { network: "testnet", stellarTxHash: EXIT, startedAt: 1_000 } });
-    expect(JSON.parse(storage.getItem(testnetKey) ?? "null")).toEqual({ network: "testnet", stellarTxHash: EXIT, startedAt: 1_000 });
+    expect(watcher.getState()).toMatchObject({ phase: "attesting", transfer: { network: "testnet", chain: "base", stellarTxHash: EXIT, startedAt: 1_000 } });
+    expect(JSON.parse(storage.getItem(testnetKey) ?? "null")).toEqual({ network: "testnet", chain: "base", stellarTxHash: EXIT, startedAt: 1_000 });
   });
 
   it("refuse to follow a burn handed over for the other network", () => {

@@ -8,7 +8,7 @@ const OTHER_EXIT = "7d".repeat(32);
 const BASE_MINT = `0x${"d8".repeat(32)}`;
 const key = exitStorageKey("testnet", owner.address);
 
-const transfer: ExitTransfer = { network: "testnet", stellarTxHash: EXIT, startedAt: 1_000 };
+const transfer: ExitTransfer = { network: "testnet", stellarTxHash: EXIT, startedAt: 1_000, chain: "base" };
 const waiting = (attestation: "not_found" | "pending" | "unreachable" = "pending"): ExitAnswer => ({ status: "pending", attestation });
 const minted: ExitAnswer = { status: "minted", hash: BASE_MINT };
 
@@ -44,11 +44,11 @@ function harness(script: (ExitAnswer | Error)[], storage: KeyValueStore | null =
 describe("following USDC back to Base", () => {
   it("goes from the burn on Stellar to the mint on Base", async () => {
     const h = harness([waiting("not_found"), waiting(), minted]);
-    expect(exitStages(h.watcher.getState()).map((stage) => stage.status)).toEqual(["waiting", "waiting", "waiting"]);
+    expect(exitStages(h.watcher.getState(), "Base").map((stage) => stage.status)).toEqual(["waiting", "waiting", "waiting"]);
 
     expect(h.watcher.watch(transfer)).toBe(true);
     expect(h.watcher.getState()).toMatchObject({ phase: "attesting", transfer });
-    expect(exitStages(h.watcher.getState())).toEqual([
+    expect(exitStages(h.watcher.getState(), "Base")).toEqual([
       { id: "burned", label: "Burned on Stellar", status: "done" },
       { id: "attested", label: "Attested by Circle", status: "active" },
       { id: "minted", label: "Minted on Base", status: "waiting" },
@@ -58,8 +58,8 @@ describe("following USDC back to Base", () => {
     await h.tick();
     h.clock.now = 10_000;
     await h.tick();
-    expect(h.watcher.getState()).toEqual({ phase: "minted", transfer, baseTxHash: BASE_MINT, finishedAt: 10_000 });
-    expect(exitStages(h.watcher.getState()).map((stage) => stage.status)).toEqual(["done", "done", "done"]);
+    expect(h.watcher.getState()).toEqual({ phase: "minted", transfer, mintTxHash: BASE_MINT, finishedAt: 10_000 });
+    expect(exitStages(h.watcher.getState(), "Base").map((stage) => stage.status)).toEqual(["done", "done", "done"]);
     expect(h.ask.calls.map((call) => call[0])).toEqual([EXIT, EXIT, EXIT]);
     expect(h.waits).toEqual([2_000, 2_000]);
   });
@@ -95,7 +95,7 @@ describe("following USDC back to Base", () => {
   it("refuses a second burn while one is on record", async () => {
     const h = harness([waiting()]);
     expect(h.watcher.watch(transfer)).toBe(true);
-    expect(h.watcher.watch({ network: "testnet", stellarTxHash: OTHER_EXIT, startedAt: 2_000 })).toBe(false);
+    expect(h.watcher.watch({ network: "testnet", chain: "base", stellarTxHash: OTHER_EXIT, startedAt: 2_000 })).toBe(false);
     expect(h.watcher.watch(transfer)).toBe(true);
     await settle(3);
     expect(h.watcher.getState()).toMatchObject({ transfer: { stellarTxHash: EXIT } });
@@ -114,7 +114,7 @@ describe("following USDC back to Base", () => {
     expect(after.watcher.restore()).toBe(false);
     after.clock.now = 30_000;
     await settle(3);
-    expect(after.watcher.getState()).toEqual({ phase: "minted", transfer, baseTxHash: BASE_MINT, finishedAt: 30_000 });
+    expect(after.watcher.getState()).toEqual({ phase: "minted", transfer, mintTxHash: BASE_MINT, finishedAt: 30_000 });
     expect(harness([]).watcher.restore()).toBe(false);
   });
 
@@ -127,7 +127,7 @@ describe("following USDC back to Base", () => {
     expect(h.watcher.getState()).toBe(IDLE_EXIT);
     expect(h.storage?.getItem(key)).toBeNull();
     expect(h.ask.calls).toHaveLength(1);
-    expect(h.watcher.watch({ network: "testnet", stellarTxHash: OTHER_EXIT, startedAt: 2_000 })).toBe(true);
+    expect(h.watcher.watch({ network: "testnet", chain: "base", stellarTxHash: OTHER_EXIT, startedAt: 2_000 })).toBe(true);
   });
 
   it("keeps the record when the server cannot follow transfers, and asks again after a reload", async () => {
@@ -135,7 +135,7 @@ describe("following USDC back to Base", () => {
     h.watcher.watch(transfer);
     await settle(3);
     expect(h.watcher.getState()).toEqual({ phase: "untracked", transfer });
-    expect(exitStages(h.watcher.getState()).map((stage) => stage.status)).toEqual(["done", "active", "waiting"]);
+    expect(exitStages(h.watcher.getState(), "Base").map((stage) => stage.status)).toEqual(["done", "active", "waiting"]);
     expect(h.waits).toEqual([]);
     expect(h.storage?.getItem(key)).not.toBeNull();
 
@@ -149,7 +149,7 @@ describe("following USDC back to Base", () => {
     const h = harness([waiting()], null);
     h.watcher.watch(transfer);
     expect(h.watcher.tracked()).toEqual({ transfer, saved: false });
-    expect(h.watcher.watch({ network: "testnet", stellarTxHash: OTHER_EXIT, startedAt: 2_000 })).toBe(false);
+    expect(h.watcher.watch({ network: "testnet", chain: "base", stellarTxHash: OTHER_EXIT, startedAt: 2_000 })).toBe(false);
   });
 });
 

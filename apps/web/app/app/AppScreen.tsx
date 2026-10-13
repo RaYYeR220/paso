@@ -22,6 +22,10 @@ export function AppScreen() {
   // The demo key is a key by construction. A wallet's address is looked at: a smart contract cannot sign for an account.
   const walletKind = useOwnerKind(connected && !signer.isDemo ? signer.address : null);
 
+  const report = health.of(network);
+  // Until the server has said, testnet is taken to mint on Base Sepolia and mainnet not to, as each is set up by default.
+  const paysBaseMints = report ? report.enabled && report.paysBaseMints : network === "testnet";
+
   const wantsDemo = params.get("demo") === "1" && signer.demo.available;
   const prefill = params.get("to") ?? "";
   const startDemo = signer.demo.connect;
@@ -77,6 +81,7 @@ export function AppScreen() {
           owner={signer.address}
           prefillTo={prefill}
           relayer={health.relayer(network)}
+          paysBaseMints={paysBaseMints}
           proofHref={choice.href("/proof#mainnet")}
         />
       </AppShell>
