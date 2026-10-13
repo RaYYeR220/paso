@@ -1,12 +1,13 @@
-import { messageTransmitterAbi, NETWORKS } from "@paso/sdk";
+import { evmChain, messageTransmitterAbi, NETWORKS } from "@paso/sdk";
 import { Keypair } from "@stellar/stellar-sdk";
-import { ContractFunctionRevertedError } from "viem";
+import { ContractFunctionRevertedError, getAddress } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { POST as completeRoute } from "@/app/api/cctp/complete/route";
 import { loadConfig } from "@/lib/server/config";
 import { ApiError } from "@/lib/server/errors";
 import { Relayer, type DemoFundResult } from "@/lib/server/relayer";
+import arcExit from "./fixtures/arc-exit-message.json";
 import inbound from "./fixtures/delivered-message.json";
 import exit from "./fixtures/exit-message.json";
 import { live, post } from "./helpers";
@@ -110,8 +111,10 @@ function completing({ used = [0], wei = ETH, block = BLOCK, simulate, feePerGas 
       (call: { address: string; functionName: string; args: readonly unknown[]; gas: bigint; maxFeePerGas: bigint }) => Promise<string>
     >(async () => (write ? write() : MINT_HASH)),
   };
-  vi.spyOn(relayer as unknown as { evmClients: () => unknown }, "evmClients").mockReturnValue({ publicClient, walletClient });
-  return { relayer, publicClient, walletClient };
+  const evmClients = vi
+    .spyOn(relayer as unknown as { evmClients: (chain?: string) => unknown }, "evmClients")
+    .mockReturnValue({ publicClient, walletClient });
+  return { relayer, publicClient, walletClient, evmClients };
 }
 
 const refusal = async (relayer: Relayer, body: unknown = request(), caller = "caller") =>
@@ -254,12 +257,73 @@ describe("POST /api/cctp/complete, once the exit is attested", () => {
 
   it("picks the exit by what the message says when the transaction carries others", async () => {
     const { relayer, walletClient } = completing();
-    const elsewhere = exitWith("destinationDomain", "00000003");
+    const elsewhere = exitWith("destinationDomain", "00000001");
     const notOurs = exitWith("messageSender", "ab".repeat(32));
     stubIris(() => attested(inbound.message, elsewhere, notOurs, MESSAGE));
 
     expect(await relayer.complete(request(), "caller")).toEqual({ status: "minted", hash: MINT_HASH });
     expect(walletClient.writeContract.mock.calls[0]![0].args).toEqual([MESSAGE, ATTESTATION]);
+  });
+});
+
+describe("an exit to a chain other than Base", () => {
+  const ARC_EXIT = arcExit.message as `0x${string}`;
+  const ARC_ATTESTATION = arcExit.attestation as `0x${string}`;
+  const arcAttested = () => Response.json({ messages: [{ message: ARC_EXIT, attestation: ARC_ATTESTATION, status: "complete" }] });
+  const RECIPIENT = getAddress(`0x${ARC_EXIT.slice(2 + (148 + 36 + 12) * 2, 2 + (148 + 68) * 2)}`);
+
+  it("is checked on Arc and handed back for the wallet, even by a server that pays for mints on Base", async () => {
+    const { relayer, publicClient, walletClient, evmClients } = completing();
+    stubIris(arcAttested);
+
+    expect(await relayer.complete(request(), "caller")).toEqual({ status: "attested", message: ARC_EXIT, attestation: ARC_ATTESTATION });
+
+    expect(evmClients.mock.calls.map(([chain]) => chain)).toEqual(["arc"]);
+    expect(publicClient.readContract.mock.calls[0]![0]).toMatchObject({ functionName: "usedNonces" });
+    expect(publicClient.estimateContractGas).toHaveBeenCalledTimes(1);
+    expect(publicClient.estimateContractGas.mock.calls[0]![0]).toMatchObject({
+      address: evmChain("testnet", "arc").messageTransmitter,
+      args: [ARC_EXIT, ARC_ATTESTATION],
+      account: RECIPIENT,
+    });
+    expect(publicClient.getBalance).not.toHaveBeenCalled();
+    expect(walletClient.writeContract).not.toHaveBeenCalled();
+  });
+
+  it("costs no mint the server pays for: with one a day left, a mint on Base still goes out afterwards", async () => {
+    const base = completing({ env: { BASE_MINTS_PER_DAY: "1", BASE_MINTS_PER_CALLER_PER_HOUR: "1" } });
+    stubIris(() => attested(exitWith("destinationDomain", "00000003")));
+    expect(await base.relayer.complete(request(), "caller")).toMatchObject({ status: "attested" });
+    expect(base.evmClients.mock.calls.at(-1)).toEqual(["arbitrum"]);
+
+    stubIris(() => attested());
+    expect(await base.relayer.complete(request(), "caller")).toEqual({ status: "minted", hash: MINT_HASH });
+    expect(base.evmClients.mock.calls.at(-1)).toEqual(["base"]);
+    expect(base.walletClient.writeContract).toHaveBeenCalledTimes(1);
+  });
+
+  it("is answered minted when Arc has received it already, and looked at there again later", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const { relayer, publicClient, evmClients } = completing({ used: [0, 1] });
+    stubIris(arcAttested);
+    const asked = request();
+
+    expect(await relayer.complete(asked, "caller")).toMatchObject({ status: "attested" });
+    vi.setSystemTime(Date.now() + 20_000);
+    expect(await relayer.complete(asked, "caller")).toEqual({ status: "minted" });
+    expect(evmClients.mock.calls.map(([chain]) => chain)).toEqual(["arc", "arc"]);
+    expect(publicClient.readContract).toHaveBeenCalledTimes(2);
+  });
+
+  it("is refused, naming Arc, when its mint would revert there", async () => {
+    const { relayer, walletClient } = completing({ simulate: reverting("Invalid attestation signature") });
+    stubIris(arcAttested);
+
+    expect(await refusal(relayer)).toMatchObject({
+      code: "simulation_failed",
+      detail: expect.stringMatching(/would revert on Arc Testnet \(Invalid attestation signature\)/),
+    });
+    expect(walletClient.writeContract).not.toHaveBeenCalled();
   });
 });
 
@@ -344,7 +408,7 @@ describe("an exit that cannot be minted", () => {
     expect(several.publicClient.readContract).not.toHaveBeenCalled();
 
     await terminal(completing(), inbound.message, /from CCTP domain 1 to 27/, "bad_request");
-    await terminal(completing(), exitWith("destinationDomain", "00000003"), /from CCTP domain 27 to 3/, "bad_request");
+    await terminal(completing(), exitWith("destinationDomain", "00000001"), /from CCTP domain 27 to 1/, "bad_request");
     await terminal(completing(), exitWith("sourceDomain", "00000000"), /from CCTP domain 0 to 6/, "bad_request");
     await terminal(completing(), exitWith("messageSender", "ab".repeat(32)), /not sent through the hub/, "bad_request");
     await terminal(completing(), MESSAGE.slice(0, 300), /does not carry a USDC transfer/, "bad_request");

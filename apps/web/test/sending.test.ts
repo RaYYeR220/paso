@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "@/lib/server/config";
 import { createQueue, QueueFullError, QueueTimeoutError } from "@/lib/server/queue";
 import { Relayer } from "@/lib/server/relayer";
-import delivered from "./fixtures/delivered-message.json";
+import delivered from "./fixtures/arc-delivered-message.json";
 
 type Sent = { status: string; hash: string; errorResult?: { result: { type: string } } };
 
@@ -424,7 +424,7 @@ describe("what the relayer account pays", () => {
         : realFetch(input, init),
     );
     vi.spyOn(relayer as unknown as { isNonceUsed: () => Promise<boolean> }, "isNonceUsed").mockResolvedValue(false);
-    return { network: "testnet", sourceDomain: 1, txHash: `0x${"5e".repeat(32)}` };
+    return { network: "testnet", sourceDomain: delivered.sourceDomain, txHash: `0x${"5e".repeat(32)}` };
   }
 
   it("is capped per transaction for a deployment, not only for a relayed call", async () => {

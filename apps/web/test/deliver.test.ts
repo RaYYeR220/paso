@@ -1,17 +1,17 @@
-import { decodeBurnMessage, NETWORKS } from "@paso/sdk";
+import { decodeBurnMessage, listEvmChains, NETWORKS } from "@paso/sdk";
 import { Keypair } from "@stellar/stellar-sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { POST as deliverRoute } from "@/app/api/cctp/deliver/route";
 import { loadConfig } from "@/lib/server/config";
 import { ApiError } from "@/lib/server/errors";
 import { Relayer, type DeliverResult } from "@/lib/server/relayer";
-import delivered from "./fixtures/delivered-message.json";
+import delivered from "./fixtures/arc-delivered-message.json";
 import { live, post, xlmBalance } from "./helpers";
 
 const IRIS = NETWORKS.testnet.irisUrl;
 const realFetch = globalThis.fetch;
 
-/** A burn message that Circle attested and that was delivered on Stellar testnet long ago. */
+/** A burn of USDC on Arc Testnet that Circle attested and that was delivered on Stellar testnet. */
 const MESSAGE = delivered.message as `0x${string}`;
 const ATTESTATION = delivered.attestation as `0x${string}`;
 
@@ -94,7 +94,7 @@ describe("POST /api/cctp/deliver, once the burn is attested", () => {
     const relayer = offlineRelayer();
     const lookups = stubIris(() => complete());
     const { send } = stubChain(relayer, { nonceUsed: [false], send: async () => "ab".repeat(32) });
-    const request = { network: "testnet", sourceDomain: 1, txHash: freshTxHash() };
+    const request = { network: "testnet", sourceDomain: delivered.sourceDomain, txHash: freshTxHash() };
 
     expect(await relayer.deliver(request)).toEqual({ status: "delivered", hash: "ab".repeat(32), route: "forwarder" });
     expect(send).toHaveBeenCalledTimes(1);
@@ -113,7 +113,7 @@ describe("POST /api/cctp/deliver, once the burn is attested", () => {
       nonceUsed: [false],
       send: () => new Promise<string>((resolve) => (finish = resolve)),
     });
-    const request = { network: "testnet", sourceDomain: 1, txHash: freshTxHash() };
+    const request = { network: "testnet", sourceDomain: delivered.sourceDomain, txHash: freshTxHash() };
 
     const both = Promise.all([relayer.deliver(request), relayer.deliver(request)]);
     await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
@@ -135,7 +135,7 @@ describe("POST /api/cctp/deliver, once the burn is attested", () => {
       },
     });
 
-    const result = await relayer.deliver({ network: "testnet", sourceDomain: 1, txHash: freshTxHash() });
+    const result = await relayer.deliver({ network: "testnet", sourceDomain: delivered.sourceDomain, txHash: freshTxHash() });
     expect(result).toEqual({ status: "delivered", route: "forwarder" });
   });
 
@@ -149,9 +149,75 @@ describe("POST /api/cctp/deliver, once the burn is attested", () => {
       },
     });
 
-    await expect(relayer.deliver({ network: "testnet", sourceDomain: 1, txHash: freshTxHash() })).rejects.toMatchObject({
+    await expect(relayer.deliver({ network: "testnet", sourceDomain: delivered.sourceDomain, txHash: freshTxHash() })).rejects.toMatchObject({
       code: "transaction_failed",
     });
+  });
+
+  it("delivers a burn made on Arc, a chain other than Base, asking Circle under Arc's domain", async () => {
+    const relayer = offlineRelayer();
+    const lookups = stubIris(() => complete());
+    const { send } = stubChain(relayer, { nonceUsed: [false], send: async () => "ab".repeat(32) });
+    const txHash = freshTxHash();
+
+    expect(decodeBurnMessage(MESSAGE).sourceDomain).toBe(26);
+    expect(await relayer.deliver({ network: "testnet", sourceDomain: 26, txHash })).toMatchObject({ status: "delivered" });
+    expect(lookups).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks Circle under the domain of each chain it lists, and under no other", async () => {
+    const asked: string[] = [];
+    vi.stubGlobal("fetch", (input: RequestInfo | URL) => {
+      asked.push(String(input instanceof Request ? input.url : input));
+      return Promise.resolve(Response.json({ error: "Message not found" }, { status: 404 }));
+    });
+    const relayer = offlineRelayer();
+    const listed = listEvmChains("testnet").map((chain) => chain.cctpDomain);
+    expect(listed).toEqual([6, 0, 3, 2, 26]);
+
+    for (const domain of listed) {
+      expect(await relayer.deliver({ network: "testnet", sourceDomain: domain, txHash: freshTxHash() })).toEqual({
+        status: "pending",
+        attestation: "not_found",
+      });
+    }
+    expect(asked.map((url) => new URL(url).pathname)).toEqual(listed.map((domain) => `/v2/messages/${domain}`));
+
+    // Avalanche, Solana, Polygon, Unichain: domains Circle has and Paso does not list. Circle is not asked about them.
+    for (const domain of [1, 5, 7, 10]) {
+      await expect(relayer.deliver({ network: "testnet", sourceDomain: domain, txHash: freshTxHash() })).rejects.toMatchObject({
+        code: "bad_request",
+        detail: expect.stringContaining("Base Sepolia 6, Ethereum Sepolia 0, Arbitrum Sepolia 3, OP Sepolia 2, Arc Testnet 26"),
+      });
+    }
+    expect(asked).toHaveLength(listed.length);
+  });
+
+  it("refuses a message that names another source than the domain it was asked under", async () => {
+    const relayer = offlineRelayer();
+    stubIris(() => complete());
+    const chain = stubChain(relayer, { nonceUsed: [false], send: async () => "ab".repeat(32) });
+
+    await expect(relayer.deliver({ network: "testnet", sourceDomain: 6, txHash: freshTxHash() })).rejects.toMatchObject({
+      code: "bad_request",
+      detail: "That transfer comes from CCTP domain 26, not from Base Sepolia",
+    });
+    expect(chain.send).not.toHaveBeenCalled();
+  });
+
+  it("refuses a message from a chain it does not list, even under a domain it does", async () => {
+    const relayer = offlineRelayer();
+    const fromAvalanche = `${MESSAGE.slice(0, 10)}00000001${MESSAGE.slice(18)}`;
+    expect(decodeBurnMessage(fromAvalanche as `0x${string}`).sourceDomain).toBe(1);
+    stubIris(() => complete(fromAvalanche));
+    const chain = stubChain(relayer, { nonceUsed: [false], send: async () => "ab".repeat(32) });
+
+    await expect(relayer.deliver({ network: "testnet", sourceDomain: 26, txHash: freshTxHash() })).rejects.toMatchObject({
+      code: "bad_request",
+      detail: expect.stringContaining("comes from CCTP domain 1"),
+    });
+    expect(chain.send).not.toHaveBeenCalled();
   });
 
   it("refuses a message that is not addressed to Stellar", async () => {
@@ -160,7 +226,7 @@ describe("POST /api/cctp/deliver, once the burn is attested", () => {
     expect(decodeBurnMessage(elsewhere as `0x${string}`).destinationDomain).toBe(3);
     stubIris(() => complete(elsewhere));
 
-    await expect(relayer.deliver({ network: "testnet", sourceDomain: 1, txHash: freshTxHash() })).rejects.toMatchObject({
+    await expect(relayer.deliver({ network: "testnet", sourceDomain: delivered.sourceDomain, txHash: freshTxHash() })).rejects.toMatchObject({
       code: "bad_request",
       detail: expect.stringContaining("not to Stellar"),
     });
@@ -171,7 +237,7 @@ describe("POST /api/cctp/deliver, once the burn is attested", () => {
     const chain = stubChain(relayer, { nonceUsed: [], send: async () => "ab".repeat(32) });
     stubIris(() => complete(`${MESSAGE}${"00".repeat(8_192)}`));
 
-    await expect(relayer.deliver({ network: "testnet", sourceDomain: 1, txHash: freshTxHash() })).rejects.toMatchObject({
+    await expect(relayer.deliver({ network: "testnet", sourceDomain: delivered.sourceDomain, txHash: freshTxHash() })).rejects.toMatchObject({
       code: "bad_request",
       detail: expect.stringContaining("too large"),
     });

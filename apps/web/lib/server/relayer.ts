@@ -1,9 +1,12 @@
 import {
   assertOnlyAccountEntries,
   decodeBurnMessage,
+  DEFAULT_EVM_CHAIN,
   deliverOperation,
   deployOperation,
   erc20Abi,
+  evmChain,
+  evmChainForDomain,
   fetchAttestation,
   fetchAttestations,
   formatAmount,
@@ -14,6 +17,7 @@ import {
   messageTransmitterAbi,
   isDeployed,
   isExpired,
+  listEvmChains,
   MAX_VALIDITY_LEDGERS,
   readContract,
   receiveMessageOnEvm,
@@ -25,6 +29,8 @@ import {
   twinAddress,
   type Attestation,
   type BurnMessage,
+  type EvmChainConfig,
+  type EvmChainName,
   type InboundRoute,
   type NetworkName,
   type RelayResult,
@@ -37,6 +43,7 @@ import {
   ContractFunctionRevertedError,
   createPublicClient,
   createWalletClient,
+  fallback,
   formatEther,
   getAddress,
   hexToBytes,
@@ -104,7 +111,6 @@ const HEALTH_CACHE_MS = 5_000;
 /** Bounds on input: what a request, or an answer from another service, may ask the server to decode and keep. */
 const MAX_XDR_CHARS = 16_384;
 const MAX_AUTH_ENTRIES = 2;
-const MAX_DOMAIN = 0xffff_ffff;
 const MAX_MESSAGE_BYTES = 8_192;
 const MAX_ATTESTATION_BYTES = 2_048;
 const MAX_DIAGNOSTIC_CHARS = 4_000;
@@ -817,10 +823,10 @@ export class Relayer {
   }
 
   /**
-   * Finishes a transfer back to Base: looks the exit up at Circle's
-   * attestation service, once, and when it is attested has the server's
-   * account on Base hand the message to Circle's MessageTransmitter, which
-   * mints the USDC to the recipient the message names.
+   * Finishes a transfer back to an EVM chain: looks the exit up at Circle's
+   * attestation service, once, and when it is attested for Base has the
+   * server's account there hand the message to Circle's MessageTransmitter,
+   * which mints the USDC to the recipient the message names.
    *
    * The server pays the gas and decides nothing else. The call is built from
    * what Circle returned for the transaction, never from bytes a caller
@@ -828,10 +834,12 @@ export class Relayer {
    * Nothing is sent that has not just been simulated successfully, and a
    * mint that fails is never sent a second time.
    *
-   * Where the server does not pay for mints, which is mainnet unless it was
-   * told otherwise by name, the exit is looked up and checked in just the
-   * same way and then handed back: the answer is `attested`, with the
-   * message and its attestation, for the owner's own wallet to submit.
+   * An exit to any other chain the network lists, and every exit where the
+   * server does not pay for mints, which is mainnet unless it was told
+   * otherwise by name, is looked up and checked in just the same way, on
+   * the chain it is for, and then handed back: the answer is `attested`,
+   * with the message and its attestation, for the owner's own wallet to
+   * submit.
    *
    * An exit has one of four answers. `pending`: ask again. `minted`.
    * `attested`: checked, and the caller's to mint. Or a refusal that says
@@ -1063,21 +1071,30 @@ export class Relayer {
     }
   }
 
+  /**
+   * A burn to deliver: its transaction, and the CCTP domain of the chain it
+   * was made on, which has to be one of the chains the SDK lists for this
+   * network. A burn anywhere else is refused before Circle is asked.
+   */
   private readBurn(body: unknown): { sourceDomain: number; txHash: Hex } {
     if (!isRecord(body)) {
       throw new ApiError("bad_request", "Expected a JSON object with network, sourceDomain and txHash");
     }
     this.assertNetwork(body.network, true);
     const { sourceDomain, txHash } = body;
-    const { cctpDomain } = this.config.network.stellar;
-    const domain = Number.isInteger(sourceDomain) ? (sourceDomain as number) : -1;
-    if (domain < 0 || domain > MAX_DOMAIN || domain === cctpDomain) {
-      throw new ApiError("bad_request", "sourceDomain must be the CCTP domain of the chain the USDC was burned on");
+    const { network } = this.config;
+    const source = Number.isInteger(sourceDomain) ? evmChainForDomain(network, sourceDomain as number) : undefined;
+    if (!source) {
+      const listed = listEvmChains(network).map((chain) => `${chain.label} ${chain.cctpDomain}`).join(", ");
+      throw new ApiError(
+        "bad_request",
+        `sourceDomain must be the CCTP domain of a chain USDC is brought from on ${network.name}: ${listed}`,
+      );
     }
     if (typeof txHash !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
       throw new ApiError("bad_request", "txHash must be the hash of the burn transaction (0x and 64 hex digits)");
     }
-    return { sourceDomain: domain, txHash: txHash as Hex };
+    return { sourceDomain: source.cctpDomain, txHash: txHash as Hex };
   }
 
   /** The Stellar transaction of an exit: 64 hex digits, the form Circle indexes it under. */
@@ -1178,6 +1195,11 @@ export class Relayer {
     if (burn.destinationDomain !== network.stellar.cctpDomain) {
       throw new ApiError("bad_request", `That transfer goes to CCTP domain ${burn.destinationDomain}, not to Stellar`);
     }
+    // The chain acted on is the one the attested message names, and it has to be the listed chain Circle was asked under.
+    if (burn.sourceDomain !== sourceDomain) {
+      const asked = evmChainForDomain(network, sourceDomain);
+      throw new ApiError("bad_request", `That transfer comes from CCTP domain ${burn.sourceDomain}, not from ${asked?.label ?? `domain ${sourceDomain}`}`);
+    }
     const route = inboundRouteOf(message, network);
     if (await this.isNonceUsed(nonce)) return { status: "delivered", route };
 
@@ -1248,8 +1270,9 @@ export class Relayer {
     const now = Date.now();
     if (exit.message && now - exit.checkedAt >= RECHECK_MS) {
       exit.checkedAt = now;
-      const { publicClient } = this.evmClients();
-      const received = await isReceivedOnEvm(publicClient, exit.message, this.config.network).catch(() => false);
+      const destination = this.destinationOf(exit.message);
+      const { publicClient } = this.evmClients(destination.name);
+      const received = await isReceivedOnEvm(publicClient, exit.message, this.config.network, destination.name).catch(() => false);
       if (received) {
         const result: CompleteResult = { status: "minted" };
         this.exits.set(txHash, { kind: "minted", until: now + DAY_MS, result });
@@ -1268,14 +1291,14 @@ export class Relayer {
    */
   private async settleMint(txHash: string, exit: Extract<Exit, { kind: "sending" }>): Promise<CompleteResult> {
     const { network } = this.config;
-    const { chain } = network.evm;
-    const { publicClient } = this.evmClients();
+    const destination = this.destinationOf(exit.message);
+    const { publicClient } = this.evmClients(destination.name);
     const now = Date.now();
     try {
       const receipt = exit.hash
         ? await publicClient.getTransactionReceipt({ hash: exit.hash }).catch(() => undefined)
         : undefined;
-      if (await isReceivedOnEvm(publicClient, exit.message, network)) {
+      if (await isReceivedOnEvm(publicClient, exit.message, network, destination.name)) {
         const result: CompleteResult =
           receipt?.status === "success" && exit.hash ? { status: "minted", hash: exit.hash } : { status: "minted" };
         this.exits.set(txHash, { kind: "minted", until: now + DAY_MS, result });
@@ -1285,14 +1308,14 @@ export class Relayer {
     } catch (error) {
       if (error instanceof ApiError) throw error;
     }
-    throw new ApiError("unavailable", `The mint was sent and ${chain.name} has not confirmed it yet; ask again in a moment`);
+    throw new ApiError("unavailable", `The mint was sent and ${destination.label} has not confirmed it yet; ask again in a moment`);
   }
 
   /** Records a mint that was included and reverted. It is not sent again. */
   private failExit(txHash: string, message: Hex): ApiError {
     const refusal = new ApiError(
       "simulation_failed",
-      `The mint was included on ${this.config.network.evm.chain.name} and reverted; the server will not send it again, submit it from your own wallet`,
+      `The mint was included on ${this.destinationOf(message).label} and reverted; the server will not send it again, submit it from your own wallet`,
     );
     const now = Date.now();
     this.exits.set(txHash, { kind: "failed", until: now + DAY_MS, refusal, message, checkedAt: now });
@@ -1331,10 +1354,15 @@ export class Relayer {
   /**
    * The one exit through the hub that a transaction carries. A transaction
    * can carry several messages, so the one to act on is chosen by what it
-   * says: burned on Stellar, for Base, at the request of the hub.
+   * says: burned on Stellar, for one of the EVM chains the SDK lists for the
+   * network, at the request of the hub.
    */
-  private hubExit(txHash: string, attestations: Attestation[]): { burn: BurnMessage; attestation: Attestation } {
-    const { stellar, evm } = this.config.network;
+  private hubExit(
+    txHash: string,
+    attestations: Attestation[],
+  ): { burn: BurnMessage; attestation: Attestation; destination: EvmChainConfig } {
+    const { network } = this.config;
+    const { stellar } = network;
     const hub = stellar.hub ? toHex(StrKey.decodeContract(stellar.hub)) : null;
     const transfers = attestations.flatMap((attestation) => {
       try {
@@ -1344,9 +1372,10 @@ export class Relayer {
         return [];
       }
     });
-    const onRoute = transfers.filter(
-      ({ burn }) => burn.sourceDomain === stellar.cctpDomain && burn.destinationDomain === evm.cctpDomain,
-    );
+    const onRoute = transfers.flatMap(({ burn, attestation }) => {
+      const destination = burn.sourceDomain === stellar.cctpDomain ? evmChainForDomain(network, burn.destinationDomain) : undefined;
+      return destination ? [{ burn, attestation, destination }] : [];
+    });
     const exits = onRoute.filter(({ burn }) => burn.messageSender === hub);
 
     const [exit] = exits;
@@ -1363,8 +1392,8 @@ export class Relayer {
         txHash,
         "bad_request",
         only && transfers.length === 1
-          ? `That transfer goes from CCTP domain ${only.burn.sourceDomain} to ${only.burn.destinationDomain}, not from Stellar to ${evm.chain.name}`
-          : `That transaction carries no transfer from Stellar to ${evm.chain.name}`,
+          ? `That transfer goes from CCTP domain ${only.burn.sourceDomain} to ${only.burn.destinationDomain}, not from Stellar to a chain the server completes exits on`
+          : "That transaction carries no transfer from Stellar to a chain the server completes exits on",
       );
     }
     throw this.refuseExit(
@@ -1375,13 +1404,13 @@ export class Relayer {
   }
 
   /**
-   * Why Base would not accept this exit, read off the message alone, or
-   * `null` when nothing in it stands in the way. `payer` is the server's
-   * account when the server is to submit the mint, and `null` when the mint
-   * is left to a wallet. None of this can change for the exit, so a reason
-   * found here is final.
+   * Why `destination` would not accept this exit, read off the message
+   * alone, or `null` when nothing in it stands in the way. `payer` is the
+   * server's account when the server is to submit the mint, and `null` when
+   * the mint is left to a wallet. None of this can change for the exit, so a
+   * reason found here is final.
    */
-  private unmintable(burn: BurnMessage, payer: Address | null): string | null {
+  private unmintable(burn: BurnMessage, payer: Address | null, destination: EvmChainConfig): string | null {
     const { stellar } = this.config.network;
     if (burn.destinationCaller !== ZERO_BYTES32) {
       if (payer === null) return "it names the one address allowed to complete it, and only that address can submit the mint";
@@ -1390,10 +1419,10 @@ export class Relayer {
       }
     }
     if (!/^0x0{24}[0-9a-f]{40}$/.test(burn.mintRecipient) || burn.mintRecipient === ZERO_BYTES32) {
-      return "its recipient is not an address on Base";
+      return `its recipient is not an address on ${destination.label}`;
     }
     if (burn.burnToken !== toHex(StrKey.decodeContract(stellar.usdc))) {
-      return "what it burned is not the USDC that Circle mints on Base";
+      return `what it burned is not the USDC that Circle mints on ${destination.label}`;
     }
     if (payer !== null && burn.amount < MIN_MINT_AMOUNT) {
       return "it is too small for the server to pay its gas";
@@ -1403,7 +1432,7 @@ export class Relayer {
 
   private async completeOnce(txHash: string, caller: string): Promise<CompleteResult> {
     const { network, baseMints } = this.config;
-    const { stellar, evm } = network;
+    const { stellar } = network;
 
     const lookup = await this.lookUpExit(stellar.cctpDomain, txHash);
     if (lookup.state === "not_found") return { status: "pending", attestation: "not_found" };
@@ -1426,20 +1455,20 @@ export class Relayer {
       });
     }
 
-    const { burn, attestation } = this.hubExit(txHash, lookup.attestations);
+    const { burn, attestation, destination } = this.hubExit(txHash, lookup.attestations);
     const { message } = attestation;
-    const { publicClient, walletClient } = this.evmClients();
-    // The server submits the mint only where it was set up to pay for one and has an account to pay from.
+    const { publicClient, walletClient } = this.evmClients(destination.name);
+    // The server submits the mint only on Base, where it was set up to pay for one and has an account to pay from.
     // Everywhere else the exit is checked in the same way and handed back for a wallet to submit.
-    const pays = baseMints.enabled && walletClient !== null;
+    const pays = baseMints.enabled && walletClient !== null && destination.name === DEFAULT_EVM_CHAIN;
     const payer = pays ? walletClient.account.address : null;
-    const unreachable = () => new ApiError("unavailable", `The server could not reach ${evm.chain.name}; try again later`);
+    const unreachable = () => new ApiError("unavailable", `The server could not reach ${destination.label}; try again later`);
 
     // Whether it has been received comes first: if it has, there is nothing left to decide.
     let block: bigint;
     let held: bigint;
     try {
-      if (await isReceivedOnEvm(publicClient, message, network)) return { status: "minted" };
+      if (await isReceivedOnEvm(publicClient, message, network, destination.name)) return { status: "minted" };
       [block, held] = await Promise.all([
         publicClient.getBlockNumber(),
         payer ? publicClient.getBalance({ address: payer }) : Promise.resolve(BigInt(0)),
@@ -1448,7 +1477,7 @@ export class Relayer {
       throw unreachable();
     }
 
-    const reason = this.unmintable(burn, payer);
+    const reason = this.unmintable(burn, payer, destination);
     if (reason) {
       throw this.refuseExit(txHash, "simulation_failed", `The server cannot complete this exit: ${reason}`, DAY_MS, message);
     }
@@ -1457,19 +1486,19 @@ export class Relayer {
       throw this.refuseExit(
         txHash,
         "simulation_failed",
-        `The server cannot complete this exit: its attestation expired at block ${burn.expirationBlock} of ${evm.chain.name}`,
+        `The server cannot complete this exit: its attestation expired at block ${burn.expirationBlock} of ${destination.label}`,
         SHORT_MEMORY_MS,
         message,
       );
     }
     if (payer && held < baseMints.payerEthFloor) {
-      throw new ApiError("unavailable", `The server is out of gas on ${evm.chain.name}; submit the mint from your own wallet`);
+      throw new ApiError("unavailable", `The server is out of gas on ${destination.label}; submit the mint from your own wallet`);
     }
 
     // The exact call, simulated. What does not succeed here is not sent, and not handed to a wallet either.
     // Anyone may submit it, so without an account of the server's it is simulated as its own recipient would send it.
     const call = {
-      address: evm.messageTransmitter,
+      address: destination.messageTransmitter,
       abi: messageTransmitterAbi,
       functionName: "receiveMessage",
       args: [message, attestation.attestation],
@@ -1485,12 +1514,12 @@ export class Relayer {
       throw this.refuseExit(
         txHash,
         "simulation_failed",
-        `The server cannot complete this exit: the mint would revert on ${evm.chain.name}${reverted ? ` (${reverted})` : ""}`,
+        `The server cannot complete this exit: the mint would revert on ${destination.label}${reverted ? ` (${reverted})` : ""}`,
         SHORT_MEMORY_MS,
         message,
       );
     }
-    if (!walletClient || !payer || !fees) {
+    if (!pays || !walletClient || !payer || !fees) {
       const now = Date.now();
       this.rememberExit(txHash, { kind: "attested", until: now + SHORT_MEMORY_MS, message, attestation: attestation.attestation, checkedAt: now });
       return { status: "attested", message, attestation: attestation.attestation };
@@ -1505,7 +1534,7 @@ export class Relayer {
       );
     }
     if (fees.maxFeePerGas > baseMints.maxFeePerGas) {
-      throw new ApiError("unavailable", `Gas on ${evm.chain.name} costs more right now than the server pays; try again later`);
+      throw new ApiError("unavailable", `Gas on ${destination.label} costs more right now than the server pays; try again later`);
     }
     const padded = (gas * BigInt(12)) / BigInt(10);
     const gasLimit = padded > MINT_GAS_LIMIT ? MINT_GAS_LIMIT : padded;
@@ -1518,7 +1547,7 @@ export class Relayer {
       const sent = await this.evmQueue(async (signal) => {
         assertStillWanted(signal);
         this.assertPredecessorSettled();
-        if (await isReceivedOnEvm(publicClient, message, network)) return { alreadyReceived: true, hash: undefined };
+        if (await isReceivedOnEvm(publicClient, message, network, destination.name)) return { alreadyReceived: true, hash: undefined };
         // Without room to write the reservation down there is no send: a mint is never on its way unrecorded.
         if (!this.exitRoom(txHash)) throw busy();
         assertStillWanted(signal);
@@ -1535,6 +1564,7 @@ export class Relayer {
             message,
             attestation: attestation.attestation,
             network,
+            chain: destination.name,
             gas: gasLimit,
             maxFeePerGas: mintFees.maxFeePerGas,
             maxPriorityFeePerGas:
@@ -1575,7 +1605,7 @@ export class Relayer {
         // The cause stays in the log: a transport error can quote the endpoint it failed to reach.
         console.error("Mint on Base unconfirmed:", error instanceof Error ? error.name : "unknown error");
       }
-      throw new ApiError("unavailable", `The mint was sent and ${evm.chain.name} has not confirmed it yet; ask again in a moment`);
+      throw new ApiError("unavailable", `The mint was sent and ${destination.label} has not confirmed it yet; ask again in a moment`);
     }
   }
 
@@ -1639,14 +1669,32 @@ export class Relayer {
     return used.type === "scvBool" && used.b;
   }
 
-  private evmClients() {
+  /**
+   * Clients for one EVM chain of the network, Base unless another is named.
+   * Base is reached through the configured endpoint, every other chain
+   * through the public endpoints the SDK lists for it. The server's account
+   * sends on Base and nowhere else, so only Base has a wallet client.
+   */
+  private evmClients(name: EvmChainName = DEFAULT_EVM_CHAIN) {
     const { network, payer, evmRpcUrl } = this.config;
-    const { chain } = network.evm;
-    const transport = http(evmRpcUrl, { timeout: EVM_TIMEOUT_MS, retryCount: 1 });
+    const { chain, rpcUrls } = evmChain(network, name);
+    const options = { timeout: EVM_TIMEOUT_MS, retryCount: 1 };
+    const base = name === DEFAULT_EVM_CHAIN;
+    const transport = base ? http(evmRpcUrl, options) : fallback(rpcUrls.map((url) => http(url, options)));
     return {
       publicClient: createPublicClient({ chain, transport }),
-      walletClient: payer ? createWalletClient({ account: payer, chain, transport }) : null,
+      walletClient: payer && base ? createWalletClient({ account: payer, chain, transport }) : null,
     };
+  }
+
+  /** The chain an exit message is for. A message for a chain the network does not list is read as Base's, which refuses it. */
+  private destinationOf(message: Hex): EvmChainConfig {
+    const { network } = this.config;
+    try {
+      return evmChainForDomain(network, decodeBurnMessage(message).destinationDomain) ?? evmChain(network);
+    } catch {
+      return evmChain(network);
+    }
   }
 
   /**

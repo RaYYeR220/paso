@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "@/lib/server/config";
 import { ApiError } from "@/lib/server/errors";
 import { Relayer } from "@/lib/server/relayer";
-import delivered from "./fixtures/delivered-message.json";
+import delivered from "./fixtures/arc-delivered-message.json";
 import exit from "./fixtures/exit-message.json";
 import { post } from "./helpers";
 
@@ -333,7 +333,7 @@ describe("how much one caller can have paid for on mainnet", () => {
         : realFetch(input, init),
     );
     const nonceUsed = vi.spyOn(run.relayer as unknown as { isNonceUsed: () => Promise<boolean> }, "isNonceUsed").mockResolvedValue(false);
-    const burn = (index: number) => ({ network: "mainnet", sourceDomain: 6, txHash: `0x${index.toString(16).padStart(64, "0")}` });
+    const burn = (index: number) => ({ network: "mainnet", sourceDomain: delivered.sourceDomain, txHash: `0x${index.toString(16).padStart(64, "0")}` });
     const deliver = (index: number, caller: string) => run.relayer.deliver(burn(index), caller);
 
     for (let i = 0; i < 6; i += 1) await expect(deliver(i, "203.0.113.1")).resolves.toMatchObject({ status: "delivered" });

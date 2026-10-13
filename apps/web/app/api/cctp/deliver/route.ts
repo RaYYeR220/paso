@@ -9,8 +9,13 @@ export const maxDuration = 60;
  * the burn.
  *
  *   POST { network, sourceDomain, txHash }
- *     sourceDomain  CCTP domain of the chain the burn happened on (Base is 6)
+ *     sourceDomain  CCTP domain of the chain the burn happened on: Base 6, Ethereum 0, Arbitrum 3,
+ *                   OP Mainnet 2, Arc 26, or their test networks. Any other domain is refused.
  *     txHash        hash of the burn transaction
+ *
+ * The message delivered is the one Circle attested under that domain, and it
+ * has to name the same domain as its source: the chain acted on is read off
+ * the attested bytes, not taken from the request.
  *
  *   200 { status: "pending", attestation: "not_found" | "pending" | "unreachable", delayReason? }
  *   200 { status: "delivered", hash?, route: "forwarder" | "direct" }
