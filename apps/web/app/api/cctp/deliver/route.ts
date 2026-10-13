@@ -22,6 +22,11 @@ export const maxDuration = 60;
  * delivered by someone else, which is just as good. A burn the relayer does
  * not deliver is not lost: Circle has attested it, and anyone can deliver it
  * from any funded Stellar account, at any time.
+ *
+ * The relayer pays for this without any account owner's signature, on
+ * mainnet too: only for a message Circle has attested, once per message, and
+ * within the delivery limits and the day's fee budget. `Relayer.deliver`
+ * says why that is acceptable.
  */
 export async function POST(request: Request): Promise<Response> {
   return respond(async () => {

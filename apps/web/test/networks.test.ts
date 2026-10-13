@@ -1,5 +1,6 @@
 import { NETWORKS, type NetworkName } from "@paso/sdk";
 import { Account, Keypair, SorobanDataBuilder, StrKey, xdr } from "@stellar/stellar-sdk";
+import type { Address } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "@/lib/server/config";
@@ -73,8 +74,18 @@ function scripted({ network = "testnet", env = {}, resourceFee = "100", balance 
     status: "NOT_FOUND",
     latestLedgerCloseTime: sent[sent.length - 1]!.maxTime + (clock === "after" ? 1 : -5),
   });
-  const deploy = (caller = "caller", owner = randomOwner()) => relayer.deploy({ network, owner }, caller);
-  return { relayer, server, sent, answers, missing, deploy, network };
+  /**
+   * Deploys an owner's account the way the relayer does before a first
+   * relayed call. It is what these tests pay for, on either network; the
+   * deploy route itself is testnet's.
+   */
+  const deployOwner = async (owner: Address, caller = "caller") => {
+    const internals = relayer as unknown as { ensureDeployed(owner: Address, caller: string): Promise<string | undefined> };
+    const hash = await internals.ensureDeployed(owner, caller);
+    return hash ? { hash, alreadyDeployed: false } : { alreadyDeployed: true };
+  };
+  const deploy = (caller = "caller", owner = randomOwner()) => deployOwner(owner, caller);
+  return { relayer, server, sent, answers, missing, deploy, deployOwner, network };
 }
 
 const refusalOf = async (attempt: Promise<unknown>) => (await attempt.catch((error: unknown) => error)) as ApiError;
@@ -92,7 +103,7 @@ describe("a transaction the network left out", () => {
     const body = { network: "testnet", owner: randomOwner() };
     run.server.pollTransaction.mockImplementationOnce(run.missing("after"));
 
-    const leftOut = await refusalOf(run.relayer.deploy(body, "caller"));
+    const leftOut = await refusalOf(run.deployOwner(body.owner, "caller"));
     expect(leftOut).toMatchObject({
       code: "unavailable",
       detail: expect.stringMatching(/was not included before its time ran out/),
@@ -101,7 +112,7 @@ describe("a transaction the network left out", () => {
     expect(run.server.sendTransaction).toHaveBeenCalledTimes(1);
     expect(run.sent[0]!.fee).toBe("1100");
 
-    await expect(run.relayer.deploy(body, "caller")).resolves.toMatchObject({ alreadyDeployed: false });
+    await expect(run.deployOwner(body.owner, "caller")).resolves.toMatchObject({ alreadyDeployed: false });
     expect(run.server.sendTransaction).toHaveBeenCalledTimes(2);
     expect(run.sent[1]!.fee).toBe("2100");
     expect(run.relayer.state.sends.size).toBe(0);
@@ -122,9 +133,9 @@ describe("a transaction the network left out", () => {
     const body = { network: "testnet", owner: randomOwner() };
     run.server.pollTransaction.mockImplementationOnce(run.missing("after"));
 
-    await refusalOf(run.relayer.deploy(body, "caller"));
+    await refusalOf(run.deployOwner(body.owner, "caller"));
     expect(run.relayer.state.fees.spent()).toBe(BigInt(1_100));
-    await run.relayer.deploy(body, "caller");
+    await run.deployOwner(body.owner, "caller");
     expect(run.relayer.state.fees.spent()).toBe(BigInt(2_100));
   });
 
@@ -133,8 +144,8 @@ describe("a transaction the network left out", () => {
     const body = { network: "testnet", owner: randomOwner() };
     run.server.pollTransaction.mockImplementationOnce(run.missing("after"));
 
-    await refusalOf(run.relayer.deploy(body, "caller"));
-    await expect(run.relayer.deploy(body, "caller")).resolves.toMatchObject({ alreadyDeployed: false });
+    await refusalOf(run.deployOwner(body.owner, "caller"));
+    await expect(run.deployOwner(body.owner, "caller")).resolves.toMatchObject({ alreadyDeployed: false });
     expect(await refusalOf(run.deploy("caller"))).toMatchObject({ code: "rate_limited" });
   });
 
@@ -145,14 +156,14 @@ describe("a transaction the network left out", () => {
     run.server.pollTransaction.mockImplementationOnce(run.missing("before"));
     run.server.getTransaction.mockImplementation(run.missing("before"));
 
-    expect(await refusalOf(run.relayer.deploy(body, "caller"))).toMatchObject({
+    expect(await refusalOf(run.deployOwner(body.owner, "caller"))).toMatchObject({
       code: "unavailable",
       detail: expect.stringContaining("has not been confirmed yet"),
       extra: { sent: true },
     });
     for (const wait of [1_000, 60_000, 600_000]) {
       await vi.advanceTimersByTimeAsync(wait);
-      expect(await refusalOf(run.relayer.deploy(body, "caller"))).toMatchObject({
+      expect(await refusalOf(run.deployOwner(body.owner, "caller"))).toMatchObject({
         code: "unavailable",
         detail: expect.stringContaining("is on its way"),
         extra: { sent: true },
@@ -162,7 +173,7 @@ describe("a transaction the network left out", () => {
 
     // The network catches up and says the time bound has passed: only now is another one sent.
     run.server.getTransaction.mockImplementation(run.missing("after"));
-    const again = run.relayer.deploy(body, "caller");
+    const again = run.deployOwner(body.owner, "caller");
     await vi.advanceTimersByTimeAsync(10);
     await expect(again).resolves.toMatchObject({ alreadyDeployed: false });
     expect(run.server.sendTransaction).toHaveBeenCalledTimes(2);
@@ -174,9 +185,9 @@ describe("a transaction the network left out", () => {
     const body = { network: "mainnet", owner: randomOwner() };
     run.server.pollTransaction.mockImplementation(run.missing("after"));
 
-    const first = await refusalOf(run.relayer.deploy(body, "caller"));
-    const second = await refusalOf(run.relayer.deploy(body, "caller"));
-    const third = await refusalOf(run.relayer.deploy(body, "caller"));
+    const first = await refusalOf(run.deployOwner(body.owner, "caller"));
+    const second = await refusalOf(run.deployOwner(body.owner, "caller"));
+    const third = await refusalOf(run.deployOwner(body.owner, "caller"));
 
     expect(run.sent.map((tx) => tx.fee)).toEqual(["100100", "200100", "400100"]);
     expect([first, second].map((refusal) => refusal.detail)).toEqual([
@@ -191,13 +202,13 @@ describe("a transaction the network left out", () => {
     expect(third.extra.retryAfterSeconds).toBeGreaterThan(200);
 
     // Asked again at once, nothing more is sent.
-    expect(await refusalOf(run.relayer.deploy(body, "caller"))).toMatchObject({ detail: expect.stringMatching(/left it out 3 times/) });
+    expect(await refusalOf(run.deployOwner(body.owner, "caller"))).toMatchObject({ detail: expect.stringMatching(/left it out 3 times/) });
     expect(run.server.sendTransaction).toHaveBeenCalledTimes(3);
 
     // After the pause the same thing starts over, at the usual bid.
     await vi.advanceTimersByTimeAsync(5 * 60_000);
     run.server.pollTransaction.mockImplementation(async (hash) => ({ status: "SUCCESS", txHash: hash }));
-    const anew = run.relayer.deploy(body, "caller");
+    const anew = run.deployOwner(body.owner, "caller");
     await vi.advanceTimersByTimeAsync(10);
     await expect(anew).resolves.toMatchObject({ alreadyDeployed: false });
     expect(run.sent[3]!.fee).toBe("100100");
@@ -207,12 +218,12 @@ describe("a transaction the network left out", () => {
     const run = scripted();
     const body = { network: "testnet", owner: randomOwner() };
     run.server.pollTransaction.mockImplementationOnce(run.missing("after"));
-    await refusalOf(run.relayer.deploy(body, "caller"));
+    await refusalOf(run.deployOwner(body.owner, "caller"));
 
     run.answers.push({ status: "ERROR", hash: "", errorResult: { result: { type: "txInsufficientBalance" } } });
-    expect(await refusalOf(run.relayer.deploy(body, "caller"))).toMatchObject({ detail: expect.stringContaining("txInsufficientBalance") });
+    expect(await refusalOf(run.deployOwner(body.owner, "caller"))).toMatchObject({ detail: expect.stringContaining("txInsufficientBalance") });
 
-    await run.relayer.deploy(body, "caller");
+    await run.deployOwner(body.owner, "caller");
     expect(run.sent.map((tx) => tx.fee)).toEqual(["1100", "2100", "2100"]);
   });
 });
@@ -393,11 +404,11 @@ describe("two networks in one server", () => {
     testnet.server.pollTransaction.mockImplementationOnce(testnet.missing("before"));
     testnet.server.getTransaction.mockImplementation(testnet.missing("before"));
 
-    await refusalOf(testnet.relayer.deploy({ network: "testnet", owner }, "caller"));
+    await refusalOf(testnet.deployOwner(owner));
     expect(testnet.relayer.state.sends.size).toBe(1);
 
-    await expect(mainnet.relayer.deploy({ network: "mainnet", owner }, "caller")).resolves.toMatchObject({ alreadyDeployed: false });
-    expect(await refusalOf(testnet.relayer.deploy({ network: "testnet", owner }, "caller"))).toMatchObject({
+    await expect(mainnet.deployOwner(owner)).resolves.toMatchObject({ alreadyDeployed: false });
+    expect(await refusalOf(testnet.deployOwner(owner))).toMatchObject({
       detail: expect.stringContaining("is on its way"),
     });
   });
@@ -432,14 +443,14 @@ describe("two networks in one server", () => {
 
   it("answer a request with the relayer of the network it names", async () => {
     const getRelayer = await load();
-    const deploy = await route("deploy");
-    const onTestnet = vi.spyOn(getRelayer("testnet"), "deploy").mockResolvedValue({ address: "C-testnet", alreadyDeployed: true });
-    const onMainnet = vi.spyOn(getRelayer("mainnet"), "deploy").mockResolvedValue({ address: "C-mainnet", alreadyDeployed: true });
+    const relay = await route("relay");
+    const onTestnet = vi.spyOn(getRelayer("testnet"), "relay").mockResolvedValue({ hash: "testnet" });
+    const onMainnet = vi.spyOn(getRelayer("mainnet"), "relay").mockResolvedValue({ hash: "mainnet" });
     const owner = randomOwner();
 
-    expect(await (await deploy(post("/api/deploy", { network: "mainnet", owner }))).json()).toMatchObject({ address: "C-mainnet" });
-    expect(await (await deploy(post("/api/deploy", { network: "testnet", owner }))).json()).toMatchObject({ address: "C-testnet" });
-    expect(await (await deploy(post("/api/deploy", { owner }))).json()).toMatchObject({ address: "C-testnet" });
+    expect(await (await relay(post("/api/relay", { network: "mainnet", owner }))).json()).toEqual({ hash: "mainnet" });
+    expect(await (await relay(post("/api/relay", { network: "testnet", owner }))).json()).toEqual({ hash: "testnet" });
+    expect(await (await relay(post("/api/relay", { owner }))).json()).toEqual({ hash: "testnet" });
     expect(onMainnet).toHaveBeenCalledTimes(1);
     expect(onTestnet).toHaveBeenCalledTimes(2);
     expect(onMainnet.mock.calls[0]![1]).toBe("shared");
@@ -508,6 +519,25 @@ describe("two networks in one server", () => {
       networks: { testnet: { enabled: true, ok: true, network: "testnet" }, mainnet: { enabled: true, ok: false, network: "mainnet" } },
     });
     for (const secret of [testnetSecret, mainnetSecret]) expect(text).not.toContain(secret);
+  });
+
+  it("the deploy route refuses mainnet, and the mainnet relayer sends nothing for it", async () => {
+    const getRelayer = await load();
+    const mainnet = getRelayer("mainnet") as unknown as { send: () => Promise<string>; ensureDeployed: () => Promise<string> };
+    const send = vi.spyOn(mainnet, "send");
+    const ensureDeployed = vi.spyOn(mainnet, "ensureDeployed");
+    const deploy = await route("deploy");
+
+    for (const body of [{ network: "mainnet", owner: randomOwner() }, { network: "mainnet", owner: randomOwner(), proof: `0x${"ab".repeat(65)}` }]) {
+      const response = await deploy(post("/api/deploy", body));
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({
+        error: "not_found",
+        detail: "On mainnet an account is deployed only with its owner's first signed call, through /api/relay; this route deploys on testnet only",
+      });
+    }
+    expect(ensureDeployed).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
   });
 
   it("the faucet refuses a request for mainnet, served or not", async () => {

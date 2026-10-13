@@ -43,12 +43,6 @@ export type DeliverResponse =
   | { status: "pending"; attestation: "not_found" | "pending" | "unreachable"; delayReason?: string }
   | { status: "delivered"; hash?: string; route: InboundRoute };
 
-export interface DeployResponse {
-  address: string;
-  hash?: string;
-  alreadyDeployed: boolean;
-}
-
 /** How many transactions of one kind the relayer pays for in an hour: from one caller, and from everyone. */
 export interface SpendLimit {
   perCallerPerHour: number;
@@ -95,7 +89,6 @@ export interface PasoApi {
   demoFund(owner: Address, signal?: AbortSignal): Promise<DemoFundResponse>;
   /** Asks once whether a burn is attested, and delivers it on Stellar when it is. */
   deliver(burn: { sourceDomain: number; txHash: Hex }, signal?: AbortSignal): Promise<DeliverResponse>;
-  deploy(owner: Address, signal?: AbortSignal): Promise<DeployResponse>;
   health(signal?: AbortSignal): Promise<HealthResponse>;
 }
 
@@ -154,7 +147,6 @@ export function createApi(options: ApiOptions): PasoApi {
   return {
     demoFund: (owner, signal) => post(ROUTES.demoFund, { network, owner }, signal),
     deliver: ({ sourceDomain, txHash }, signal) => post(ROUTES.deliver, { network, sourceDomain, txHash }, signal),
-    deploy: (owner, signal) => post(ROUTES.deploy, { network, owner }, signal),
     health: (signal) => request(fetcher, `${baseUrl}${ROUTES.health}`, { signal, cache: "no-store" }),
   };
 }

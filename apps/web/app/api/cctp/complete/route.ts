@@ -30,6 +30,10 @@ export const maxDuration = 60;
  * what Circle returned, to be handed to `receiveMessage` on Circle's
  * MessageTransmitter on Base from any wallet. The exit is checked in the
  * same way in both cases, and nothing a caller sends is passed on.
+ *
+ * No Stellar fee is paid here. Where the server pays for the mint, it pays
+ * gas on Base, and only for an exit made through the hub: an exit the
+ * account's owner signed.
  */
 export async function POST(request: Request): Promise<Response> {
   return respond(async () => {

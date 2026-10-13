@@ -18,10 +18,14 @@ export function networkLabel(name: NetworkName): "Testnet" | "Mainnet" {
   return name === "mainnet" ? "Mainnet" : "Testnet";
 }
 
-/** The app's own API routes. The network a request is for goes in its body. */
+/**
+ * The app's own API routes that the browser uses. The network a request is
+ * for goes in its body. The browser never asks for an account to be
+ * deployed on its own: the relayer deploys it with its owner's first signed
+ * call.
+ */
 export const ROUTES = {
   relay: "/api/relay",
-  deploy: "/api/deploy",
   deliver: "/api/cctp/deliver",
   complete: "/api/cctp/complete",
   demoFund: "/api/demo/fund",

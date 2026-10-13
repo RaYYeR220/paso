@@ -1,4 +1,15 @@
-import { attachSignature, prepare, relayRequest, sign, twinAddress, withArgument, type RelayRequest, type Signed } from "@paso/sdk";
+import {
+  attachSignature,
+  NETWORKS,
+  prepare,
+  relayRequest,
+  sign,
+  twinAddress,
+  withArgument,
+  type NetworkName,
+  type RelayRequest,
+  type Signed,
+} from "@paso/sdk";
 import { Account, Address, Keypair, nativeToScVal, SorobanDataBuilder, xdr, type rpc } from "@stellar/stellar-sdk";
 import { generatePrivateKey, privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -7,7 +18,7 @@ import { POST as relayRoute } from "@/app/api/relay/route";
 import { loadConfig } from "@/lib/server/config";
 import { ApiError } from "@/lib/server/errors";
 import { getRelayer, Relayer } from "@/lib/server/relayer";
-import { hub, post, usdc } from "./helpers";
+import { post } from "./helpers";
 
 const LATEST = 5_000_000;
 const freshOwner = () => privateKeyToAccount(generatePrivateKey());
@@ -50,8 +61,15 @@ const simulated = (auth: xdr.SorobanAuthorizationEntry[]) => ({
 
 /** A USDC approval from the account of `owner`, prepared without the network and signed by `signer`. */
 /** With `preparedAgo`, a call prepared that many ledgers back: one whose single ledger of validity has passed. */
-async function approval(owner: PrivateKeyAccount, signer: PrivateKeyAccount = owner, validForLedgers = 120, preparedAgo = 0): Promise<Signed> {
-  const account = twinAddress(owner.address, "testnet");
+async function approval(
+  owner: PrivateKeyAccount,
+  signer: PrivateKeyAccount = owner,
+  validForLedgers = 120,
+  preparedAgo = 0,
+  network: NetworkName = "testnet",
+): Promise<Signed> {
+  const { usdc, hub } = NETWORKS[network].stellar;
+  const account = twinAddress(owner.address, network);
   const server = {
     simulateTransaction: async (tx: never) => ({ ...simulated([recorded(account, invocation(tx).call)]), latestLedger: LATEST - preparedAgo }),
   } as unknown as rpc.Server;
@@ -67,7 +85,7 @@ async function approval(owner: PrivateKeyAccount, signer: PrivateKeyAccount = ow
         nativeToScVal(LATEST + 1_000, { type: "u32" }),
       ],
     },
-    { owner: owner.address, network: "testnet", server, validForLedgers },
+    { owner: owner.address, network, server, validForLedgers },
   );
   // `sign` refuses a signature that is not the owner's, which is the point of asking the wallet directly here.
   const signature = await signer.signTypedData(prepared.typedData);
@@ -86,7 +104,7 @@ function withGarbage(signed: Signed): RelayRequest {
 }
 
 /** A relayer on a scripted network where no account exists until its deployment has been sent. */
-function undeployed(relayer = new Relayer(loadConfig({ RELAYER_SECRET: Keypair.random().secret() }))) {
+function undeployed(relayer = new Relayer(loadConfig({ RELAYER_SECRET: Keypair.random().secret() })), network: NetworkName = "testnet") {
   let sequence = 100;
   const accounts = new Set<string>();
   const sent: string[] = [];
@@ -103,6 +121,7 @@ function undeployed(relayer = new Relayer(loadConfig({ RELAYER_SECRET: Keypair.r
       return simulated(auth.length ? auth : [recorded(Address.fromScVal(call.args[0]!).toString(), call)]);
     }),
     getAccount: vi.fn(async (address: string) => new Account(address, String(sequence))),
+    getAccountEntry: vi.fn(async () => ({ balance: BigInt(100 * 10_000_000) })),
     sendTransaction: vi.fn(async (tx: { toEnvelope(): xdr.TransactionEnvelope }) => {
       sequence += 1;
       const { call } = invocation(tx);
@@ -110,7 +129,7 @@ function undeployed(relayer = new Relayer(loadConfig({ RELAYER_SECRET: Keypair.r
       sent.push(fn);
       const [owner] = call.args;
       if (fn === "deploy" && owner?.type === "scvBytes") {
-        accounts.add(twinAddress(`0x${Buffer.from(owner.bytes.toBytes()).toString("hex")}`, "testnet"));
+        accounts.add(twinAddress(`0x${Buffer.from(owner.bytes.toBytes()).toString("hex")}`, network));
       }
       return { status: "PENDING", hash: "" };
     }),
@@ -267,5 +286,69 @@ describe("what a caller can make the relayer spend on deployments", () => {
     expect(server.sendTransaction).toHaveBeenCalledTimes(10);
     // Each deployment: 1000 stroops to be included and 100 in resources, on this scripted network.
     expect(relayer.state.fees.spent()).toBe(BigInt(11_000));
+  });
+});
+
+describe("deploying an account on mainnet, where the relayer pays real XLM", () => {
+  const mainnetEnv = {
+    RELAYER_SECRET: Keypair.random().secret(),
+    PASO_ALLOW_MAINNET: "true",
+    RELAYER_SECRET_MAINNET: Keypair.random().secret(),
+  };
+  const onMainnet = () => undeployed(new Relayer(loadConfig(mainnetEnv, "mainnet")), "mainnet");
+
+  it("is not done on request: the deploy route refuses before anything is read, simulated or sent", async () => {
+    const { relayer, server, sent } = onMainnet();
+
+    for (const body of [{ network: "mainnet", owner: freshOwner().address }, { owner: freshOwner().address }, null]) {
+      const refused = (await relayer.deploy(body, "caller").catch((error: unknown) => error)) as ApiError;
+      expect(refused).toMatchObject({
+        code: "not_found",
+        status: 404,
+        detail: "On mainnet an account is deployed only with its owner's first signed call, through /api/relay; this route deploys on testnet only",
+      });
+    }
+
+    expect(sent).toEqual([]);
+    expect(server.sendTransaction).not.toHaveBeenCalled();
+    expect(server.simulateTransaction).not.toHaveBeenCalled();
+    expect(server.getAccount).not.toHaveBeenCalled();
+    expect(server.getLedgerEntries).not.toHaveBeenCalled();
+    expect(relayer.state.fees.spent()).toBe(BigInt(0));
+  });
+
+  it("is done with the owner's first signed call, once the signature is checked to be the owner's", async () => {
+    const { relayer, sent } = onMainnet();
+
+    const result = await relayer.relay(relayRequest(await approval(freshOwner(), undefined, 120, 0, "mainnet")));
+
+    expect(sent).toEqual(["deploy", "approve"]);
+    expect(result.deployHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(result.hash).not.toBe(result.deployHash);
+  });
+
+  it("is not done for a signature that is not the owner's, or for 65 bytes that are not a signature", async () => {
+    const owner = freshOwner();
+    for (const body of [
+      relayRequest(await approval(owner, freshOwner(), 120, 0, "mainnet")),
+      withGarbage(await approval(owner, owner, 120, 0, "mainnet")),
+    ]) {
+      const { relayer, server } = onMainnet();
+      expect(await refusalOf(relayer, body)).toMatchObject(notSigned);
+      expect(server.sendTransaction).not.toHaveBeenCalled();
+      expect(relayer.state.fees.spent()).toBe(BigInt(0));
+    }
+  });
+
+  it("is still done on request on testnet, within the route's limits", async () => {
+    const { relayer, sent } = undeployed();
+    const owner = freshOwner().address;
+
+    await expect(relayer.deploy({ network: "testnet", owner }, "caller")).resolves.toEqual({
+      address: twinAddress(owner, "testnet"),
+      hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      alreadyDeployed: false,
+    });
+    expect(sent).toEqual(["deploy"]);
   });
 });

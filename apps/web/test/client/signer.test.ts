@@ -3,6 +3,7 @@ import { isAddressEqual, recoverTypedDataAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it } from "vitest";
 import { ApiFailure, createApi } from "@/lib/client/api";
+import { ROUTES } from "@/lib/client/config";
 import { DEMO_KEY_STORAGE, DEMO_LABEL, DEMO_TESTNET_ONLY, ensureDemoKey, forgetDemoKey, loadDemoKey } from "@/lib/client/demoKey";
 import { demoState, signerState, startDemo } from "@/lib/client/signer";
 import { memoryStorage } from "@/lib/client/storage";
@@ -108,12 +109,17 @@ describe("the API client", () => {
       network: "mainnet",
       fetch: (async (_: string, init: RequestInit) => {
         requestsOnMainnet.push(init);
-        return new Response(JSON.stringify({ address: "C", alreadyDeployed: true }), { status: 200 });
+        return new Response(JSON.stringify({ status: "pending", attestation: "pending" }), { status: 200 });
       }) as unknown as typeof fetch,
     });
     await mainnet.deliver({ sourceDomain: 6, txHash: BURN });
-    await mainnet.deploy(`0x${"11".repeat(20)}`);
-    expect(requestsOnMainnet.map((init) => JSON.parse(String(init.body)).network)).toEqual(["mainnet", "mainnet"]);
+    expect(requestsOnMainnet.map((init) => JSON.parse(String(init.body)).network)).toEqual(["mainnet"]);
+  });
+
+  it("has no way to ask for an account to be deployed on its own", () => {
+    const api = createApi({ network: "mainnet" });
+    expect(Object.keys(api).sort()).toEqual(["deliver", "demoFund", "health"]);
+    expect(Object.values(ROUTES)).not.toContain("/api/deploy");
   });
 
   it("carries the server's reason for declining, when it gives one it knows", async () => {

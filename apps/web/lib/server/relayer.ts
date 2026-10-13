@@ -444,6 +444,13 @@ export function createRelayerState(config: ServerConfig): RelayerState {
  * request can make it authorise a call, and it cannot change a signed one.
  * A server that works on two networks has two of these, each with its own
  * account, its own settings and its own state.
+ *
+ * What it pays for on mainnet, and on whose word: a relayed call, and the
+ * deployment of the account before its first one, only once the owner's
+ * signature over that call has been checked; the delivery of a message
+ * Circle has attested (see `deliver`); nothing else. The deploy route and
+ * the faucet are testnet's, and finishing a transfer back to Base costs no
+ * XLM.
  */
 export class Relayer {
   readonly address: string;
@@ -739,8 +746,23 @@ export class Relayer {
     return { state: "spent" };
   }
 
-  /** Deploys the account of an Ethereum address. Doing it twice changes nothing. */
+  /**
+   * Deploys the account of an Ethereum address. Doing it twice changes nothing.
+   *
+   * Testnet only. A request here proves nothing about who sends it, and on
+   * mainnet the relayer would pay real XLM for any address at all. There an
+   * account is deployed only together with its owner's first signed call,
+   * through `relay`, after the signature has been checked to be the owner's.
+   * Anyone who wants an account deployed sooner can call `hub.deploy` from a
+   * Stellar account of their own.
+   */
   async deploy(body: unknown, caller: string = SHARED_IDENTITY): Promise<DeployResult> {
+    if (this.config.network.name !== "testnet") {
+      throw new ApiError(
+        "not_found",
+        "On mainnet an account is deployed only with its owner's first signed call, through /api/relay; this route deploys on testnet only",
+      );
+    }
     const owner = this.readOwner(body);
     const address = twinAddress(owner, this.config.network);
     const hash = await this.ensureDeployed(owner, caller);
@@ -755,6 +777,18 @@ export class Relayer {
    * is genuine and where its USDC goes, so any message addressed to Stellar
    * is delivered. A message someone else already delivered counts as
    * delivered.
+   *
+   * This is the one thing the relayer pays for, on mainnet too, without a
+   * signature from an account's owner. That is acceptable because what it
+   * pays for cannot be made up: the message has to be attested by Circle,
+   * which happens only after someone burned USDC on another chain for a
+   * Stellar recipient, at their own cost in USDC and gas. The transaction is
+   * built from Circle's bytes alone and authorises nothing but that call;
+   * Circle's contracts take each message once, so each burn is paid for at
+   * most once. And it is bounded like every payment: it counts against the
+   * caller's and the hour's deliveries, the per-transaction fee cap, the
+   * day's fee budget and the account's floor. On mainnet, by default: 6 per
+   * caller and 20 in all an hour, about 0.07 XLM each, under 2 XLM a day.
    */
   async deliver(body: unknown, caller: string = SHARED_IDENTITY): Promise<DeliverResult> {
     const { sourceDomain, txHash } = this.readBurn(body);

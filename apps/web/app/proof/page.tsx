@@ -89,8 +89,8 @@ const RUN: readonly Station[] = [
 
 const TESTS: readonly { text: string; command?: string }[] = [
   { text: "Account contract 29, hub 15", command: "pnpm test:contracts" },
-  { text: "SDK 686 offline", command: "pnpm test:sdk" },
-  { text: "Relayer and client 515 offline", command: "pnpm test:web" },
+  { text: "SDK 713 offline", command: "pnpm test:sdk" },
+  { text: "Relayer and client 522 offline", command: "pnpm test:web" },
   { text: "11 signing vectors checked by both the Rust and the TypeScript suites." },
 ];
 

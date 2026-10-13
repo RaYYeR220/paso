@@ -21,7 +21,7 @@ import {
   VerdictStrip,
   type SendDestination,
 } from "@/components/app";
-import { REFUSAL_ON_CHAIN, SCRIPTS_URL } from "@/components/app/site";
+import { deliverCommand, REFUSAL_ON_CHAIN, SCRIPTS_URL } from "@/components/app/site";
 import {
   baseAddress,
   formatElapsed,
@@ -59,11 +59,6 @@ export interface WorkspaceProps {
 /** A transfer that has been under way this long may want explaining, or letting go of. */
 const SLOW_AFTER_SECONDS = 90;
 const UNSEEN_AFTER_SECONDS = 600;
-
-/** The command that delivers a burn from the repository, with any funded Stellar account paying the fee. */
-function deliverCommand(network: NetworkName, burnTxHash: string): string {
-  return `pnpm e2e${network === "mainnet" ? " --network mainnet" : ""} --resume-burn ${burnTxHash} --skip-transfer --skip-exit`;
-}
 
 function fundingStatus(funding: Funding, isDemo: boolean, network: NetworkName): ReactNode {
   const { state, inputError, amountFormatted, elapsedSeconds, tracked, keyCheck, limits } = funding;
@@ -126,7 +121,8 @@ function fundingStatus(funding: Funding, isDemo: boolean, network: NetworkName):
               has the burn, and it can be delivered later, by this relayer or by anyone. This page keeps asking.
             </p>
             <p>
-              From the repository, with any funded Stellar account paying the fee: <code>{deliverCommand(network, tracked.burnTxHash)}</code>
+              From a checkout of the repository, with any funded Stellar account paying the fee and no key of yours:{" "}
+              <code>{deliverCommand(tracked.burnTxHash, network)}</code>
             </p>
             {stop}
           </div>

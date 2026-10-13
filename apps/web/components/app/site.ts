@@ -21,3 +21,12 @@ export const SCRIPTS_URL = "https://github.com/RaYYeR220/paso#scripts";
 
 /** What the persistent strip says while a page is on mainnet. */
 export const MAINNET_CAUTION = "Mainnet. Real USDC. This software has not been audited — use small amounts.";
+
+/**
+ * The command that delivers a burn from a checkout of the repository. It
+ * needs any funded Stellar account to pay the fee (`PASO_SOURCE_SECRET`),
+ * and no key of the account's owner.
+ */
+export function deliverCommand(burnTxHash: string, network: NetworkName): string {
+  return `pnpm deliver ${burnTxHash} --network ${network}`;
+}

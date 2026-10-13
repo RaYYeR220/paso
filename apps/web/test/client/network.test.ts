@@ -12,6 +12,7 @@ import {
   withNetworkParam,
 } from "@/lib/client/network";
 import { chosenSignerKey } from "@/lib/client/signer";
+import { deliverCommand } from "@/components/app/site";
 import { memoryStorage, migrateStorage } from "@/lib/client/storage";
 import { owner } from "./helpers";
 
@@ -160,5 +161,13 @@ describe("what the browser keeps, per network", () => {
     expect(() => ensureDemoKey("mainnet", storage)).toThrow(/testnet only/);
     expect(() => ensureDemoKey("mainnet", null)).toThrow(/testnet only/);
     expect(loadDemoKey("testnet", storage)).toBe(key);
+  });
+});
+
+describe("the command that delivers a burn without the hosted relayer", () => {
+  it("names the burn and the network, and nothing the owner holds", () => {
+    const burn = `0x${"9b".repeat(32)}`;
+    expect(deliverCommand(burn, "mainnet")).toBe(`pnpm deliver ${burn} --network mainnet`);
+    expect(deliverCommand(burn, "testnet")).toBe(`pnpm deliver ${burn} --network testnet`);
   });
 });

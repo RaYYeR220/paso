@@ -112,7 +112,7 @@ The first seven apply to `String` and `Symbol` arguments and to function names, 
 
 `waitForAttestation(sourceDomain, txHash, network, { signal, onStatus })` polls Circle's Iris service until the burn is attested and resolves to `{ message, attestation, nonce }`. It reports `not_found`, `pending`, `unreachable` and `complete` through `onStatus` and keeps polling until aborted. `fetchAttestation(sourceDomain, txHash, network)` asks once and returns `{ status, attestation? }`. For a burn made on Stellar, `txHash` is the transaction hash without `0x`.
 
-`deliverOperation({ message, attestation, caller }, network)` picks the right delivery call from the message itself, and `deliverWith({ message, attestation }, keypair, network)` submits it from any funded Stellar account. Delivery is permissionless: Circle's contracts check the attestation and decide where the USDC goes.
+`deliverOperation({ message, attestation, caller }, network)` picks the right delivery call from the message itself, and `deliverWith({ message, attestation }, keypair, network)` submits it from any funded Stellar account. Delivery is permissionless: Circle's contracts check the attestation and decide where the USDC goes. From a checkout of the repository, `pnpm deliver <base burn tx hash> --network <testnet|mainnet>` does the same with `PASO_SOURCE_SECRET` set to any funded Stellar account; it needs no key of the account's owner.
 
 ## Relayer
 
